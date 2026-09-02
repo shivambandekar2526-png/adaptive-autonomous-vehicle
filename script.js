@@ -3128,21 +3128,32 @@ class DetectionManager {
       // Trajectory and Collision Risk Assessment
       let riskLevel = 'SAFE';
 
-      // Forward corridor alignment: is candidate in ego's direct moving path?
-      const inEgoTravelCorridor = Math.abs(bearing) < (35 * Math.PI / 180);
+      // Forward corridor alignment: is candidate directly in ego vehicle's travel path?
+      const forwardCorridorDist = dx * Math.cos(egoHeading) + dy * Math.sin(egoHeading);
+      const lateralCorridorDist = Math.abs(dy * Math.cos(egoHeading) - dx * Math.sin(egoHeading));
+      const inEgoTravelCorridor = (forwardCorridorDist > 0 && lateralCorridorDist < (cand.radius + 14));
       const isApproaching = closingSpeed > 2.0;
 
-      // Danger Condition: Imminent collision trajectory or critical proximity
-      if ((ttc <= this.dangerTTC && isApproaching && (inEgoTravelCorridor || inCloseProximity)) ||
-          (distance <= this.criticalDistance && isApproaching)) {
+      // Potholes: Road surface hazards (assessed as CAUTION when approaching in corridor)
+      if (cand.type === 'pothole') {
+        if (inEgoTravelCorridor && forwardCorridorDist < 120 && egoSpeed > 10) {
+          riskLevel = 'CAUTION';
+          cCount++;
+        } else {
+          riskLevel = 'SAFE';
+          sCount++;
+        }
+      }
+      // Solid Obstacles & Dynamic Entities
+      // Danger Condition: Imminent collision trajectory or critical proximity in corridor
+      else if ((ttc <= this.dangerTTC && isApproaching && (inEgoTravelCorridor || inCloseProximity)) ||
+               (distance <= this.criticalDistance && isApproaching && (inEgoTravelCorridor || inCloseProximity))) {
         riskLevel = 'DANGER';
         dCount++;
         if (ttc < minTTC) minTTC = ttc;
       }
-      // Caution Condition: Potential collision path or proximity alert
-      else if ((ttc <= this.cautionTTC && isApproaching) ||
-               (distance <= this.cautionDistance && (isApproaching || inEgoTravelCorridor)) ||
-               (!cand.isDynamic && inEgoTravelCorridor && distance < 140 && egoSpeed > 15)) {
+      // Caution Condition: Potential collision path or proximity alert in travel corridor
+      else if (((ttc <= this.cautionTTC && isApproaching) || (distance <= this.cautionDistance && isApproaching) || (!cand.isDynamic && distance < 120 && egoSpeed > 15)) && (inEgoTravelCorridor || inCloseProximity)) {
         riskLevel = 'CAUTION';
         cCount++;
         if (ttc < minTTC) minTTC = ttc;
@@ -3167,6 +3178,8 @@ class DetectionManager {
         subType: cand.subType,
         x: cand.x,
         y: cand.y,
+        heading: cand.heading !== undefined ? cand.heading : 0,
+        speed: cand.speed !== undefined ? cand.speed : 0,
         dx: dx,
         dy: dy,
         distance: distance,
@@ -3890,7 +3903,403 @@ class PathPlanner {
 }
 
 /* ============================================================================
-   9. SIMULATION CORE APPLICATION CONTROLLER & GAME LOOP
+   9. MODULE 6A: CONTEXT-AWARE DECISION MAKING SYSTEM
+   ============================================================================ */
+
+/**
+ * Context-Aware Decision Manager
+ * Evaluates real-time perception, collision risk, traffic stream dynamics,
+ * candidate path feasibility, road geometry, and obstacle blockages to determine
+ * the high-level tactical behavior decision for the Ego Vehicle.
+ *
+ * Possible Decisions:
+ *  - 'GO'      : Path is clear, safe speed, progression toward destination.
+ *  - 'SLOW'    : Developing risk, proximity hazard, approaching pothole/junction, or avoidance steering.
+ *  - 'STOP'    : Imminent collision threat, emergency brake condition, stationary obstacle ahead.
+ *  - 'WAIT'    : Traffic gridlock in front, waiting for bottleneck/intersection to clear.
+ *  - 'YIELD'   : Cross traffic incursion, yielding to vehicles on conflicting trajectories.
+ *  - 'REVERSE' : Trapped/blocked in front with safe clear rear space to unblock.
+ *  - 'REPLAN'  : Selected path infeasible/blocked, alternative trajectory computation required.
+ */
+class DecisionManager {
+  constructor(options = {}) {
+    this.currentDecision = 'GO';
+    this.reason = 'Clear path toward destination';
+    this.decisionHistory = [];
+    this.historyLength = 10;
+    
+    // Configurable thresholds for context evaluation
+    this.config = {
+      imminentTTC: 1.8,            // Seconds (TTC <= 1.8s triggers STOP)
+      cautionTTC: 4.0,             // Seconds (TTC <= 4.0s triggers SLOW)
+      criticalDistance: 32,        // Pixels (Immediate threat proximity)
+      corridorLookahead: 120,      // Pixels (Corridor forward zone)
+      rearSafetyBuffer: 65,        // Pixels (Clearance behind ego for safe REVERSE)
+      intersectionZone: {          // Intersection bounds
+        minX: 780,
+        maxX: 1040,
+        minY: 420,
+        maxY: 650
+      }
+    };
+    
+    // Telemetry state
+    this.state = {
+      crossTrafficDetected: false,
+      frontBlocked: false,
+      rearClear: true,
+      pathFeasible: true,
+      imminentDanger: false,
+      developingRisk: false,
+      approachingHazard: false
+    };
+  }
+
+  /**
+   * Main evaluation cycle: computes the single primary decision for the current frame
+   * @param {EgoVehicle} egoVehicle
+   * @param {Object} environmentData
+   * @param {Object} perceptionData
+   * @param {Object} pathPlannerData
+   * @param {TrafficManager} trafficManager
+   * @param {number} dt
+   */
+  update(egoVehicle, environmentData, perceptionData, pathPlannerData, trafficManager, dt) {
+    if (!egoVehicle) {
+      this.currentDecision = 'WAIT';
+      this.reason = 'Ego vehicle not initialized';
+      return;
+    }
+
+    const egoX = egoVehicle.x;
+    const egoY = egoVehicle.y;
+    const egoHeading = egoVehicle.heading;
+    const egoSpeed = egoVehicle.speed || 0;
+    const isEgoCollided = egoVehicle.isCollided || false;
+    const isEgoInPothole = egoVehicle.inPothole || false;
+
+    const detectedObjects = (perceptionData && Array.isArray(perceptionData.detectedObjects)) ? perceptionData.detectedObjects : [];
+    const overallRisk = perceptionData ? perceptionData.overallRisk : 'SAFE';
+    const minTTC = (perceptionData && perceptionData.minTTC !== null) ? perceptionData.minTTC : Infinity;
+
+    const selectedPath = pathPlannerData ? pathPlannerData.selectedPath : null;
+    const plannerState = pathPlannerData ? pathPlannerData.plannerState : 'OPTIMAL';
+    const candidatePaths = pathPlannerData ? (pathPlannerData.candidatePaths || []) : [];
+
+    const dynamicEntities = trafficManager ? trafficManager.getEntities() : [];
+
+    // --- 1. Analyze Environmental Context & Traffic States ---
+    const context = this.analyzeContext({
+      egoX,
+      egoY,
+      egoHeading,
+      egoSpeed,
+      isEgoCollided,
+      isEgoInPothole,
+      detectedObjects,
+      overallRisk,
+      minTTC,
+      selectedPath,
+      plannerState,
+      candidatePaths,
+      dynamicEntities,
+      environmentData
+    });
+
+    this.state = context;
+
+    // --- 2. Execute Deterministic Decision Priority Pipeline ---
+    const decisionResult = this.evaluatePriority(context);
+
+    this.currentDecision = decisionResult.decision;
+    this.reason = decisionResult.reason;
+
+    // Record telemetry history
+    this.decisionHistory.push({
+      decision: this.currentDecision,
+      reason: this.reason,
+      timestamp: performance.now()
+    });
+    if (this.decisionHistory.length > this.historyLength) {
+      this.decisionHistory.shift();
+    }
+  }
+
+  /**
+   * Analyze all sensory and spatial factors
+   */
+  analyzeContext(data) {
+    const {
+      egoX, egoY, egoHeading, egoSpeed, isEgoCollided, isEgoInPothole,
+      detectedObjects, overallRisk, minTTC, selectedPath, plannerState,
+      candidatePaths, dynamicEntities, environmentData
+    } = data;
+
+    const cosH = Math.cos(egoHeading);
+    const sinH = Math.sin(egoHeading);
+
+    // A. Check Imminent Danger / Emergency Stop Condition
+    let imminentDanger = false;
+    let dangerReason = '';
+
+    if (isEgoCollided) {
+      imminentDanger = true;
+      dangerReason = 'Obstacle collision';
+    } else if (overallRisk === 'DANGER' && minTTC <= this.config.imminentTTC) {
+      imminentDanger = true;
+      dangerReason = `Imminent collision threat (TTC ${minTTC.toFixed(1)}s)`;
+    } else {
+      // Check for objects critically close in forward trajectory corridor
+      for (const obj of detectedObjects) {
+        const dx = obj.x - egoX;
+        const dy = obj.y - egoY;
+        const forwardDist = dx * cosH + dy * sinH;
+        const lateralDist = Math.abs(dy * cosH - dx * sinH);
+
+        if (forwardDist > 0 && forwardDist < this.config.criticalDistance && lateralDist < 20) {
+          imminentDanger = true;
+          dangerReason = `Obstacle ahead (${obj.type || 'hazard'} ${Math.round(forwardDist)}px)`;
+          break;
+        }
+      }
+    }
+
+    // B. Check Selected Path Feasibility
+    let pathFeasible = true;
+    let replanReason = '';
+
+    if (!selectedPath || selectedPath.status === 'COLLISION' || selectedPath.status === 'OFF_ROAD' || plannerState === 'EMERGENCY_STOP') {
+      pathFeasible = false;
+      replanReason = selectedPath ? `Path blocked (${selectedPath.status})` : 'No safe path available';
+    }
+
+    // C. Check Front Traffic Blockage / Bottleneck
+    let frontBlocked = false;
+    let frontBlockReason = '';
+    let slowFrontVehicles = 0;
+
+    for (const obj of detectedObjects) {
+      const dx = obj.x - egoX;
+      const dy = obj.y - egoY;
+      const forwardDist = dx * cosH + dy * sinH;
+      const lateralDist = Math.abs(dy * cosH - dx * sinH);
+
+      if (forwardDist > 5 && forwardDist < 65 && lateralDist < 26) {
+        if ((obj.speed !== undefined && obj.speed < 15) || !obj.isDynamic || obj.type === 'debris' || obj.type === 'parked_object') {
+          slowFrontVehicles++;
+        }
+      }
+    }
+
+    if (slowFrontVehicles >= 1 && (imminentDanger || !pathFeasible || egoSpeed < 10)) {
+      frontBlocked = true;
+      frontBlockReason = 'Traffic blocked ahead';
+    }
+
+    // D. Check Rear Clearance for Safe Reverse Movement
+    let rearClear = true;
+    let rearBlocker = null;
+
+    // Check all dynamic entities
+    for (const dyn of dynamicEntities) {
+      const dx = dyn.x - egoX;
+      const dy = dyn.y - egoY;
+      const forwardDist = dx * cosH + dy * sinH;
+      const lateralDist = Math.abs(dy * cosH - dx * sinH);
+
+      // In rear zone directly behind ego
+      if (forwardDist < -4 && forwardDist > -this.config.rearSafetyBuffer && lateralDist < 26) {
+        rearClear = false;
+        rearBlocker = dyn;
+        break;
+      }
+    }
+
+    // Check solid static collision obstacles in rear
+    if (rearClear && window.StaticCollisionSystem) {
+      const rearCheckX = egoX - cosH * 35;
+      const rearCheckY = egoY - sinH * 35;
+      const solidRear = window.StaticCollisionSystem.checkSolidCollision(rearCheckX, rearCheckY, 16);
+      if (solidRear.collided) {
+        rearClear = false;
+        rearBlocker = solidRear.obstacle;
+      }
+    }
+
+    // E. Check Cross-Traffic / Intersection Conflict
+    let crossTrafficDetected = false;
+    let crossTrafficReason = '';
+
+    const inIntersectionZone = (
+      egoX >= this.config.intersectionZone.minX - 50 &&
+      egoX <= this.config.intersectionZone.maxX &&
+      egoY >= this.config.intersectionZone.minY &&
+      egoY <= this.config.intersectionZone.maxY
+    );
+
+    for (const obj of detectedObjects) {
+      if (obj.isDynamic) {
+        let headingDiff = Math.abs((obj.heading || 0) - egoHeading);
+        while (headingDiff > Math.PI) headingDiff -= Math.PI * 2;
+        headingDiff = Math.abs(headingDiff);
+
+        const isCrossHeading = headingDiff > (30 * Math.PI / 180) && headingDiff < (150 * Math.PI / 180);
+        const dx = obj.x - egoX;
+        const dy = obj.y - egoY;
+        const dist = Math.hypot(dx, dy);
+
+        if (isCrossHeading && dist < 125) {
+          crossTrafficDetected = true;
+          crossTrafficReason = `Cross traffic approaching (${obj.type || 'vehicle'})`;
+          break;
+        }
+      }
+
+      // Check pedestrian or animal crossing actively across road corridor
+      if ((obj.type === 'pedestrian' || obj.type === 'animal') && obj.distance < 90) {
+        const dx = obj.x - egoX;
+        const dy = obj.y - egoY;
+        const forwardDist = dx * cosH + dy * sinH;
+        const lateralDist = Math.abs(dy * cosH - dx * sinH);
+        if (forwardDist > 0 && forwardDist < 90 && lateralDist < 40) {
+          crossTrafficDetected = true;
+          crossTrafficReason = `Crossing ${obj.type} ahead`;
+          break;
+        }
+      }
+    }
+
+    // F. Check Developing Risk / Hazard Caution
+    let developingRisk = false;
+    let cautionReason = '';
+
+    if (overallRisk === 'CAUTION' || (minTTC > this.config.imminentTTC && minTTC <= this.config.cautionTTC)) {
+      developingRisk = true;
+      cautionReason = `Developing collision risk (TTC ${minTTC < 10 ? minTTC.toFixed(1) + 's' : 'caution'})`;
+    } else if (plannerState === 'AVOIDANCE') {
+      developingRisk = true;
+      cautionReason = 'Executing path avoidance maneuver';
+    } else if (isEgoInPothole) {
+      developingRisk = true;
+      cautionReason = 'Pothole impact - reducing speed';
+    } else {
+      // Check approaching pothole in lane within lookahead
+      if (window.StaticCollisionSystem) {
+        for (let step = 15; step <= 70; step += 15) {
+          const checkX = egoX + cosH * step;
+          const checkY = egoY + sinH * step;
+          const potCheck = window.StaticCollisionSystem.checkPothole(checkX, checkY, 12);
+          if (potCheck.inPothole) {
+            developingRisk = true;
+            cautionReason = 'Approaching road pothole';
+            break;
+          }
+        }
+      }
+    }
+
+    return {
+      imminentDanger,
+      dangerReason,
+      pathFeasible,
+      replanReason,
+      frontBlocked,
+      frontBlockReason,
+      rearClear,
+      rearBlocker,
+      crossTrafficDetected,
+      crossTrafficReason,
+      developingRisk,
+      cautionReason,
+      egoSpeed,
+      inIntersectionZone
+    };
+  }
+
+  /**
+   * Deterministic Priority Hierarchy Decision Resolution
+   */
+  evaluatePriority(ctx) {
+    // 1. HIGHEST PRIORITY: Imminent Collision Threat -> STOP
+    if (ctx.imminentDanger) {
+      return {
+        decision: 'STOP',
+        reason: ctx.dangerReason || 'Imminent collision threat'
+      };
+    }
+
+    // 2. Trajectory Blockage / Infeasible Path -> REPLAN
+    if (!ctx.pathFeasible) {
+      return {
+        decision: 'REPLAN',
+        reason: ctx.replanReason || 'Selected path blocked'
+      };
+    }
+
+    // 3. Traffic Blockage Resolution -> REVERSE vs WAIT
+    if (ctx.frontBlocked) {
+      if (ctx.rearClear) {
+        return {
+          decision: 'REVERSE',
+          reason: 'Reversing to clear blockage'
+        };
+      } else {
+        return {
+          decision: 'WAIT',
+          reason: 'Traffic blocked - rear occupied'
+        };
+      }
+    }
+
+    // 4. Cross Traffic / Intersection Incursion -> YIELD or WAIT
+    if (ctx.crossTrafficDetected) {
+      if (ctx.inIntersectionZone) {
+        return {
+          decision: 'WAIT',
+          reason: ctx.crossTrafficReason || 'Waiting at busy intersection'
+        };
+      } else {
+        return {
+          decision: 'YIELD',
+          reason: ctx.crossTrafficReason || 'Yielding to cross traffic'
+        };
+      }
+    }
+
+    // 5. Developing Risk / Hazard Caution / Avoidance Maneuver -> SLOW
+    if (ctx.developingRisk) {
+      return {
+        decision: 'SLOW',
+        reason: ctx.cautionReason || 'Developing risk - reducing speed'
+      };
+    }
+
+    // 6. DEFAULT: Normal Clear Driving -> GO
+    return {
+      decision: 'GO',
+      reason: 'Clear path toward destination'
+    };
+  }
+
+  /**
+   * Accessor for Decision Telemetry
+   */
+  getDecisionData() {
+    return {
+      decision: this.currentDecision,
+      reason: this.reason,
+      state: this.state,
+      history: this.decisionHistory
+    };
+  }
+
+  getDecision() {
+    return this.currentDecision;
+  }
+}
+
+/* ============================================================================
+   10. SIMULATION CORE APPLICATION CONTROLLER & GAME LOOP
    ============================================================================ */
 class SimulationAppController {
   constructor() {
@@ -3915,6 +4324,9 @@ class SimulationAppController {
 
     // Module 5: Adaptive Path Planning System
     this.pathPlanner = new PathPlanner();
+
+    // Module 6A: Context-Aware Decision Manager
+    this.decisionManager = new DecisionManager();
 
     // Registered Submodules
     this.modules = {};
@@ -3954,6 +4366,11 @@ class SimulationAppController {
       
       // Telemetry Readouts
       egoSpeed: document.getElementById('ego-speed'),
+
+      // Module 6A Decision Telemetry Elements
+      decisionDot: document.getElementById('decision-dot'),
+      decisionValue: document.getElementById('decision-value'),
+      decisionReasonText: document.getElementById('decision-reason-text'),
       
       // Module 4 Detection & Risk Elements
       riskDot: document.getElementById('risk-dot'),
@@ -4194,7 +4611,19 @@ class SimulationAppController {
       );
     }
 
-    // 5. Update Submodules (Future Module 6+)
+    // 5. Update Context-Aware Decision Manager (Module 6A)
+    if (this.decisionManager) {
+      this.decisionManager.update(
+        this.egoVehicle,
+        EnvironmentData,
+        this.getPerceptionData(),
+        this.getPathPlannerData(),
+        this.trafficManager,
+        dt
+      );
+    }
+
+    // 6. Update Submodules (Future Module 6B+)
     Object.keys(this.modules).forEach((name) => {
       const mod = this.modules[name];
       if (typeof mod.update === 'function') {
@@ -4202,10 +4631,10 @@ class SimulationAppController {
       }
     });
 
-    // 6. Update Real-time HUD Telemetry
+    // 7. Update Real-time HUD Telemetry
     this.updateHUD();
 
-    // 7. Render Scene
+    // 8. Render Scene
     this.render();
 
     // Request next animation frame
@@ -4215,7 +4644,7 @@ class SimulationAppController {
   }
 
   /**
-   * Update HUD Telemetry elements with Ego Vehicle, Perception and Path Planner telemetry
+   * Update HUD Telemetry elements with Ego Vehicle, Perception, Path Planner, and Decision telemetry
    */
   updateHUD() {
     if (this.egoVehicle) {
@@ -4223,6 +4652,40 @@ class SimulationAppController {
       const speedKmH = (Math.abs(this.egoVehicle.speed) * 0.25).toFixed(1);
       if (this.dom.egoSpeed) {
         this.dom.egoSpeed.textContent = speedKmH;
+      }
+    }
+
+    // Update Module 6A Context-Aware Decision Telemetry
+    if (this.decisionManager) {
+      const dec = this.decisionManager.currentDecision;
+      const reason = this.decisionManager.reason;
+
+      if (this.dom.decisionValue) {
+        this.dom.decisionValue.textContent = dec;
+        this.dom.decisionValue.className = 'pill-value';
+        if (dec === 'STOP') {
+          this.dom.decisionValue.classList.add('accent-rose');
+        } else if (dec === 'SLOW') {
+          this.dom.decisionValue.classList.add('accent-amber');
+        } else if (dec === 'WAIT') {
+          this.dom.decisionValue.classList.add('accent-indigo');
+        } else if (dec === 'YIELD') {
+          this.dom.decisionValue.classList.add('accent-orange');
+        } else if (dec === 'REVERSE') {
+          this.dom.decisionValue.classList.add('accent-pink');
+        } else if (dec === 'REPLAN') {
+          this.dom.decisionValue.classList.add('accent-cyan');
+        } else {
+          this.dom.decisionValue.classList.add('accent-emerald');
+        }
+      }
+
+      if (this.dom.decisionDot) {
+        this.dom.decisionDot.className = 'pill-dot decision-dot ' + dec.toLowerCase();
+      }
+
+      if (this.dom.decisionReasonText) {
+        this.dom.decisionReasonText.textContent = reason;
       }
     }
 
@@ -4403,6 +4866,17 @@ class SimulationAppController {
     return this.pathPlanner ? this.pathPlanner.candidatePaths : [];
   }
 
+  /**
+   * Accessor for Context-Aware Decision Maker (Module 6A)
+   */
+  getDecisionData() {
+    return this.decisionManager ? this.decisionManager.getDecisionData() : { decision: 'GO', reason: 'Normal Driving' };
+  }
+
+  getDecision() {
+    return this.decisionManager ? this.decisionManager.getDecision() : 'GO';
+  }
+
   getObstacles() {
     return {
       potholes: EnvironmentData.potholes,
@@ -4412,7 +4886,8 @@ class SimulationAppController {
       signal: EnvironmentData.trafficSignal,
       dynamicObjects: this.getDynamicObjects(),
       perception: this.getPerceptionData(),
-      planner: this.getPathPlannerData()
+      planner: this.getPathPlannerData(),
+      decision: this.getDecisionData()
     };
   }
 
@@ -4450,6 +4925,7 @@ window.TrafficManager = TrafficManager;
 window.DetectionManager = DetectionManager;
 window.PathPlanner = PathPlanner;
 window.StaticCollisionSystem = StaticCollisionSystem;
+window.DecisionManager = DecisionManager;
 
 // Boot on DOM Ready
 document.addEventListener('DOMContentLoaded', () => {

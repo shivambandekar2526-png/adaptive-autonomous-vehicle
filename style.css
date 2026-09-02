@@ -180,6 +180,80 @@ html, body {
   color: var(--accent-emerald);
 }
 
+.pill-value.accent-indigo {
+  color: #818cf8;
+}
+
+.pill-value.accent-orange {
+  color: #f97316;
+}
+
+.pill-value.accent-pink {
+  color: #ec4899;
+}
+
+/* Module 6A Decision Pill & Dot Styles */
+.decision-pill {
+  border-color: rgba(6, 182, 212, 0.3);
+  background: rgba(15, 23, 42, 0.9);
+}
+
+.decision-reason {
+  color: var(--text-muted);
+  font-size: 0.7rem;
+  font-weight: 500;
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.decision-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  transition: all 0.2s ease;
+}
+
+.decision-dot.go {
+  background-color: var(--accent-emerald);
+  box-shadow: 0 0 6px var(--accent-emerald);
+}
+
+.decision-dot.slow {
+  background-color: var(--accent-amber);
+  box-shadow: 0 0 8px var(--accent-amber);
+  animation: pulse-fast 0.7s infinite alternate;
+}
+
+.decision-dot.stop {
+  background-color: var(--accent-rose);
+  box-shadow: 0 0 10px var(--accent-rose);
+  animation: pulse-fast 0.3s infinite alternate;
+}
+
+.decision-dot.wait {
+  background-color: #818cf8;
+  box-shadow: 0 0 8px #818cf8;
+}
+
+.decision-dot.yield {
+  background-color: #f97316;
+  box-shadow: 0 0 8px #f97316;
+}
+
+.decision-dot.reverse {
+  background-color: #ec4899;
+  box-shadow: 0 0 8px #ec4899;
+  animation: pulse-fast 0.5s infinite alternate;
+}
+
+.decision-dot.replan {
+  background-color: var(--accent-cyan);
+  box-shadow: 0 0 8px var(--accent-cyan);
+  animation: pulse-fast 0.4s infinite alternate;
+}
+
 .planner-dot {
   width: 7px;
   height: 7px;

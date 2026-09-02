@@ -13,12 +13,20 @@
       <div class="header-left">
         <div class="project-identity">
           <h1 class="sim-title">Adaptive Path Planning &amp; Collision Avoidance</h1>
-          <span class="sim-subtitle">Unstructured Indian Road Simulation &bull; Module 5: Adaptive Path Planning</span>
+          <span class="sim-subtitle">Unstructured Indian Road Simulation &bull; Module 6A: Context-Aware Decision Making</span>
         </div>
       </div>
 
-      <!-- Real-time Perception, Risk & Planner Telemetry Readouts -->
+      <!-- Real-time Perception, Risk, Planner & Context Decision Telemetry Readouts -->
       <div class="header-center">
+        <!-- Module 6A: Context-Aware Decision -->
+        <div class="telemetry-pill decision-pill" title="Context-Aware Decision Maker (Module 6A)">
+          <span class="pill-dot decision-dot go" id="decision-dot"></span>
+          <span class="pill-label">DECISION:</span>
+          <span class="pill-value accent-emerald" id="decision-value">GO</span>
+          <span class="decision-reason" id="decision-reason-text">Clear path</span>
+        </div>
+
         <!-- Adaptive Path Planner Decision -->
         <div class="telemetry-pill" title="Adaptive Local Path Planner Decision">
           <span class="pill-dot planner-dot" id="planner-dot"></span>
@@ -208,6 +216,10 @@
             <span class="legend-swatch debris-swatch"></span>
             <span>Construction Debris &amp; Barricades</span>
           </div>
+          <div class="legend-item">
+            <span class="pill-dot decision-dot go" style="display:inline-block; margin-right:6px;"></span>
+            <span><strong>Decisions</strong> (GO, SLOW, STOP, WAIT, YIELD, REVERSE, REPLAN)</span>
+          </div>
         </div>
         <div class="legend-footer">
           <small>&bull; [W/A/S/D] Drive &bull; [C] Paths &bull; [V] Radar &bull; [T] Traffic &bull; [R] Fit</small>
@@ -216,7 +228,7 @@
 
       <!-- Mini Notification / Hint Banner -->
       <div class="hint-banner" id="hint-banner">
-        <span>Module 5 Active: Adaptive Path Planning active. [C] Toggle Paths | [V] Toggle Radar | [T] Toggle Traffic</span>
+        <span>Module 6A Active: Context-Aware Decision Making active. [C] Toggle Paths | [V] Toggle Radar | [T] Toggle Traffic</span>
       </div>
     </main>
   </div>
