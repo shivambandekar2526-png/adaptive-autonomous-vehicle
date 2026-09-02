@@ -7200,35 +7200,52 @@ class MLPNet {
 }
 
 /**
- * Continuous Actor-Critic Reinforcement Learning Agent for Ego Vehicle
- * Directly maps continuous 20-dimensional simulation state observations to continuous
- * physical vehicle driving inputs: Steering [-1, 1], Throttle [0, 1], and Brake [0, 1].
+ * Continuous Proximal Policy Optimization (PPO-Clip) Agent for Ego Vehicle
+ * Directly outputs continuous steering [-1, 1], throttle [0, 1], and brake [0, 1]
+ * from continuous 22-dimensional simulation environment state observations.
  */
-class EgoRLAgent {
+class EgoPPOAgent {
   constructor(options = {}) {
-    this.obsDim = options.obsDim || 20;
+    this.obsDim = options.obsDim || 22;
     this.actionDim = options.actionDim || 3;
     this.hiddenDims = options.hiddenDims || [64, 64];
 
+    // Actor: outputs mean continuous actions mu = [steer, throttle, brake]
     this.actor = new MLPNet(this.obsDim, this.hiddenDims, this.actionDim, ['tanh', 'sigmoid', 'sigmoid']);
+    // Critic: outputs scalar state-value estimate V(s)
     this.critic = new MLPNet(this.obsDim, this.hiddenDims, 1, ['linear']);
 
-    this.explorationNoise = 0.25;
-    this.minNoise = 0.05;
-    this.noiseDecay = 0.995;
+    // Continuous Gaussian policy standard deviations [steer, throttle, brake]
+    this.logStd = new Float32Array([-0.693, -1.2, -1.2]); // std approx [0.50, 0.30, 0.30]
+    this.minStd = new Float32Array([0.08, 0.05, 0.05]);
+    this.stdDecay = 0.996;
+
+    // Hyperparameters
     this.gamma = 0.99;
-    this.actorLr = 0.0008;
-    this.criticLr = 0.0015;
+    this.gaeLambda = 0.95;
+    this.clipEps = 0.20;
+    this.actorLr = 0.0006;
+    this.criticLr = 0.0012;
+    this.ppoEpochs = 4;
 
     this.episodesTrained = 0;
     this.bestReward = -Infinity;
-    this.trajectory = [];
+    this.rollout = [];
+    this.checkpoints = {};
+  }
+
+  get std() {
+    return [
+      Math.max(this.minStd[0], Math.exp(this.logStd[0])),
+      Math.max(this.minStd[1], Math.exp(this.logStd[1])),
+      Math.max(this.minStd[2], Math.exp(this.logStd[2]))
+    ];
   }
 
   /**
-   * Extract comprehensive, normalized 20-D observation vector from simulation environment
+   * Extract rich, directional 22-D normalized continuous observation vector
    */
-  getObservation(ego, env, routePlanner, dynamicEntities) {
+  getObservation(ego, env, routePlanner, dynamicEntities, prevAction = [0, 0, 0]) {
     if (!ego || !env) return new Array(this.obsDim).fill(0);
 
     const dest = env.destination || { x: 1650, y: 560 };
@@ -7243,29 +7260,6 @@ class EgoRLAgent {
     const topEdgeDist = Math.max(0, Math.min(1.0, (ego.y - 465) / 190));
     const bottomEdgeDist = Math.max(0, Math.min(1.0, (655 - ego.y) / 190));
     const crossTrack = Math.max(-1.0, Math.min(1.0, (ego.y - 560) / 95));
-
-    let routeAngleErr = 0;
-    let lookaheadAngle = relAngle;
-    let progressRatio = 0;
-
-    if (routePlanner && typeof routePlanner.getNavigationTarget === 'function') {
-      const nav = routePlanner.getNavigationTarget(ego, 60);
-      if (nav && nav.hasRoute) {
-        let diff = (nav.targetHeading || 0) - ego.heading;
-        while (diff > Math.PI) diff -= Math.PI * 2;
-        while (diff < -Math.PI) diff += Math.PI * 2;
-        routeAngleErr = diff / Math.PI;
-
-        if (nav.targetLookahead) {
-          const laAngle = Math.atan2(nav.targetLookahead.y - ego.y, nav.targetLookahead.x - ego.x);
-          let laDiff = laAngle - ego.heading;
-          while (laDiff > Math.PI) laDiff -= Math.PI * 2;
-          while (laDiff < -Math.PI) laDiff += Math.PI * 2;
-          lookaheadAngle = laDiff / Math.PI;
-        }
-        progressRatio = (nav.progressPercent || 0) / 100;
-      }
-    }
 
     // 5 Raycast range sensors [-60°, -30°, 0°, +30°, +60°]
     const rayAngles = [-Math.PI / 3, -Math.PI / 6, 0, Math.PI / 6, Math.PI / 3];
@@ -7289,6 +7283,29 @@ class EgoRLAgent {
         }
       }
       rayDistances.push(hitDist / maxRayLen);
+    }
+
+    // Nearest Static Hazard (Pothole / Debris)
+    let nearestHazardDist = 1.0;
+    let nearestHazardAngle = 0.0;
+    if (env && Array.isArray(env.potholes)) {
+      let minDist = 150;
+      for (const p of env.potholes) {
+        const pdx = p.x - ego.x;
+        const pdy = p.y - ego.y;
+        const fwd = pdx * Math.cos(ego.heading) + pdy * Math.sin(ego.heading);
+        if (fwd > -5 && fwd < 150) {
+          const d = Math.hypot(pdx, pdy);
+          if (d < minDist) {
+            minDist = d;
+            nearestHazardDist = Math.max(0, Math.min(1.0, d / 150));
+            let ang = Math.atan2(pdy, pdx) - ego.heading;
+            while (ang > Math.PI) ang -= Math.PI * 2;
+            while (ang < -Math.PI) ang += Math.PI * 2;
+            nearestHazardAngle = ang / Math.PI;
+          }
+        }
+      }
     }
 
     // Nearest Dynamic Agent (Pedestrians, Dogs, Cows)
@@ -7317,79 +7334,86 @@ class EgoRLAgent {
       }
     }
 
-    // Static Pothole Proximity
-    let potholeAhead = 0.0;
-    if (env && Array.isArray(env.potholes)) {
-      for (const p of env.potholes) {
-        const dx = p.x - ego.x;
-        const dy = p.y - ego.y;
-        const fwd = dx * Math.cos(ego.heading) + dy * Math.sin(ego.heading);
-        const lat = Math.abs(dy * Math.cos(ego.heading) - dx * Math.sin(ego.heading));
-        if (fwd > 5 && fwd < 75 && lat < (p.radius + 18)) {
-          potholeAhead = 1.0;
-          break;
-        }
-      }
-    }
-
     return [
+      Math.max(0, Math.min(1.0, ego.x / 1800)),
+      Math.max(0, Math.min(1.0, ego.y / 700)),
       Math.max(-0.5, Math.min(1.0, (ego.speed || 0) / 100)),
       Math.cos(ego.heading),
       Math.sin(ego.heading),
+      Math.max(-1.0, Math.min(1.0, dx / 1600)),
+      Math.max(-1.0, Math.min(1.0, dy / 1600)),
       Math.min(1.0, distToGoal / 1600),
       relAngle / Math.PI,
       topEdgeDist,
       bottomEdgeDist,
       crossTrack,
-      routeAngleErr,
-      lookaheadAngle,
       rayDistances[0],
       rayDistances[1],
       rayDistances[2],
       rayDistances[3],
       rayDistances[4],
+      nearestHazardDist,
+      nearestHazardAngle,
       nearestDynDist,
       nearestDynAngle,
-      potholeAhead,
-      0.0, // turn ahead
-      progressRatio
+      prevAction[0] // Previous steering action for smoothness
     ];
   }
 
   /**
-   * Sample action from policy
-   * @param {Array<number>} obs
-   * @param {boolean} isTraining
+   * Sample action from continuous Gaussian policy
    */
   selectAction(obs, isTraining = true) {
     const actRes = this.actor.forward(obs);
-    const meanAction = actRes.output; // [steer, throttle, brake]
+    const mu = actRes.output; // [steer, throttle, brake]
     const criticRes = this.critic.forward(obs);
     const value = criticRes.output[0];
 
-    const action = [...meanAction];
+    const currentStd = this.std;
+    const action = [...mu];
+    let logProb = 0;
+
     if (isTraining) {
-      // Gaussian exploration noise
-      action[0] = Math.max(-1.0, Math.min(1.0, action[0] + (Math.random() * 2 - 1) * this.explorationNoise));
-      action[1] = Math.max(0.0, Math.min(1.0, action[1] + (Math.random() * 2 - 1) * this.explorationNoise * 0.5));
-      action[2] = Math.max(0.0, Math.min(1.0, action[2] + (Math.random() * 2 - 1) * this.explorationNoise * 0.5));
+      // Gaussian sampling with Box-Muller transform
+      for (let i = 0; i < 3; i++) {
+        const u1 = Math.max(1e-7, Math.random());
+        const u2 = Math.random();
+        const z = Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
+        action[i] = mu[i] + currentStd[i] * z;
+      }
+    }
+
+    // Clamp actions to valid vehicle physics ranges
+    action[0] = Math.max(-1.0, Math.min(1.0, action[0]));
+    action[1] = Math.max(0.0, Math.min(1.0, action[1]));
+    action[2] = Math.max(0.0, Math.min(1.0, action[2]));
+
+    // Compute log probability density of sampled action under Gaussian distribution
+    for (let i = 0; i < 3; i++) {
+      const diff = (action[i] - mu[i]) / currentStd[i];
+      logProb += -0.5 * (diff * diff + 2.0 * Math.log(currentStd[i]) + 1.837877);
     }
 
     return {
       action,
-      meanAction,
+      meanAction: mu,
       value,
+      logProb,
       actorActivations: actRes.activations,
       criticActivations: criticRes.activations
     };
   }
 
+  /**
+   * Record step into PPO rollout buffer
+   */
   recordStep(obs, actionData, reward, done) {
-    this.trajectory.push({
+    this.rollout.push({
       obs,
       action: actionData.action,
       meanAction: actionData.meanAction,
       value: actionData.value,
+      logProb: actionData.logProb,
       actorActivations: actionData.actorActivations,
       criticActivations: actionData.criticActivations,
       reward,
@@ -7397,20 +7421,25 @@ class EgoRLAgent {
     });
   }
 
-  trainOnEpisode() {
-    const N = this.trajectory.length;
+  /**
+   * Optimize policy using PPO-Clip with GAE advantage estimation
+   */
+  trainPPO() {
+    const N = this.rollout.length;
     if (N === 0) return 0;
 
-    // 1. Compute discounted returns & advantages
+    // 1. Compute Generalized Advantage Estimator (GAE)
     const returns = new Float32Array(N);
     const advantages = new Float32Array(N);
-    let runningReturn = 0;
+    let gae = 0;
 
     for (let t = N - 1; t >= 0; t--) {
-      const step = this.trajectory[t];
-      runningReturn = step.reward + (step.done ? 0 : this.gamma * runningReturn);
-      returns[t] = runningReturn;
-      advantages[t] = returns[t] - step.value;
+      const step = this.rollout[t];
+      const nextValue = (t === N - 1 || step.done) ? 0 : this.rollout[t + 1].value;
+      const delta = step.reward + this.gamma * nextValue * (step.done ? 0 : 1) - step.value;
+      gae = delta + this.gamma * this.gaeLambda * (step.done ? 0 : 1) * gae;
+      advantages[t] = gae;
+      returns[t] = advantages[t] + step.value;
     }
 
     // Normalize advantages for gradient stability
@@ -7425,49 +7454,86 @@ class EgoRLAgent {
       advantages[t] = (advantages[t] - meanAdv) / stdAdv;
     }
 
-    // 2. Compute and apply Actor & Critic gradients
-    for (let t = 0; t < N; t++) {
-      const step = this.trajectory[t];
-      const adv = advantages[t];
+    // 2. Multi-epoch PPO Clipped Updates
+    const currentStd = this.std;
 
-      // Policy Gradient: - (a - mu) * adv
-      const gradActorOutput = [
-        -(step.action[0] - step.meanAction[0]) * adv,
-        -(step.action[1] - step.meanAction[1]) * adv,
-        -(step.action[2] - step.meanAction[2]) * adv
-      ];
+    for (let epoch = 0; epoch < this.ppoEpochs; epoch++) {
+      for (let t = 0; t < N; t++) {
+        const step = this.rollout[t];
+        const adv = advantages[t];
 
-      const actorGrads = this.actor.backward(step.actorActivations, gradActorOutput);
-      this.actor.applyGradients(actorGrads.gradWeights, actorGrads.gradBiases, this.actorLr);
+        // Forward pass to get current policy action mean
+        const actRes = this.actor.forward(step.obs);
+        const muCurr = actRes.output;
 
-      // Critic MSE gradient: 2 * (V(s) - Return)
-      const gradCriticOutput = [2.0 * (step.value - returns[t])];
-      const criticGrads = this.critic.backward(step.criticActivations, gradCriticOutput);
-      this.critic.applyGradients(criticGrads.gradWeights, criticGrads.gradBiases, this.criticLr);
+        // Current log-prob under updated policy
+        let logProbCurr = 0;
+        for (let i = 0; i < 3; i++) {
+          const diff = (step.action[i] - muCurr[i]) / currentStd[i];
+          logProbCurr += -0.5 * (diff * diff + 2.0 * Math.log(currentStd[i]) + 1.837877);
+        }
+
+        // Probability ratio r_t(theta) = exp(logpi_curr - logpi_old)
+        const ratio = Math.exp(Math.max(-10, Math.min(10, logProbCurr - step.logProb)));
+        const clippedRatio = Math.max(1.0 - this.clipEps, Math.min(1.0 + this.clipEps, ratio));
+
+        // PPO Clipped Gradient Direction
+        let gradMultiplier = ratio * adv;
+        if (adv > 0 && ratio > 1.0 + this.clipEps) {
+          gradMultiplier = 0; // Clipped upper bound
+        } else if (adv < 0 && ratio < 1.0 - this.clipEps) {
+          gradMultiplier = 0; // Clipped lower bound
+        }
+
+        // Actor Gradient wrt mu: - gradMultiplier * (a - mu) / std^2
+        const gradActorOutput = [
+          -(step.action[0] - muCurr[0]) / (currentStd[0] * currentStd[0] + 1e-6) * gradMultiplier,
+          -(step.action[1] - muCurr[1]) / (currentStd[1] * currentStd[1] + 1e-6) * gradMultiplier,
+          -(step.action[2] - muCurr[2]) / (currentStd[2] * currentStd[2] + 1e-6) * gradMultiplier
+        ];
+
+        const actorGrads = this.actor.backward(actRes.activations, gradActorOutput);
+        this.actor.applyGradients(actorGrads.gradWeights, actorGrads.gradBiases, this.actorLr);
+
+        // Critic Gradient: 2 * (V(s) - Return)
+        const criticRes = this.critic.forward(step.obs);
+        const gradCriticOutput = [2.0 * (criticRes.output[0] - returns[t])];
+        const criticGrads = this.critic.backward(criticRes.activations, gradCriticOutput);
+        this.critic.applyGradients(criticGrads.gradWeights, criticGrads.gradBiases, this.criticLr);
+      }
     }
 
     this.episodesTrained++;
-    this.explorationNoise = Math.max(this.minNoise, this.explorationNoise * this.noiseDecay);
-    this.trajectory = [];
+    for (let i = 0; i < 3; i++) {
+      this.logStd[i] = Math.log(Math.max(this.minStd[i], Math.exp(this.logStd[i]) * this.stdDecay));
+    }
+    this.rollout = [];
     return N;
   }
 
-  save(key = 'ego_rl_model') {
+  saveCheckpoint(episode, name) {
+    const ckptKey = name || `ppo_checkpoint_ep${episode}`;
+    const data = this.save(ckptKey);
+    this.checkpoints[ckptKey] = { episode, bestReward: this.bestReward, date: Date.now() };
+    return data;
+  }
+
+  save(key = 'ego_ppo_model') {
     const data = {
       episodesTrained: this.episodesTrained,
       bestReward: this.bestReward,
-      explorationNoise: this.explorationNoise,
+      logStd: Array.from(this.logStd),
       actor: this.actor.serialize(),
       critic: this.critic.serialize()
     };
     if (typeof localStorage !== 'undefined') {
       localStorage.setItem(key, JSON.stringify(data));
-      console.log(`[EgoRLAgent] Model saved successfully to localStorage key "${key}".`);
+      console.log(`[EgoPPOAgent] PPO model saved to localStorage key "${key}".`);
     }
     return data;
   }
 
-  load(key = 'ego_rl_model') {
+  load(key = 'ego_ppo_model') {
     if (typeof localStorage === 'undefined') return false;
     const raw = localStorage.getItem(key);
     if (!raw) return false;
@@ -7475,45 +7541,48 @@ class EgoRLAgent {
       const data = JSON.parse(raw);
       this.episodesTrained = data.episodesTrained || 0;
       this.bestReward = data.bestReward || -Infinity;
-      this.explorationNoise = data.explorationNoise || 0.15;
+      if (data.logStd) this.logStd = new Float32Array(data.logStd);
       if (data.actor) this.actor.deserialize(data.actor);
       if (data.critic) this.critic.deserialize(data.critic);
-      console.log(`[EgoRLAgent] Model loaded successfully (episodes: ${this.episodesTrained}).`);
+      console.log(`[EgoPPOAgent] PPO model loaded successfully (episodes: ${this.episodesTrained}).`);
       return true;
     } catch (e) {
-      console.error('[EgoRLAgent] Failed to load model:', e);
+      console.error('[EgoPPOAgent] Failed to load model:', e);
       return false;
     }
   }
 }
 
+// Alias EgoRLAgent to EgoPPOAgent for backward compatibility
+const EgoRLAgent = EgoPPOAgent;
+
 /**
  * Reinforcement Learning Training & Evaluation Manager
- * Controls the episode training loop, reward computation, stats tracking, and visual rendering.
+ * Controls the episode training loop, reward computation, 100-episode statistics tracking, and HUD.
  */
 class RLTrainingManager {
   constructor(simulationEngine, rlAgent) {
     this.engine = simulationEngine;
-    this.agent = rlAgent || new EgoRLAgent();
+    this.agent = rlAgent || new EgoPPOAgent();
     this.mode = 'OFF'; // 'OFF', 'TRAINING', 'EVALUATION'
     
-    this.disableDynamicTraffic = false; // Pedestrians & animals are active in the RL training environment
     this.maxEpisodeSteps = 1200;
     this.currentStep = 0;
     this.currentEpisode = 0;
     this.currentEpisodeReward = 0;
     this.prevDistanceToGoal = 0;
 
-    // Running metrics
+    // Cumulative and rolling statistics
     this.episodeRewards = [];
-    this.successCount = 0;
-    this.crashCount = 0;
-    this.offRoadCount = 0;
-    this.timeoutCount = 0;
-    this.lastTerminationReason = 'NONE';
-    this.turboMultiplier = 1; // 1x visual, can be set to 5x or 10x for fast training
+    this.episodeSuccesses = [];
+    this.episodeLengths = [];
+    this.totalCollisions = 0;
+    this.totalRoadDepartures = 0;
+    this.totalSuccesses = 0;
 
+    this.lastTerminationReason = 'NONE';
     this.lastAction = [0, 0, 0];
+    this.prevSteerAction = 0;
   }
 
   isActive() {
@@ -7533,7 +7602,6 @@ class RLTrainingManager {
     if (this.isActive()) {
       this.resetEpisode();
       if (this.isTraining() && this.agent.episodesTrained === 0) {
-        // Attempt loading existing model
         this.agent.load();
       }
     }
@@ -7562,6 +7630,7 @@ class RLTrainingManager {
     this.currentEpisode++;
     this.currentEpisodeReward = 0;
     this.lastTerminationReason = 'RUNNING';
+    this.prevSteerAction = 0;
 
     const dest = env.destination || { x: 1650, y: 560 };
     this.prevDistanceToGoal = Math.hypot(dest.x - ego.x, dest.y - ego.y);
@@ -7591,12 +7660,12 @@ class RLTrainingManager {
     }
 
     const dynEntities = this.engine.trafficManager ? this.engine.trafficManager.getEntities() : [];
-    const obs = this.agent.getObservation(ego, env, routePlanner, dynEntities);
+    const obs = this.agent.getObservation(ego, env, routePlanner, dynEntities, this.lastAction);
     const isTraining = this.isTraining();
     const actData = this.agent.selectAction(obs, isTraining);
     this.lastAction = actData.action;
 
-    // Apply continuous RL actions directly to EgoVehicle inputs
+    // Apply continuous PPO actions directly to EgoVehicle physics inputs
     ego.inputs.steer = actData.action[0];
     ego.inputs.throttle = actData.action[1];
     ego.inputs.brake = actData.action[2];
@@ -7609,31 +7678,37 @@ class RLTrainingManager {
     // Compute Step Reward
     const dest = env.destination || { x: 1650, y: 560 };
     const currDist = Math.hypot(dest.x - ego.x, dest.y - ego.y);
-    let reward = (this.prevDistanceToGoal - currDist) * 1.5;
+    let reward = (this.prevDistanceToGoal - currDist) * 2.0; // Forward progress reward
     this.prevDistanceToGoal = currDist;
 
-    // Centerline / Road corridor bonus
-    reward += 0.25 * (1 - Math.min(1, Math.abs(ego.y - 560) / 45));
+    // Centerline / Road corridor centering bonus
+    reward += 0.30 * (1 - Math.min(1, Math.abs(ego.y - 560) / 45));
     // Forward velocity bonus
-    reward += 0.20 * Math.max(0, (ego.speed || 0) / 80);
-    // Smoothness penalty
-    reward -= 0.03 * (actData.action[0] * actData.action[0]);
+    reward += 0.25 * Math.max(0, (ego.speed || 0) / 80);
+
+    // Smoothness penalty: Penalize rapid steering changes and excessive steering magnitude
+    const steerDelta = actData.action[0] - this.prevSteerAction;
+    reward -= 0.06 * (steerDelta * steerDelta);
+    reward -= 0.02 * (actData.action[0] * actData.action[0]);
+    this.prevSteerAction = actData.action[0];
+
     // Step cost
     reward -= 0.04;
 
-    // Stationary penalty
+    // Stationary penalty (prevents car from standing still)
     if (Math.abs(ego.speed) < 2.0 && currDist > 60) {
-      reward -= 0.25;
+      reward -= 0.30;
     }
 
-    // Dynamic Pedestrian / Animal / Static Hazard proximity safety penalty
-    if (obs[15] < 0.35) {
-      reward -= 0.20 * (1.0 - obs[15] / 0.35);
+    // Dynamic Pedestrian / Animal / Hazard proximity safety penalty
+    if (obs[19] < 0.30) {
+      reward -= 0.20 * (1.0 - obs[19] / 0.30);
     }
 
     // Check Termination Conditions
     let done = false;
     let reason = 'RUNNING';
+    let isSuccess = false;
 
     const isOffRoad = typeof window !== 'undefined' && window.StaticCollisionSystem
       ? !window.StaticCollisionSystem.isDrivableRoad(ego.x, ego.y)
@@ -7645,22 +7720,22 @@ class RLTrainingManager {
       reward += 500.0;
       done = true;
       reason = 'ARRIVED';
-      this.successCount++;
+      isSuccess = true;
+      this.totalSuccesses++;
     } else if (isCollided) {
       reward -= 200.0;
       done = true;
       reason = 'COLLISION';
-      this.crashCount++;
+      this.totalCollisions++;
     } else if (isOffRoad) {
       reward -= 200.0;
       done = true;
       reason = 'OFF_ROAD';
-      this.offRoadCount++;
+      this.totalRoadDepartures++;
     } else if (this.currentStep >= this.maxEpisodeSteps) {
       reward -= 50.0;
       done = true;
       reason = 'TIMEOUT';
-      this.timeoutCount++;
     }
 
     this.currentEpisodeReward += reward;
@@ -7671,40 +7746,74 @@ class RLTrainingManager {
 
     if (done) {
       this.lastTerminationReason = reason;
-      this.episodeRewards.push(this.currentEpisodeReward);
-      if (this.episodeRewards.length > 20) this.episodeRewards.shift();
 
+      // Track rolling history (last 100 episodes)
+      this.episodeRewards.push(this.currentEpisodeReward);
+      this.episodeSuccesses.push(isSuccess ? 1 : 0);
+      this.episodeLengths.push(this.currentStep);
+
+      if (this.episodeRewards.length > 100) this.episodeRewards.shift();
+      if (this.episodeSuccesses.length > 100) this.episodeSuccesses.shift();
+      if (this.episodeLengths.length > 100) this.episodeLengths.shift();
+
+      // Display after every episode
+      console.log(`[PPO Episode ${this.currentEpisode}] Reward: ${this.currentEpisodeReward.toFixed(2)} | Success: ${isSuccess} | Steps: ${this.currentStep} | DistToGoal: ${currDist.toFixed(1)}px | Reason: ${reason} | Total Collisions: ${this.totalCollisions} | Total OffRoad: ${this.totalRoadDepartures}`);
+
+      // Periodically display 100-episode statistics (every 10 or 25 episodes)
+      if (this.currentEpisode % 10 === 0) {
+        const stats = this.get100EpisodeStats();
+        console.log(`=== [PPO Progress Report: Ep ${this.currentEpisode}] AvgReward(100): ${stats.avgReward100} | SuccessRate(100): ${stats.successRate100} | AvgLength(100): ${stats.avgLength100} ===`);
+        if (isTraining) {
+          this.agent.saveCheckpoint(this.currentEpisode);
+        }
+      }
+
+      // Checkpoint best reward
       if (this.currentEpisodeReward > this.agent.bestReward) {
         this.agent.bestReward = this.currentEpisodeReward;
-        if (isTraining) this.agent.save();
+        if (isTraining) this.agent.save('ego_ppo_best_model');
       }
 
+      // Update PPO policy network on episode completion
       if (isTraining) {
-        this.agent.trainOnEpisode();
+        this.agent.trainPPO();
       }
 
-      // Automatically reset for next episode
+      // Reset environment for next episode
       this.resetEpisode();
     }
   }
 
+  get100EpisodeStats() {
+    const len = this.episodeRewards.length || 1;
+    const avgReward = (this.episodeRewards.reduce((a, b) => a + b, 0) / len).toFixed(2);
+    const successRate = ((this.episodeSuccesses.reduce((a, b) => a + b, 0) / len) * 100).toFixed(1) + '%';
+    const avgLength = (this.episodeLengths.reduce((a, b) => a + b, 0) / len).toFixed(1);
+
+    return {
+      windowSize: len,
+      avgReward100: avgReward,
+      successRate100: successRate,
+      avgLength100: avgLength
+    };
+  }
+
   getMetrics() {
-    let meanReward = 0;
-    if (this.episodeRewards.length > 0) {
-      meanReward = this.episodeRewards.reduce((a, b) => a + b, 0) / this.episodeRewards.length;
-    }
-    const totalEpisodes = this.currentEpisode || 1;
-    const successRate = ((this.successCount / totalEpisodes) * 100).toFixed(1);
+    const stats100 = this.get100EpisodeStats();
+    const currentDist = (this.prevDistanceToGoal || 0).toFixed(1);
 
     return {
       mode: this.mode,
       episode: this.currentEpisode,
       step: this.currentStep,
       currentReward: this.currentEpisodeReward.toFixed(1),
-      meanReward: meanReward.toFixed(1),
+      avgReward100: stats100.avgReward100,
+      successRate100: stats100.successRate100,
+      avgLength100: stats100.avgLength100,
       bestReward: this.agent.bestReward === -Infinity ? '0.0' : this.agent.bestReward.toFixed(1),
-      successRate: `${successRate}%`,
-      explorationNoise: this.agent.explorationNoise.toFixed(3),
+      totalCollisions: this.totalCollisions,
+      totalOffRoad: this.totalRoadDepartures,
+      distToGoal: `${currentDist}px`,
       lastReason: this.lastTerminationReason,
       steer: this.lastAction[0].toFixed(2),
       throttle: this.lastAction[1].toFixed(2),
@@ -7713,7 +7822,7 @@ class RLTrainingManager {
   }
 
   /**
-   * Render real-time RL HUD Overlay on simulation canvas
+   * Render real-time PPO HUD Overlay on simulation canvas
    */
   renderHUD(ctx, camera) {
     if (!this.isActive() || !ctx) return;
@@ -7724,12 +7833,12 @@ class RLTrainingManager {
     const m = this.getMetrics();
     const cardX = 20;
     const cardY = 120;
-    const cardW = 260;
-    const cardH = 200;
+    const cardW = 270;
+    const cardH = 220;
 
     // Glassmorphic Card Background
-    ctx.fillStyle = 'rgba(15, 23, 42, 0.92)';
-    ctx.strokeStyle = this.isTraining() ? 'rgba(6, 182, 212, 0.6)' : 'rgba(16, 185, 129, 0.6)';
+    ctx.fillStyle = 'rgba(15, 23, 42, 0.94)';
+    ctx.strokeStyle = this.isTraining() ? 'rgba(6, 182, 212, 0.7)' : 'rgba(16, 185, 129, 0.7)';
     ctx.lineWidth = 1.5;
 
     ctx.beginPath();
@@ -7740,24 +7849,25 @@ class RLTrainingManager {
     // Card Header Badge
     ctx.fillStyle = this.isTraining() ? '#06b6d4' : '#10b981';
     ctx.font = 'bold 12px "Segoe UI", sans-serif';
-    ctx.fillText(`🧠 RL ${this.mode} MODE`, cardX + 14, cardY + 22);
+    ctx.fillText(`🧠 PPO CONTINUOUS RL (${this.mode})`, cardX + 14, cardY + 22);
 
     ctx.fillStyle = '#94a3b8';
     ctx.font = '11px "Segoe UI", sans-serif';
     ctx.fillText(`Episode: ${m.episode}  (Step: ${m.step})`, cardX + 14, cardY + 42);
-    ctx.fillText(`Reward: ${m.currentReward}  |  Mean: ${m.meanReward}`, cardX + 14, cardY + 62);
-    ctx.fillText(`Best: ${m.bestReward}  |  Success: ${m.successRate}`, cardX + 14, cardY + 82);
-    ctx.fillText(`Exploration Noise (σ): ${m.explorationNoise}`, cardX + 14, cardY + 102);
-    ctx.fillText(`Last End: ${m.lastReason}`, cardX + 14, cardY + 122);
+    ctx.fillText(`Reward: ${m.currentReward}  |  Avg(100): ${m.avgReward100}`, cardX + 14, cardY + 62);
+    ctx.fillText(`Success (100): ${m.successRate100}  |  AvgLen: ${m.avgLength100}`, cardX + 14, cardY + 82);
+    ctx.fillText(`Collisions: ${m.totalCollisions}  |  Off-Road: ${m.totalOffRoad}`, cardX + 14, cardY + 102);
+    ctx.fillText(`Goal Dist: ${m.distToGoal}  |  Best: ${m.bestReward}`, cardX + 14, cardY + 122);
+    ctx.fillText(`Last End: ${m.lastReason}`, cardX + 14, cardY + 142);
 
-    // Action Meters
-    ctx.fillText(`Steering: [ ${m.steer} ]`, cardX + 14, cardY + 146);
-    ctx.fillText(`Throttle: [ ${m.throttle} ]  Brake: [ ${m.brake} ]`, cardX + 14, cardY + 168);
+    // Continuous Control Gauges
+    ctx.fillText(`Steering: [ ${m.steer} ]`, cardX + 14, cardY + 166);
+    ctx.fillText(`Throttle: [ ${m.throttle} ]  Brake: [ ${m.brake} ]`, cardX + 14, cardY + 188);
 
-    // Mini Steering Bar
-    const barX = cardX + 140;
-    const barY = cardY + 138;
-    const barW = 90;
+    // Mini Steering Meter Bar
+    const barX = cardX + 150;
+    const barY = cardY + 158;
+    const barW = 95;
     const barH = 10;
     ctx.fillStyle = 'rgba(30, 41, 59, 0.9)';
     ctx.fillRect(barX, barY, barW, barH);
@@ -8585,8 +8695,8 @@ class SimulationAppController {
       this.detectionManager.render(this.ctx, this.egoVehicle);
     }
 
-    // Render Adaptive Candidate Paths & Selected Path (Module 5)
-    if (this.pathPlanner) {
+    // Render Adaptive Candidate Paths & Selected Path (Module 5) - Only when not in RL mode
+    if (this.pathPlanner && !(this.rlTrainingManager && this.rlTrainingManager.isActive())) {
       this.pathPlanner.render(this.ctx);
     }
 
@@ -8795,6 +8905,7 @@ window.RoadSegment = RoadSegment;
 window.GlobalRoutePlanner = GlobalRoutePlanner;
 window.GlobalRouteSystem = GlobalRouteSystem;
 window.MLPNet = MLPNet;
+window.EgoPPOAgent = EgoPPOAgent;
 window.EgoRLAgent = EgoRLAgent;
 window.RLTrainingManager = RLTrainingManager;
 
