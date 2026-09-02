@@ -5618,20 +5618,21 @@ class PathPlanner {
         potholePenalty += 400; // Moderate penalty: prefers avoiding when practical, passable if avoiding would cause collision
       }
 
-      // D. Drivable Road Envelope Check
-      const onMainRoad = (wp.y >= 465 && wp.y <= 655) && (wp.x >= 0 && wp.x <= 1800);
-      const onSideRoad = (wp.x >= 860 && wp.x <= 980) && (wp.y >= 0 && wp.y <= 560);
+      // D. Drivable Road Envelope Check (using vehicle body footprint width)
+      const vehicleHalfW = 10; // Vehicle body half-width
+      const onMainRoad = ((wp.y - vehicleHalfW) >= 465 && (wp.y + vehicleHalfW) <= 655) && (wp.x >= 0 && wp.x <= 1800);
+      const onSideRoad = ((wp.x - vehicleHalfW) >= 860 && (wp.x + vehicleHalfW) <= 980) && (wp.y >= 0 && wp.y <= 560);
 
       if (!onMainRoad && !onSideRoad) {
         isOffRoad = true;
         roadCost += 5000;
       } else {
-        // Preferred lane centering & shoulder avoidance: strongly penalize running into road shoulders (y < 480 or y > 640)
+        // Mild preference for lane center without blocking valid drivable road edge bypasses
         if (onMainRoad) {
-          if (wp.y > 640) {
-            roadCost += (wp.y - 640) * 85;
-          } else if (wp.y < 480) {
-            roadCost += (480 - wp.y) * 85;
+          if (wp.y > 645) {
+            roadCost += (wp.y - 645) * 15;
+          } else if (wp.y < 475) {
+            roadCost += (475 - wp.y) * 15;
           }
         }
       }
@@ -6572,7 +6573,19 @@ class AutonomousVehicleController {
           this.targetSpeed = this.config.reverseSpeed; // -26 px/s
           egoVehicle.inputs.throttle = -0.65;
           egoVehicle.inputs.brake = 0;
-          egoVehicle.inputs.steer = 0;
+
+          // Reverse steering: calculate steering to rotate heading back towards road and clear front obstacle
+          let revTargetHeading = (nav && nav.targetHeading !== undefined) ? nav.targetHeading : 0;
+          let revHeadingDiff = egoHeading - revTargetHeading;
+          while (revHeadingDiff > Math.PI) revHeadingDiff -= Math.PI * 2;
+          while (revHeadingDiff < -Math.PI) revHeadingDiff += Math.PI * 2;
+
+          // Cross-track error compensation in reverse
+          const cte = (nav && nav.crossTrackError !== undefined) ? nav.crossTrackError : 0;
+          // In reverse: positive heading error (pointed right/down) -> steer right (+delta) to rotate CCW back to road
+          const revSteerCmd = Math.max(-0.85, Math.min(0.85, 1.35 * revHeadingDiff + 0.015 * cte));
+          egoVehicle.inputs.steer += (revSteerCmd - egoVehicle.inputs.steer) * 8.0 * dt;
+
           this.reverseTimer = (this.reverseTimer || 0) + dt;
           if (this.reverseTimer >= 1.5) {
             this.reverseTimer = 0;
@@ -6642,7 +6655,7 @@ class AutonomousVehicleController {
       }
     }
 
-    // 5. Lateral Route Following & Path Tracking (Pure Pursuit + Alignment Damping)
+    // 5. Lateral Route Following & Path Tracking (Pure Pursuit + Alignment Damping + Straightening)
     let desiredSteerAngle = 0;
 
     // Prevent steering oscillation when waiting, stopped, or stuck
@@ -6676,7 +6689,13 @@ class AutonomousVehicleController {
       // Pure pursuit delta = atan2(2 * L * sin(alpha), lookaheadDist)
       const L = egoVehicle.wheelbase || 26;
       const delta = Math.atan2(2 * L * Math.sin(lookaheadHeadingError), dynamicLookahead);
-      const targetSteer = 0.85 * (delta / (egoVehicle.maxSteeringAngle || 0.55)) + 0.15 * (routeAlignError / (egoVehicle.maxSteeringAngle || 0.55));
+      let targetSteer = 0.85 * (delta / (egoVehicle.maxSteeringAngle || 0.55)) + 0.15 * (routeAlignError / (egoVehicle.maxSteeringAngle || 0.55));
+
+      // Straightening Deadband: when closely aligned to route, center the steering to eliminate snake-like micro-oscillations
+      if (Math.abs(lookaheadHeadingError) < 0.035 && Math.abs(routeAlignError) < 0.035 && Math.abs(nav.crossTrackError) < 3.5) {
+        targetSteer = 0.25 * (routeAlignError / (egoVehicle.maxSteeringAngle || 0.55));
+      }
+
       desiredSteerAngle = Math.max(-0.85, Math.min(0.85, targetSteer));
 
       // Curvature speed reduction
@@ -6725,7 +6744,7 @@ class AutonomousVehicleController {
 
     // Smooth steering rate transition (anti-oscillation low-pass filter)
     if (this.controlState !== 'WAITING' && this.controlState !== 'STOPPED' && !this.isStuck) {
-      const steerRate = 8.0;
+      const steerRate = 7.0;
       egoVehicle.inputs.steer += (desiredSteerAngle - egoVehicle.inputs.steer) * steerRate * dt;
       egoVehicle.inputs.steer = Math.max(-1.0, Math.min(1.0, egoVehicle.inputs.steer));
     }
