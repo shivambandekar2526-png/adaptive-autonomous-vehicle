@@ -3046,18 +3046,26 @@ class TrafficAgentNavigator {
     this.route = null;
     this.routeWaypoints = [];
     this.currentWaypointIndex = 0;
-    this.navState = 'CRUISING'; // 'CRUISING', 'FOLLOWING', 'AVOIDING', 'STOPPED', 'YIELDING'
+    this.navState = 'CRUISING'; // 'CRUISING', 'FOLLOWING', 'YIELDING', 'AVOIDING', 'OVERTAKING', 'STOPPED'
     
     // Lookahead, headway, and dynamics parameters
     this.lookaheadDistance = (vehicle.type === 'motorcycle') ? 32 : 42;
     this.waypointTolerance = 26;
-    this.minSafeDistance = Math.max(32, (vehicle.length || 44) * 0.75 + 14);
+    this.minSafeDistance = Math.max(30, (vehicle.length || 44) * 0.75 + 12);
     this.timeHeadway = 1.3; // seconds
     this.maxTurnRate = (vehicle.type === 'motorcycle') ? 4.5 : 3.2; // rad/s
     this.maxAccel = (vehicle.type === 'motorcycle') ? 180 : 120; // px/s^2
     this.maxDecel = 280; // px/s^2
+
+    // Interaction & Coordination State
     this.leadVehicle = null;
     this.leadDistance = Infinity;
+    this.yieldWaitTimer = 0;
+    this.stuckTimer = 0;
+    this.overtakeState = 'NONE'; // 'NONE', 'PASSING', 'RETURNING'
+    this.overtakeTargetLaneY = 0;
+    this.nominalLaneY = vehicle.y || 600;
+    this.overtakeTimer = 0;
 
     // Initialize initial destination & route on the road graph
     this.initDestinationAndRoute();
@@ -3073,12 +3081,15 @@ class TrafficAgentNavigator {
     if (v.route && v.route.road === 'side') {
       // Side road vehicle heading South: destination is Eastbound main road
       this.destination = { x: 1750, y: 600, road: 'main', lane: 'eastbound' };
+      this.nominalLaneY = 600;
     } else {
       const isEastbound = (Math.abs(v.heading) < 0.8 || (v.heading > -0.8 && v.heading < 0.8));
       if (isEastbound) {
         this.destination = { x: 1750, y: 600, road: 'main', lane: 'eastbound' };
+        this.nominalLaneY = 600;
       } else {
         this.destination = { x: 50, y: 520, road: 'main', lane: 'westbound' };
+        this.nominalLaneY = 520;
       }
     }
 
@@ -3109,25 +3120,33 @@ class TrafficAgentNavigator {
    */
   onReachedDestination() {
     const v = this.vehicle;
+    this.overtakeState = 'NONE';
+    this.overtakeTimer = 0;
+
     if (v.x >= 1680) {
       // At East end of main road -> smoothly transition to Westbound lane (node-mw-0 -> node-mw-12)
       this.destination = { x: 50, y: 520, road: 'main', lane: 'westbound' };
+      this.nominalLaneY = 520;
     } else if (v.x <= 120) {
       // At West end of main road -> smoothly transition to Eastbound lane (node-me-0 -> node-me-12)
       this.destination = { x: 1750, y: 600, road: 'main', lane: 'eastbound' };
+      this.nominalLaneY = 600;
     } else if (v.y <= 90 && (v.x >= 840 && v.x <= 980)) {
       // At top of side road -> transition to Southbound lane towards main road
       this.destination = { x: 1750, y: 600, road: 'main', lane: 'eastbound' };
+      this.nominalLaneY = 600;
     } else {
       // Default to Eastbound
       this.destination = { x: 1750, y: 600, road: 'main', lane: 'eastbound' };
+      this.nominalLaneY = 600;
     }
 
     this.planRouteTo(this.destination);
   }
 
   /**
-   * Continuous navigation update loop: Waypoint following + Vehicle following + Obstacle awareness
+   * Continuous navigation update loop:
+   * Waypoint following + Intersection Yielding + Queue Headway + Safe Overtaking + Boundary Control
    */
   update(dt, egoVehicle, allEntities, environmentData) {
     if (!this.vehicle.active) return;
@@ -3171,20 +3190,22 @@ class TrafficAgentNavigator {
       lookaheadTarget = wp;
     }
 
-    const targetHeading = Math.atan2(lookaheadTarget.y - v.y, lookaheadTarget.x - v.x);
+    // Apply active overtaking lateral target if passing
+    let targetX = lookaheadTarget.x;
+    let targetY = lookaheadTarget.y;
+    if (this.overtakeState === 'PASSING') {
+      targetY = this.overtakeTargetLaneY;
+    }
+
+    const targetHeading = Math.atan2(targetY - v.y, targetX - v.x);
     let headingDiff = targetHeading - v.heading;
     while (headingDiff > Math.PI) headingDiff -= Math.PI * 2;
     while (headingDiff < -Math.PI) headingDiff += Math.PI * 2;
 
-    // 4. Basic Vehicle Following & Lead Vehicle Detection
-    let targetSpeed = currWp.speedLimit ? Math.min(v.baseSpeed, currWp.speedLimit) : v.baseSpeed;
-    this.leadVehicle = null;
-    this.leadDistance = Infinity;
-
+    // 4. Surroundings Perception (Ego & Other Dynamic Entities)
     const cosH = Math.cos(v.heading);
     const sinH = Math.sin(v.heading);
 
-    // Check all dynamic entities (including ego vehicle)
     const candidates = [];
     if (egoVehicle) candidates.push(egoVehicle);
     if (Array.isArray(allEntities)) {
@@ -3192,6 +3213,9 @@ class TrafficAgentNavigator {
         if (ent.id !== v.id && ent.active) candidates.push(ent);
       }
     }
+
+    this.leadVehicle = null;
+    this.leadDistance = Infinity;
 
     for (const cand of candidates) {
       // Skip irrelevant sidewalk pedestrians
@@ -3207,8 +3231,13 @@ class TrafficAgentNavigator {
       const lat = Math.abs(dy * cosH - dx * sinH);
       const candRadius = cand.radius || 14;
 
-      // In vehicle forward travel corridor
-      if (fwd > 0 && fwd < 130 && lat < (v.radius + candRadius + 8)) {
+      // In vehicle forward travel corridor and travelling in same direction
+      let headingDiffCand = Math.abs((cand.heading || 0) - v.heading);
+      while (headingDiffCand > Math.PI) headingDiffCand -= Math.PI * 2;
+      headingDiffCand = Math.abs(headingDiffCand);
+      const isSameDirection = headingDiffCand < 1.1;
+
+      if (fwd > 0 && fwd < 140 && lat < (v.radius + candRadius + 8) && isSameDirection) {
         if (fwd < this.leadDistance) {
           this.leadDistance = fwd;
           this.leadVehicle = cand;
@@ -3216,34 +3245,123 @@ class TrafficAgentNavigator {
       }
     }
 
-    // Regulate speed for lead vehicle following
-    if (this.leadVehicle) {
+    let targetSpeed = currWp.speedLimit ? Math.min(v.baseSpeed, currWp.speedLimit) : v.baseSpeed;
+    let interactionDecision = 'CRUISING';
+
+    // 5. Intersection Yielding & Priority Coordination (T-Junction Conflict Zone)
+    // Side road vehicle approaching junction (Y in [360, 465], heading South)
+    const isApproachingJunction = (v.y >= 360 && v.y <= 465 && v.x >= 840 && v.x <= 980 && Math.sin(v.heading) > 0.5);
+    if (isApproachingJunction) {
+      // Check for main road through traffic across conflict zone (X in [720, 1120], Y in [490, 630])
+      let mainRoadTrafficActive = false;
+      for (const cand of candidates) {
+        if (cand.x >= 720 && cand.x <= 1120 && cand.y >= 490 && cand.y <= 630) {
+          const candSpeed = Math.abs(cand.speed || 0);
+          if (candSpeed > 6.0 || Math.hypot(cand.x - 920, cand.y - 560) < 95) {
+            mainRoadTrafficActive = true;
+            break;
+          }
+        }
+      }
+
+      if (mainRoadTrafficActive) {
+        this.yieldWaitTimer += dt;
+        // Priority escalation / deadlock prevention: if waited > 2.5s, grant right of way
+        if (this.yieldWaitTimer < 2.5) {
+          if (v.y >= 430) {
+            targetSpeed = 0;
+            interactionDecision = 'YIELDING';
+          } else {
+            targetSpeed = Math.min(targetSpeed, 25);
+            interactionDecision = 'YIELDING';
+          }
+        } else {
+          // Escalated priority: proceed smoothly through the turn
+          targetSpeed = Math.min(targetSpeed, 35);
+          interactionDecision = 'CRUISING';
+        }
+      } else {
+        this.yieldWaitTimer = 0;
+      }
+    } else {
+      this.yieldWaitTimer = 0;
+    }
+
+    // 6. Progressive Multi-Vehicle Queue Headway & Anti-Clustering
+    if (this.leadVehicle && interactionDecision !== 'YIELDING') {
       const lead = this.leadVehicle;
       const d = this.leadDistance;
       const leadSpeed = Math.max(0, lead.speed || 0);
-      const safeDistance = Math.max(this.minSafeDistance, this.timeHeadway * v.speed);
+      const isLeadStopped = (leadSpeed < 5.0);
+      const safeDistance = isLeadStopped ? 55 : Math.max(this.minSafeDistance, this.timeHeadway * Math.max(v.speed, leadSpeed));
+      const bumperBuffer = 26;
 
-      if (d <= 28) {
-        // Critical bumper buffer -> complete stop
+      if (d <= bumperBuffer || (isLeadStopped && d < 48)) {
+        // Standstill queue buffer -> full stop
         targetSpeed = 0;
-        this.navState = 'STOPPED';
+        interactionDecision = 'STOPPED';
       } else if (d < safeDistance + 35) {
         if (d <= safeDistance) {
-          const gapRatio = Math.max(0, (d - 24) / (safeDistance - 24));
+          // Scaling speed progressively down to leadSpeed in queue
+          const gapRatio = Math.max(0, (d - bumperBuffer) / (safeDistance - bumperBuffer));
           targetSpeed = Math.min(targetSpeed, leadSpeed * Math.min(1.0, gapRatio));
         } else {
-          // Approaching lead vehicle in buffer zone
+          // Approach buffer zone (smooth deceleration into queue)
           const blend = (d - safeDistance) / 35;
           const approachSpeed = leadSpeed + (v.baseSpeed - leadSpeed) * blend;
           targetSpeed = Math.min(targetSpeed, approachSpeed);
         }
-        this.navState = (targetSpeed < 5) ? 'STOPPED' : 'FOLLOWING';
+        interactionDecision = (targetSpeed < 5) ? 'STOPPED' : 'FOLLOWING';
       }
-    } else {
-      this.navState = 'CRUISING';
     }
 
-    // 5. Basic Obstacle & Pothole Awareness
+    // 7. Safe Controlled Overtaking of Stopped Blockage / Obstacle
+    if (this.leadVehicle && (this.leadVehicle.speed || 0) < 5 && this.leadDistance < 65) {
+      this.stuckTimer += dt;
+    } else {
+      this.stuckTimer = 0;
+    }
+
+    // If stuck behind stationary obstacle for > 1.2s on Main Road and overtaking enabled
+    const allowsOvertake = (v.canOvertake !== false);
+    if (allowsOvertake && this.stuckTimer > 1.2 && this.overtakeState === 'NONE' && (v.y >= 480 && v.y <= 640)) {
+      const medianY = 560; // Center median corridor
+      // Check if median corridor is clear of oncoming traffic within 130px
+      let medianClear = true;
+      for (const cand of candidates) {
+        if (Math.abs(cand.y - medianY) < 28 && Math.abs(cand.x - v.x) < 130) {
+          medianClear = false;
+          break;
+        }
+      }
+
+      if (medianClear && window.StaticCollisionSystem && !window.StaticCollisionSystem.checkSolidCollision(v.x + 40, medianY, v.radius).collided) {
+        this.overtakeState = 'PASSING';
+        this.overtakeTargetLaneY = medianY;
+        this.overtakeTimer = 0;
+      }
+    }
+
+    if (this.overtakeState === 'PASSING') {
+      this.overtakeTimer += dt;
+      targetSpeed = Math.min(v.baseSpeed * 0.75, 55);
+      interactionDecision = 'OVERTAKING';
+
+      // Check if cleared the obstacle
+      const leadObstacleX = this.leadVehicle ? this.leadVehicle.x : (v.x + 50);
+      if (v.x > leadObstacleX + 45 || this.overtakeTimer > 4.0) {
+        this.overtakeState = 'RETURNING';
+      }
+    } else if (this.overtakeState === 'RETURNING') {
+      targetSpeed = v.baseSpeed;
+      interactionDecision = 'CRUISING';
+      if (Math.abs(v.y - this.nominalLaneY) < 10) {
+        this.overtakeState = 'NONE';
+        this.overtakeTimer = 0;
+      }
+    }
+
+    // 8. Basic Obstacle & Pothole Awareness
     for (let s = 15; s <= 65; s += 10) {
       const checkX = v.x + cosH * s;
       const checkY = v.y + sinH * s;
@@ -3266,7 +3384,7 @@ class TrafficAgentNavigator {
 
       if (isBlocked) {
         targetSpeed = 0;
-        this.navState = 'STOPPED';
+        interactionDecision = 'STOPPED';
         break;
       }
     }
@@ -3279,7 +3397,9 @@ class TrafficAgentNavigator {
       }
     }
 
-    // 6. Smooth Acceleration & Deceleration Physics
+    this.navState = interactionDecision;
+
+    // 9. Smooth Acceleration & Deceleration Physics
     if (v.speed < targetSpeed) {
       v.speed = Math.min(targetSpeed, v.speed + this.maxAccel * dt);
     } else if (v.speed > targetSpeed) {
@@ -3297,14 +3417,14 @@ class TrafficAgentNavigator {
       v.state = this.navState;
     }
 
-    // 7. Steering & Heading Integration
+    // 10. Steering & Heading Integration
     if (v.speed > 0) {
       const turnStep = Math.sign(headingDiff) * Math.min(Math.abs(headingDiff), this.maxTurnRate * dt);
       v.heading += turnStep;
       v.heading = Math.atan2(Math.sin(v.heading), Math.cos(v.heading));
     }
 
-    // 8. Position Integration with Strict Boundary Prevention
+    // 11. Position Integration with Strict Boundary Prevention
     const proposedX = v.x + v.speed * Math.cos(v.heading) * dt;
     const proposedY = v.y + v.speed * Math.sin(v.heading) * dt;
 
@@ -3357,7 +3477,7 @@ class DynamicObject {
     this.y = config.y || 0;
     this.heading = config.heading !== undefined ? config.heading : 0; // Radians
     this.speed = config.speed !== undefined ? config.speed : 60;       // px/s
-    this.baseSpeed = this.speed;
+    this.baseSpeed = config.baseSpeed !== undefined ? config.baseSpeed : (this.speed > 0 ? this.speed : 60);
 
     // Dimensions
     this.length = config.length || 44;
