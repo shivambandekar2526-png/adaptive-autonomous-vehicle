@@ -13,12 +13,31 @@
       <div class="header-left">
         <div class="project-identity">
           <h1 class="sim-title">Adaptive Path Planning &amp; Collision Avoidance</h1>
-          <span class="sim-subtitle">Unstructured Indian Road Simulation &bull; Module 4: Detection &amp; Collision Risk</span>
+          <span class="sim-subtitle">Unstructured Indian Road Simulation &bull; Module 5: Adaptive Path Planning</span>
         </div>
       </div>
 
-      <!-- Real-time Perception & Telemetry Readouts -->
+      <!-- Real-time Perception, Risk & Planner Telemetry Readouts -->
       <div class="header-center">
+        <!-- Adaptive Path Planner Decision -->
+        <div class="telemetry-pill" title="Adaptive Local Path Planner Decision">
+          <span class="pill-dot planner-dot" id="planner-dot"></span>
+          <span class="pill-label">PLANNER:</span>
+          <span class="pill-value accent-emerald" id="planner-decision">OPTIMAL</span>
+        </div>
+
+        <!-- Selected Trajectory Action / Label -->
+        <div class="telemetry-pill" title="Selected Candidate Trajectory">
+          <span class="pill-label">PATH:</span>
+          <span class="pill-value accent-cyan" id="selected-path-label">STRAIGHT</span>
+        </div>
+
+        <!-- Selected Path Cost Score -->
+        <div class="telemetry-pill" title="Selected Trajectory Cost Score">
+          <span class="pill-label">COST:</span>
+          <span class="pill-value" id="path-cost">0.0</span>
+        </div>
+
         <!-- Collision Threat Level -->
         <div class="telemetry-pill" title="Overall Collision Threat Level">
           <span class="pill-dot risk-dot safe" id="risk-dot"></span>
@@ -32,23 +51,10 @@
           <span class="pill-value accent-cyan" id="min-ttc-display">-- s</span>
         </div>
 
-        <!-- Perceived Objects in Radar Radius -->
-        <div class="telemetry-pill" title="Objects detected inside Perception Radius">
-          <span class="pill-dot radar-dot" id="radar-dot"></span>
-          <span class="pill-label">DETECTED:</span>
-          <span class="pill-value accent-amber"><span id="detected-count">0</span> <small>objs</small></span>
-        </div>
-
         <!-- Ego Vehicle Speed -->
         <div class="telemetry-pill" title="Current Ego Speed">
           <span class="pill-label">SPEED:</span>
           <span class="pill-value accent-cyan"><span id="ego-speed">0.0</span> <small>km/h</small></span>
-        </div>
-
-        <!-- Ego Vehicle Heading -->
-        <div class="telemetry-pill" title="Current Heading Angle">
-          <span class="pill-label">HEADING:</span>
-          <span class="pill-value" id="ego-heading">0.0&deg;</span>
         </div>
 
         <!-- Cursor World Coordinates -->
@@ -60,6 +66,9 @@
 
       <div class="header-right">
         <div class="control-group">
+          <button id="btn-paths" class="tool-btn active" title="Toggle Adaptive Path Trajectories (C)">
+            <span class="btn-icon">&#10548;</span> Paths
+          </button>
           <button id="btn-sensors" class="tool-btn active" title="Toggle Perception Radar Overlay (V)">
             <span class="btn-icon">&#128065;</span> Radar
           </button>
@@ -87,10 +96,10 @@
     <main class="canvas-viewport" id="viewport-container">
       <canvas id="sim-canvas"></canvas>
 
-      <!-- Driving Controls & Perception HUD Card (Floating Top-Left) -->
+      <!-- Driving Controls & Planner HUD Card (Floating Top-Left) -->
       <aside class="controls-card" id="controls-card">
         <div class="card-header">
-          <span class="card-title">Vehicle &amp; Radar Controls</span>
+          <span class="card-title">Vehicle &amp; Planner Controls</span>
           <span class="badge-mode">Manual Teleop</span>
         </div>
         <div class="key-guide">
@@ -113,6 +122,9 @@
             <span class="key-cap">P</span> <span>Reset Car Position</span>
           </div>
           <div class="key-row">
+            <span class="key-cap">C</span> <span>Toggle Candidate Paths</span>
+          </div>
+          <div class="key-row">
             <span class="key-cap">V</span> <span>Toggle Perception Radar</span>
           </div>
           <div class="key-row">
@@ -128,6 +140,18 @@
           <button id="legend-close-btn" class="close-btn">&times;</button>
         </div>
         <div class="legend-content">
+          <div class="legend-item">
+            <span class="legend-swatch best-path-swatch"></span>
+            <span><strong>Selected Path</strong> (Optimal Cost Trajectory)</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-swatch candidate-path-swatch"></span>
+            <span><strong>Candidate Paths</strong> (Feasible Rollouts)</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-swatch invalid-path-swatch"></span>
+            <span><strong>Invalid Path</strong> (Collision / Off-Road)</span>
+          </div>
           <div class="legend-item">
             <span class="legend-swatch danger-swatch"></span>
             <span><strong>DANGER Target</strong> (TTC &le; 2.0s / Imminent)</span>
@@ -186,13 +210,13 @@
           </div>
         </div>
         <div class="legend-footer">
-          <small>&bull; [W/A/S/D] Drive &bull; [V] Radar &bull; [T] Traffic &bull; [R] Fit</small>
+          <small>&bull; [W/A/S/D] Drive &bull; [C] Paths &bull; [V] Radar &bull; [T] Traffic &bull; [R] Fit</small>
         </div>
       </aside>
 
       <!-- Mini Notification / Hint Banner -->
       <div class="hint-banner" id="hint-banner">
-        <span>Module 4 Active: Perception Radar &amp; Collision Risk active. [V] Toggle Radar | [T] Toggle Traffic</span>
+        <span>Module 5 Active: Adaptive Path Planning active. [C] Toggle Paths | [V] Toggle Radar | [T] Toggle Traffic</span>
       </div>
     </main>
   </div>

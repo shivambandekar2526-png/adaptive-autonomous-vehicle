@@ -180,6 +180,27 @@ html, body {
   color: var(--accent-emerald);
 }
 
+.planner-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background-color: var(--accent-emerald);
+  box-shadow: 0 0 6px var(--accent-emerald);
+  transition: all 0.2s ease;
+}
+
+.planner-dot.avoiding {
+  background-color: var(--accent-amber);
+  box-shadow: 0 0 8px var(--accent-amber);
+  animation: pulse-fast 0.6s infinite alternate;
+}
+
+.planner-dot.emergency {
+  background-color: var(--accent-rose);
+  box-shadow: 0 0 10px var(--accent-rose);
+  animation: pulse-fast 0.3s infinite alternate;
+}
+
 .risk-dot {
   width: 7px;
   height: 7px;
@@ -485,6 +506,9 @@ html, body {
   flex-shrink: 0;
 }
 
+.best-path-swatch { background: #10b981; border: 1px solid #34d399; box-shadow: 0 0 6px rgba(16, 185, 129, 0.8); }
+.candidate-path-swatch { background: #64748b; border: 1px dashed #94a3b8; }
+.invalid-path-swatch { background: #ef4444; border: 1px dashed #f87171; }
 .danger-swatch { background: #ef4444; border: 1px solid #fca5a5; box-shadow: 0 0 6px rgba(239, 68, 68, 0.8); }
 .caution-swatch { background: #f59e0b; border: 1px solid #fcd34d; box-shadow: 0 0 6px rgba(245, 158, 11, 0.8); }
 .safe-swatch { background: #10b981; border: 1px solid #6ee7b7; box-shadow: 0 0 6px rgba(16, 185, 129, 0.8); }

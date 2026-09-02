@@ -3047,10 +3047,495 @@ class DetectionManager {
     this.showSensors = state !== undefined ? state : !this.showSensors;
     return this.showSensors;
   }
+
+  getPerceptionData() {
+    return {
+      detectedObjects: this.detectedObjects,
+      overallRisk: this.overallRisk,
+      minTTC: this.minTTC,
+      detectedCount: this.detectedObjects.length,
+      dangerCount: this.dangerCount,
+      cautionCount: this.cautionCount,
+      safeCount: this.safeCount,
+      perceptionRadius: this.perceptionRadius
+    };
+  }
+
+  getRiskAssessment() {
+    return {
+      overallRisk: this.overallRisk,
+      minTTC: this.minTTC,
+      threatObjects: this.detectedObjects.filter(o => o.riskLevel !== 'SAFE')
+    };
+  }
 }
 
 /* ============================================================================
-   8. SIMULATION CORE APPLICATION CONTROLLER & GAME LOOP
+   8. MODULE 5: ADAPTIVE PATH PLANNING SYSTEM
+   ============================================================================ */
+
+/**
+ * Adaptive Local Path Planner
+ * Evaluates candidate rollout trajectories from Ego Vehicle pose,
+ * scores each trajectory against dynamic threats, static obstacles, road bounds,
+ * destination progress, and steering smoothness, selecting the optimal safe path.
+ */
+class PathPlanner {
+  constructor(options = {}) {
+    // Lookahead and Rollout Parameters
+    this.horizonDistance = options.horizonDistance || 175; // px (approx 43.7 m)
+    this.numWaypoints = options.numWaypoints || 18;        // steps along trajectory
+    this.wheelbase = 26;                                   // Ego vehicle wheelbase (px)
+
+    // Steering definitions for 7 candidate actions
+    this.candidateDefinitions = [
+      { id: 'HARD_LEFT',    label: 'Hard Left',     steerAngle: -0.55 },
+      { id: 'MOD_LEFT',     label: 'Mod Left',      steerAngle: -0.32 },
+      { id: 'SLIGHT_LEFT',  label: 'Slight Left',   steerAngle: -0.15 },
+      { id: 'STRAIGHT',     label: 'Straight',      steerAngle:  0.00 },
+      { id: 'SLIGHT_RIGHT', label: 'Slight Right',  steerAngle:  0.15 },
+      { id: 'MOD_RIGHT',    label: 'Mod Right',     steerAngle:  0.32 },
+      { id: 'HARD_RIGHT',   label: 'Hard Right',    steerAngle:  0.55 }
+    ];
+
+    // Multi-objective Cost Weights
+    this.weights = {
+      collision: 5000,    // Immediate collision penalty
+      clearance: 700,     // Obstacle clearance weight
+      threatScale: 2.4,   // Extra penalty multiplier for DANGER/CAUTION perceived objects
+      roadBoundary: 2500, // Off-road deviation penalty
+      goalProgress: 1.6,  // Distance to target waypoint weight
+      goalHeading: 85,    // Alignment with target vector weight
+      steerMagnitude: 70, // Effort penalty for large steering
+      steerRate: 35       // Continuity penalty from current steer angle
+    };
+
+    // Runtime State
+    this.candidatePaths = [];
+    this.selectedPath = null;
+    this.plannerState = 'OPTIMAL'; // 'OPTIMAL', 'AVOIDANCE', 'EMERGENCY_STOP'
+    this.showPaths = true;
+    this.chevronAnimPhase = 0;
+  }
+
+  /**
+   * Main planning cycle: generates trajectories, scores them, and selects the optimal path
+   */
+  update(egoVehicle, environmentData, perceptionData, dt) {
+    if (dt <= 0 || dt > 0.1) dt = 0.016;
+
+    // Advance directional chevron animation
+    this.chevronAnimPhase = (this.chevronAnimPhase + 3.0 * dt) % 1.0;
+
+    if (!egoVehicle) {
+      this.candidatePaths = [];
+      this.selectedPath = null;
+      this.plannerState = 'IDLE';
+      return;
+    }
+
+    const egoX = egoVehicle.x;
+    const egoY = egoVehicle.y;
+    const egoHeading = egoVehicle.heading;
+    const currentSteer = egoVehicle.steeringAngle || 0;
+    const destination = (environmentData && environmentData.destination) ? environmentData.destination : { x: 1650, y: 560 };
+
+    // Compile perceived obstacles with risk levels from Module 4
+    const obstacles = this.gatherObstacles(environmentData, perceptionData);
+
+    // 1. Generate and Score each candidate trajectory
+    const evaluatedPaths = this.candidateDefinitions.map(def => {
+      const path = this.generateRollout(egoX, egoY, egoHeading, def.steerAngle, def.id, def.label);
+      this.scoreTrajectory(path, obstacles, destination, currentSteer, environmentData);
+      return path;
+    });
+
+    // 2. Select Optimal Path
+    const feasiblePaths = evaluatedPaths.filter(p => p.status === 'FEASIBLE');
+
+    let best = null;
+    let state = 'OPTIMAL';
+
+    if (feasiblePaths.length > 0) {
+      // Find lowest cost feasible path
+      feasiblePaths.sort((a, b) => a.totalCost - b.totalCost);
+      best = feasiblePaths[0];
+
+      // Check if the best path is actively avoiding an obstacle
+      if (best.id !== 'STRAIGHT' && best.obstacleCost > 30) {
+        state = 'AVOIDANCE';
+      } else {
+        state = 'OPTIMAL';
+      }
+    } else {
+      // Emergency Fallback: If all paths have collision/off-road, choose path with farthest collision point
+      evaluatedPaths.sort((a, b) => {
+        if (a.collisionDistance !== b.collisionDistance) {
+          return b.collisionDistance - a.collisionDistance;
+        }
+        return a.totalCost - b.totalCost;
+      });
+      best = evaluatedPaths[0];
+      state = 'EMERGENCY_STOP';
+    }
+
+    this.candidatePaths = evaluatedPaths;
+    this.selectedPath = best;
+    this.plannerState = state;
+  }
+
+  /**
+   * Generates a kinematically smooth bicycle rollout trajectory
+   */
+  generateRollout(startX, startY, startHeading, steerAngle, id, label) {
+    const waypoints = [];
+    const stepSize = this.horizonDistance / this.numWaypoints;
+    const curvature = Math.tan(steerAngle) / this.wheelbase;
+
+    let x = startX;
+    let y = startY;
+    let heading = startHeading;
+    let dist = 0;
+
+    waypoints.push({ x, y, heading, s: dist });
+
+    for (let i = 1; i <= this.numWaypoints; i++) {
+      heading += curvature * stepSize;
+      x += stepSize * Math.cos(heading);
+      y += stepSize * Math.sin(heading);
+      dist += stepSize;
+      waypoints.push({ x, y, heading, s: dist });
+    }
+
+    return {
+      id,
+      label,
+      steerAngle,
+      waypoints,
+      endPoint: waypoints[waypoints.length - 1],
+      totalCost: 0,
+      collisionCost: 0,
+      obstacleCost: 0,
+      roadCost: 0,
+      goalCost: 0,
+      steerCost: 0,
+      status: 'FEASIBLE', // 'FEASIBLE' | 'COLLISION' | 'OFF_ROAD'
+      hasCollision: false,
+      collisionIndex: -1,
+      collisionDistance: Infinity,
+      collisionObstacle: null,
+      minClearance: Infinity
+    };
+  }
+
+  /**
+   * Evaluates and scores a trajectory against all objective criteria
+   */
+  scoreTrajectory(path, obstacles, destination, currentSteer, envData) {
+    const egoRadius = 16; // Collision radius around ego vehicle (px)
+    let totalObstacleCost = 0;
+    let minClearance = Infinity;
+    let hasCollision = false;
+    let collisionIdx = -1;
+    let collisionDist = Infinity;
+    let collisionObs = null;
+
+    // --- 1. Evaluate Obstacle Clearance & Collision along Waypoints ---
+    for (let i = 0; i < path.waypoints.length; i++) {
+      const wp = path.waypoints[i];
+
+      for (let j = 0; j < obstacles.length; j++) {
+        const obs = obstacles[j];
+        const dist = Math.hypot(wp.x - obs.x, wp.y - obs.y);
+        const clearance = dist - (egoRadius + obs.radius);
+
+        if (clearance < minClearance) {
+          minClearance = clearance;
+        }
+
+        // Direct Collision Check (clearance <= 2px)
+        if (clearance <= 2) {
+          hasCollision = true;
+          if (collisionIdx === -1) {
+            collisionIdx = i;
+            collisionDist = wp.s;
+            collisionObs = obs;
+          }
+          break;
+        }
+
+        // Proximity Soft Penalty (clearance < 55px)
+        if (clearance < 55) {
+          const threatMult = obs.riskLevel === 'DANGER' ? this.weights.threatScale : (obs.riskLevel === 'CAUTION' ? 1.6 : 1.0);
+          const penalty = threatMult * (this.weights.clearance / (clearance + 5));
+          totalObstacleCost += penalty;
+        }
+      }
+
+      if (hasCollision) break;
+    }
+
+    const collisionCost = hasCollision ? this.weights.collision : 0;
+
+    // --- 2. Evaluate Road Boundary & Drivable Corridor Cost ---
+    let roadCost = 0;
+    let isOffRoad = false;
+
+    path.waypoints.forEach(wp => {
+      // Drivable road envelope: Main road horizontal [465, 655], Side road vertical intersection [860, 980]
+      const onMainRoad = (wp.y >= 465 && wp.y <= 655) && (wp.x >= 0 && wp.x <= 1800);
+      const onSideRoad = (wp.x >= 860 && wp.x <= 980) && (wp.y >= 0 && wp.y <= 560);
+
+      if (!onMainRoad && !onSideRoad) {
+        isOffRoad = true;
+        roadCost += this.weights.roadBoundary;
+      } else {
+        // Preferred lane centering: gently penalize driving too close to road edge
+        if (onMainRoad) {
+          const distFromCenter = Math.abs(wp.y - 560);
+          if (distFromCenter > 75) {
+            roadCost += (distFromCenter - 75) * 2.5;
+          }
+        }
+      }
+    });
+
+    // --- 3. Progress to Destination Goal ---
+    const endWp = path.endPoint;
+    const distToGoal = Math.hypot(destination.x - endWp.x, destination.y - endWp.y);
+    const goalProgressCost = (distToGoal / 10) * this.weights.goalProgress;
+
+    // Heading alignment toward destination
+    const targetHeading = Math.atan2(destination.y - endWp.y, destination.x - endWp.x);
+    let headingDiff = targetHeading - endWp.heading;
+    while (headingDiff > Math.PI) headingDiff -= Math.PI * 2;
+    while (headingDiff < -Math.PI) headingDiff += Math.PI * 2;
+    const goalHeadingCost = Math.abs(headingDiff) * this.weights.goalHeading;
+
+    const totalGoalCost = goalProgressCost + goalHeadingCost;
+
+    // --- 4. Steering Smoothness & Effort ---
+    const steerEffortCost = Math.pow(path.steerAngle, 2) * this.weights.steerMagnitude;
+    const steerRateCost = Math.abs(path.steerAngle - currentSteer) * this.weights.steerRate;
+    const totalSteerCost = steerEffortCost + steerRateCost;
+
+    // --- Final Status & Total Score ---
+    path.hasCollision = hasCollision;
+    path.collisionIndex = collisionIdx;
+    path.collisionDistance = collisionDist;
+    path.collisionObstacle = collisionObs;
+    path.minClearance = minClearance;
+    path.collisionCost = collisionCost;
+    path.obstacleCost = totalObstacleCost;
+    path.roadCost = roadCost;
+    path.goalCost = totalGoalCost;
+    path.steerCost = totalSteerCost;
+
+    if (hasCollision) {
+      path.status = 'COLLISION';
+    } else if (isOffRoad) {
+      path.status = 'OFF_ROAD';
+    } else {
+      path.status = 'FEASIBLE';
+    }
+
+    path.totalCost = collisionCost + totalObstacleCost + roadCost + totalGoalCost + totalSteerCost;
+  }
+
+  /**
+   * Gathers all static and dynamic obstacles enriched with Module 4 risk perception
+   */
+  gatherObstacles(envData, perceptionData) {
+    const list = [];
+
+    // 1. Detected objects from Perception Data (includes dynamic entities + nearby static hazards)
+    if (perceptionData && Array.isArray(perceptionData.detectedObjects)) {
+      perceptionData.detectedObjects.forEach(det => {
+        list.push({
+          id: det.id,
+          name: det.name || det.type,
+          type: det.type,
+          x: det.x,
+          y: det.y,
+          radius: det.radius || 15,
+          riskLevel: det.riskLevel || 'SAFE'
+        });
+      });
+    }
+
+    // 2. Fallback / Global static hazards from EnvironmentData
+    if (envData) {
+      if (Array.isArray(envData.potholes)) {
+        envData.potholes.forEach(p => {
+          if (!list.some(o => o.id === p.id)) {
+            list.push({ id: p.id, name: p.name, type: 'pothole', x: p.x, y: p.y, radius: p.radius, riskLevel: 'CAUTION' });
+          }
+        });
+      }
+      if (Array.isArray(envData.debris)) {
+        envData.debris.forEach(d => {
+          if (!list.some(o => o.id === d.id)) {
+            list.push({ id: d.id, name: d.name || 'Debris', type: 'debris', x: d.x, y: d.y, radius: Math.max(d.width, d.height) / 2, riskLevel: 'CAUTION' });
+          }
+        });
+      }
+      if (Array.isArray(envData.parkedObjects)) {
+        envData.parkedObjects.forEach(pk => {
+          if (!list.some(o => o.id === pk.id)) {
+            list.push({ id: pk.id, name: pk.name, type: 'parked', x: pk.x, y: pk.y, radius: Math.max(pk.width, pk.height) / 2, riskLevel: 'SAFE' });
+          }
+        });
+      }
+    }
+
+    return list;
+  }
+
+  /**
+   * Render Candidate Paths and the Selected Optimal Path in World Coordinates
+   */
+  render(ctx) {
+    if (!this.showPaths || this.candidatePaths.length === 0) return;
+
+    ctx.save();
+
+    // 1. Render Unselected Candidate Paths (Subtle dashed lines)
+    this.candidatePaths.forEach(path => {
+      if (path === this.selectedPath) return; // Drawn separately in step 2
+
+      ctx.save();
+      const isInvalid = path.status !== 'FEASIBLE';
+
+      if (isInvalid) {
+        ctx.strokeStyle = 'rgba(239, 68, 68, 0.45)';
+        ctx.lineWidth = 1.2;
+        ctx.setLineDash([3, 4]);
+      } else {
+        ctx.strokeStyle = 'rgba(148, 163, 184, 0.35)';
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([4, 4]);
+      }
+
+      ctx.beginPath();
+      path.waypoints.forEach((wp, idx) => {
+        if (idx === 0) ctx.moveTo(wp.x, wp.y);
+        else ctx.lineTo(wp.x, wp.y);
+      });
+      ctx.stroke();
+
+      // If collision, draw small (X) hazard marker at collision waypoint
+      if (isInvalid && path.collisionIndex >= 0) {
+        const cWp = path.waypoints[path.collisionIndex];
+        ctx.setLineDash([]);
+        ctx.strokeStyle = '#ef4444';
+        ctx.lineWidth = 2;
+        const s = 4;
+        ctx.beginPath();
+        ctx.moveTo(cWp.x - s, cWp.y - s);
+        ctx.lineTo(cWp.x + s, cWp.y + s);
+        ctx.moveTo(cWp.x + s, cWp.y - s);
+        ctx.lineTo(cWp.x - s, cWp.y + s);
+        ctx.stroke();
+      }
+
+      ctx.restore();
+    });
+
+    // 2. Render Selected / Optimal Path (Bold Glowing Ribbon + Chevrons)
+    if (this.selectedPath) {
+      const best = this.selectedPath;
+      const isEmergency = this.plannerState === 'EMERGENCY_STOP';
+      const pathColor = isEmergency ? '#ef4444' : (this.plannerState === 'AVOIDANCE' ? '#f59e0b' : '#10b981');
+      const glowColor = isEmergency ? 'rgba(239, 68, 68, 0.6)' : (this.plannerState === 'AVOIDANCE' ? 'rgba(245, 158, 11, 0.6)' : 'rgba(16, 185, 129, 0.6)');
+
+      // A. Safety Clearance Swath (Corridor Ribbon)
+      ctx.save();
+      ctx.strokeStyle = isEmergency ? 'rgba(239, 68, 68, 0.12)' : 'rgba(16, 185, 129, 0.12)';
+      ctx.lineWidth = 28;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.beginPath();
+      best.waypoints.forEach((wp, idx) => {
+        if (idx === 0) ctx.moveTo(wp.x, wp.y);
+        else ctx.lineTo(wp.x, wp.y);
+      });
+      ctx.stroke();
+      ctx.restore();
+
+      // B. Centerline Path with Neon Glow
+      ctx.save();
+      ctx.strokeStyle = pathColor;
+      ctx.lineWidth = 3.5;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.shadowColor = glowColor;
+      ctx.shadowBlur = 10;
+      ctx.beginPath();
+      best.waypoints.forEach((wp, idx) => {
+        if (idx === 0) ctx.moveTo(wp.x, wp.y);
+        else ctx.lineTo(wp.x, wp.y);
+      });
+      ctx.stroke();
+      ctx.restore();
+
+      // C. Directional Animated Chevrons Along Selected Path
+      ctx.save();
+      const numChevrons = 4;
+      for (let c = 1; c <= numChevrons; c++) {
+        const progress = (c / (numChevrons + 1) + this.chevronAnimPhase / (numChevrons + 1)) % 1.0;
+        const targetIndex = Math.min(Math.floor(progress * (best.waypoints.length - 1)), best.waypoints.length - 2);
+        const wp = best.waypoints[targetIndex];
+        const nextWp = best.waypoints[targetIndex + 1];
+        const angle = Math.atan2(nextWp.y - wp.y, nextWp.x - wp.x);
+
+        ctx.save();
+        ctx.translate(wp.x, wp.y);
+        ctx.rotate(angle);
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(-4, -4);
+        ctx.lineTo(2, 0);
+        ctx.lineTo(-4, 4);
+        ctx.stroke();
+        ctx.restore();
+      }
+      ctx.restore();
+
+      // D. Lookahead Target Endpoint Marker
+      ctx.save();
+      const endWp = best.endPoint;
+      ctx.translate(endWp.x, endWp.y);
+      ctx.fillStyle = pathColor;
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 2;
+      ctx.shadowColor = glowColor;
+      ctx.shadowBlur = 8;
+      ctx.beginPath();
+      ctx.arc(0, 0, 5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+
+      // Outer pulse ring
+      ctx.strokeStyle = pathColor;
+      ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      ctx.arc(0, 0, 8 + Math.sin(this.chevronAnimPhase * Math.PI * 2) * 2, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    ctx.restore();
+  }
+
+  togglePaths(state) {
+    this.showPaths = state !== undefined ? state : !this.showPaths;
+    return this.showPaths;
+  }
+}
+
+/* ============================================================================
+   9. SIMULATION CORE APPLICATION CONTROLLER & GAME LOOP
    ============================================================================ */
 class SimulationAppController {
   constructor() {
@@ -3072,6 +3557,9 @@ class SimulationAppController {
 
     // Module 4: Detection & Collision Risk Assessment System
     this.detectionManager = new DetectionManager();
+
+    // Module 5: Adaptive Path Planning System
+    this.pathPlanner = new PathPlanner();
 
     // Registered Submodules
     this.modules = {};
@@ -3099,7 +3587,7 @@ class SimulationAppController {
     this.lastTime = performance.now();
     requestAnimationFrame((time) => this.loop(time));
 
-    console.log('[SimulationEngine] Module 1, 2, 3 & 4 Active: Environment, Ego Vehicle, Traffic & Detection Risk loaded.');
+    console.log('[SimulationEngine] Module 1, 2, 3, 4 & 5 Active: Environment, Ego Vehicle, Traffic, Risk & Path Planner loaded.');
   }
 
   cacheDom() {
@@ -3111,17 +3599,21 @@ class SimulationAppController {
       
       // Telemetry Readouts
       egoSpeed: document.getElementById('ego-speed'),
-      egoHeading: document.getElementById('ego-heading'),
-      egoSteer: document.getElementById('ego-steer'),
       
       // Module 4 Detection & Risk Elements
       riskDot: document.getElementById('risk-dot'),
       riskLevelText: document.getElementById('risk-level-text'),
       minTtcDisplay: document.getElementById('min-ttc-display'),
-      detectedCount: document.getElementById('detected-count'),
       radarDot: document.getElementById('radar-dot'),
 
+      // Module 5 Planner Telemetry Elements
+      plannerDot: document.getElementById('planner-dot'),
+      plannerDecision: document.getElementById('planner-decision'),
+      selectedPathLabel: document.getElementById('selected-path-label'),
+      pathCost: document.getElementById('path-cost'),
+
       // Controls
+      btnPaths: document.getElementById('btn-paths'),
       btnSensors: document.getElementById('btn-sensors'),
       btnTraffic: document.getElementById('btn-traffic'),
       btnResetCar: document.getElementById('btn-reset-car'),
@@ -3206,6 +3698,14 @@ class SimulationAppController {
       this.camera.zoomAt(factor, screenX, screenY);
     }, { passive: false });
 
+    // Path Planner Toggle Button
+    if (this.dom.btnPaths) {
+      this.dom.btnPaths.addEventListener('click', () => {
+        const active = this.pathPlanner.togglePaths();
+        this.dom.btnPaths.classList.toggle('active', active);
+      });
+    }
+
     // Perception / Radar Sensors Button
     if (this.dom.btnSensors) {
       this.dom.btnSensors.addEventListener('click', () => {
@@ -3281,7 +3781,7 @@ class SimulationAppController {
       });
     }
 
-    // Keyboard Shortcuts (G: Grid, L: Labels, R: Reset View, T: Toggle Traffic, V: Toggle Radar)
+    // Keyboard Shortcuts (G: Grid, L: Labels, R: Reset View, T: Toggle Traffic, V: Toggle Radar, C: Toggle Paths)
     window.addEventListener('keydown', (e) => {
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
 
@@ -3296,12 +3796,14 @@ class SimulationAppController {
         this.dom.btnTraffic.click();
       } else if (key === 'v' && this.dom.btnSensors) {
         this.dom.btnSensors.click();
+      } else if (key === 'c' && this.dom.btnPaths) {
+        this.dom.btnPaths.click();
       }
     });
   }
 
   /**
-   * Main Simulation Loop (Updates Physics, Traffic, Perception, Telemetry, Renders Scene)
+   * Main Simulation Loop (Updates Physics, Traffic, Perception, Path Planner, Telemetry, Renders Scene)
    */
   loop(currentTime) {
     const dt = Math.min((currentTime - this.lastTime) / 1000, 0.1);
@@ -3327,7 +3829,17 @@ class SimulationAppController {
       );
     }
 
-    // 4. Update Submodules (Future Module 5+)
+    // 4. Update Adaptive Path Planner (Module 5)
+    if (this.pathPlanner) {
+      this.pathPlanner.update(
+        this.egoVehicle,
+        EnvironmentData,
+        this.detectionManager ? this.detectionManager.getPerceptionData ? this.detectionManager : this.getPerceptionData() : null,
+        dt
+      );
+    }
+
+    // 5. Update Submodules (Future Module 6+)
     Object.keys(this.modules).forEach((name) => {
       const mod = this.modules[name];
       if (typeof mod.update === 'function') {
@@ -3335,10 +3847,10 @@ class SimulationAppController {
       }
     });
 
-    // 5. Update Real-time HUD Telemetry
+    // 6. Update Real-time HUD Telemetry
     this.updateHUD();
 
-    // 6. Render Scene
+    // 7. Render Scene
     this.render();
 
     // Request next animation frame
@@ -3348,7 +3860,7 @@ class SimulationAppController {
   }
 
   /**
-   * Update HUD Telemetry elements with Ego Vehicle and Perception risk telemetry
+   * Update HUD Telemetry elements with Ego Vehicle, Perception and Path Planner telemetry
    */
   updateHUD() {
     if (this.egoVehicle) {
@@ -3356,13 +3868,6 @@ class SimulationAppController {
       const speedKmH = (Math.abs(this.egoVehicle.speed) * 0.25).toFixed(1);
       if (this.dom.egoSpeed) {
         this.dom.egoSpeed.textContent = speedKmH;
-      }
-
-      // Convert heading from radians to degrees [0, 360)
-      let headingDeg = (this.egoVehicle.heading * (180 / Math.PI)) % 360;
-      if (headingDeg < 0) headingDeg += 360;
-      if (this.dom.egoHeading) {
-        this.dom.egoHeading.textContent = `${headingDeg.toFixed(1)}°`;
       }
     }
 
@@ -3396,9 +3901,40 @@ class SimulationAppController {
           this.dom.minTtcDisplay.className = 'pill-value accent-cyan';
         }
       }
+    }
 
-      if (this.dom.detectedCount) {
-        this.dom.detectedCount.textContent = this.detectionManager.detectedObjects.length;
+    // Update Module 5 Path Planner Telemetry
+    if (this.pathPlanner) {
+      const state = this.pathPlanner.plannerState;
+      const best = this.pathPlanner.selectedPath;
+
+      if (this.dom.plannerDecision) {
+        this.dom.plannerDecision.textContent = state;
+        this.dom.plannerDecision.className = 'pill-value';
+        if (state === 'EMERGENCY_STOP') {
+          this.dom.plannerDecision.classList.add('accent-rose');
+        } else if (state === 'AVOIDANCE') {
+          this.dom.plannerDecision.classList.add('accent-amber');
+        } else {
+          this.dom.plannerDecision.classList.add('accent-emerald');
+        }
+      }
+
+      if (this.dom.plannerDot) {
+        this.dom.plannerDot.className = 'pill-dot planner-dot';
+        if (state === 'EMERGENCY_STOP') {
+          this.dom.plannerDot.classList.add('emergency');
+        } else if (state === 'AVOIDANCE') {
+          this.dom.plannerDot.classList.add('avoiding');
+        }
+      }
+
+      if (this.dom.selectedPathLabel) {
+        this.dom.selectedPathLabel.textContent = best ? best.label.toUpperCase() : '--';
+      }
+
+      if (this.dom.pathCost) {
+        this.dom.pathCost.textContent = best ? best.totalCost.toFixed(0) : '0';
       }
     }
   }
@@ -3429,12 +3965,17 @@ class SimulationAppController {
       this.detectionManager.render(this.ctx, this.egoVehicle);
     }
 
+    // Render Adaptive Candidate Paths & Selected Path (Module 5)
+    if (this.pathPlanner) {
+      this.pathPlanner.render(this.ctx);
+    }
+
     // Render Ego Vehicle (Module 2)
     if (this.egoVehicle) {
       this.egoVehicle.render(this.ctx);
     }
 
-    // Render Future Submodules (Module 5+)
+    // Render Future Submodules (Module 6+)
     Object.keys(this.modules).forEach((name) => {
       const mod = this.modules[name];
       if (typeof mod.render === 'function') {
@@ -3460,7 +4001,7 @@ class SimulationAppController {
   }
 
   /**
-   * Accessor for Perception & Detection Data (Module 4 -> Module 5 Path Planning)
+   * Accessor for Perception & Detection Data (Module 4)
    */
   getPerceptionData() {
     return {
@@ -3486,6 +4027,27 @@ class SimulationAppController {
     };
   }
 
+  /**
+   * Accessor for Adaptive Path Planner Data (Module 5 -> Module 6 Vehicle Control)
+   */
+  getPathPlannerData() {
+    return {
+      candidatePaths: this.pathPlanner ? this.pathPlanner.candidatePaths : [],
+      selectedPath: this.pathPlanner ? this.pathPlanner.selectedPath : null,
+      plannerState: this.pathPlanner ? this.pathPlanner.plannerState : 'OPTIMAL',
+      totalCandidates: this.pathPlanner ? this.pathPlanner.candidatePaths.length : 0,
+      feasibleCount: this.pathPlanner ? this.pathPlanner.candidatePaths.filter(p => p.status === 'FEASIBLE').length : 0
+    };
+  }
+
+  getSelectedPath() {
+    return this.pathPlanner ? this.pathPlanner.selectedPath : null;
+  }
+
+  getAllCandidatePaths() {
+    return this.pathPlanner ? this.pathPlanner.candidatePaths : [];
+  }
+
   getObstacles() {
     return {
       potholes: EnvironmentData.potholes,
@@ -3494,7 +4056,8 @@ class SimulationAppController {
       buildings: EnvironmentData.buildings,
       signal: EnvironmentData.trafficSignal,
       dynamicObjects: this.getDynamicObjects(),
-      perception: this.getPerceptionData()
+      perception: this.getPerceptionData(),
+      planner: this.getPathPlannerData()
     };
   }
 
@@ -3530,11 +4093,13 @@ window.EgoVehicle = EgoVehicle;
 window.DynamicObject = DynamicObject;
 window.TrafficManager = TrafficManager;
 window.DetectionManager = DetectionManager;
+window.PathPlanner = PathPlanner;
 
 // Boot on DOM Ready
 document.addEventListener('DOMContentLoaded', () => {
   SimulationEngine.init();
 });
+
 
 
 
