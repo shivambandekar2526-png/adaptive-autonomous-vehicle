@@ -3604,12 +3604,84 @@ class DynamicObject {
     this.crossingDirection = config.crossingDirection || 1; // +1 down, -1 up
     this.active = true;
 
+    // Shared PPO Policy Actuator States
+    this.maxSteeringAngle = 0.58;
+    this.maxSteeringRate = 2.8; // First-order rate limiter (rad/s)
+    this.steeringAngle = 0;
+    this.angularVelocity = 0;
+    this.lateralVelocity = 0;
+    this.lastAction = [0, 0, 0];
+    this.prevSteerAction = 0;
+    this.prevCrossTrack = 0;
+
     // Initialize dedicated TrafficAgentNavigator for road vehicles (cars, motorcycles, auto-rickshaws)
     if (this.type === 'car' || this.type === 'motorcycle' || this.type === 'auto_rickshaw') {
       this.navigator = new TrafficAgentNavigator(this, window.RoadNetworkSystem || RoadNetworkSystem);
     } else {
       this.navigator = null;
     }
+  }
+
+  /**
+   * Universal continuous RL action execution for any road vehicle via the shared PPO policy
+   * Directly controls vehicle physics through continuous steering, throttle, and brake inputs.
+   */
+  applyRLAction(action, dt) {
+    if (!this.active || !Array.isArray(action)) return;
+    if (dt <= 0 || dt > 0.1) dt = 0.016;
+
+    const steerCmd = Math.max(-1.0, Math.min(1.0, action[0] || 0));
+    const throttleCmd = Math.max(0.0, Math.min(1.0, action[1] || 0));
+    const brakeCmd = Math.max(0.0, Math.min(1.0, action[2] || 0));
+
+    // 1. Steering Actuator Dynamics (First-Order Rate Limiter)
+    const targetSteerAngle = steerCmd * this.maxSteeringAngle;
+    const maxDelta = this.maxSteeringRate * dt;
+    const steerDiff = targetSteerAngle - this.steeringAngle;
+    const clampedDelta = Math.max(-maxDelta, Math.min(maxDelta, steerDiff));
+    this.steeringAngle += clampedDelta;
+    this.steeringAngle = Math.max(-this.maxSteeringAngle, Math.min(this.maxSteeringAngle, this.steeringAngle));
+
+    // 2. Throttle, Brake & Friction Dynamics
+    const maxSpeed = this.type === 'motorcycle' ? 110 : (this.type === 'auto_rickshaw' ? 70 : 90);
+    const accelRate = 140;
+    const brakeRate = 260;
+
+    if (brakeCmd > 0.05) {
+      if (Math.abs(this.speed) > 1.5) {
+        this.speed -= brakeRate * brakeCmd * dt;
+        if (this.speed < 0) this.speed = 0;
+      } else {
+        this.speed = 0;
+      }
+    } else if (throttleCmd > 0.05) {
+      this.speed += accelRate * throttleCmd * dt;
+      this.speed = Math.min(maxSpeed, this.speed);
+    } else {
+      // Rolling drag
+      if (Math.abs(this.speed) > 1) {
+        this.speed -= 40 * dt;
+        if (this.speed < 0) this.speed = 0;
+      } else {
+        this.speed = 0;
+      }
+    }
+
+    // 3. Kinematic Bicycle Yaw Rate & Heading Integration
+    const wheelbase = this.length * 0.65;
+    if (Math.abs(this.speed) > 0.05) {
+      this.angularVelocity = (this.speed / wheelbase) * Math.tan(this.steeringAngle);
+      this.heading += this.angularVelocity * dt;
+      this.heading = Math.atan2(Math.sin(this.heading), Math.cos(this.heading));
+    } else {
+      this.angularVelocity = 0;
+    }
+
+    // 4. Position Integration
+    this.x += this.speed * Math.cos(this.heading) * dt;
+    this.y += this.speed * Math.sin(this.heading) * dt;
+
+    this.updatePersistentDestination();
   }
 
   /**
@@ -3638,6 +3710,10 @@ class DynamicObject {
    */
   updatePersistentDestination() {
     if (this.type === 'pedestrian' || this.type === 'animal') return;
+    if (!this.destination) {
+      this.initPersistentDestination();
+    }
+    if (!this.destination) return;
 
     const distToGoal = Math.hypot(this.destination.x - this.x, this.destination.y - this.y);
 
@@ -4753,11 +4829,33 @@ class TrafficManager {
     this.reset();
   }
 
-  update(dt, egoVehicle, environmentData) {
+  update(dt, egoVehicle, environmentData, sharedPolicy, isTraining = false) {
     if (!this.isEnabled) return;
     const ego = egoVehicle || (window.SimulationEngine ? window.SimulationEngine.getEgoVehicle() : null);
     const env = environmentData || window.EnvironmentData;
-    this.entities.forEach(entity => entity.update(dt, ego, this.entities, env));
+
+    for (const entity of this.entities) {
+      if (!entity.active) continue;
+
+      const isRoadVehicle = (entity.type === 'car' || entity.type === 'motorcycle' || entity.type === 'auto_rickshaw');
+      if (isRoadVehicle && sharedPolicy) {
+        // Run universal shared PPO policy for this traffic road vehicle
+        const targetY = (entity.route && entity.route.laneY) ? entity.route.laneY : (entity.destination ? entity.destination.y : 560);
+        const crossTrack = (entity.y - targetY) / 95;
+        const crossTrackRate = (crossTrack - (entity.prevCrossTrack || 0)) / Math.max(0.001, dt);
+        const lastSteerChange = (entity.lastAction ? entity.lastAction[0] : 0) - (entity.prevSteerAction || 0);
+
+        const obs = sharedPolicy.getObservation(entity, env, null, this.entities, entity.lastAction || [0, 0, 0], lastSteerChange, crossTrackRate);
+        const actData = sharedPolicy.selectAction(obs, isTraining);
+        entity.prevSteerAction = entity.lastAction ? entity.lastAction[0] : 0;
+        entity.lastAction = actData.action;
+        entity.prevCrossTrack = crossTrack;
+
+        entity.applyRLAction(actData.action, dt);
+      } else {
+        entity.update(dt, ego, this.entities, env);
+      }
+    }
   }
 
   render(ctx) {
@@ -7239,31 +7337,38 @@ class EgoPPOAgent {
 
   /**
    * Extract rich, 26-D control-state normalized continuous observation vector
+   * Supports Ego Vehicle and all traffic road vehicles (cars, motorcycles, auto-rickshaws) via the single shared policy.
    */
-  getObservation(ego, env, routePlanner, dynamicEntities, prevAction = [0, 0, 0], lastSteerChange = 0, crossTrackRate = 0) {
-    if (!ego || !env) return new Array(this.obsDim).fill(0);
+  getObservation(vehicle, env, routePlanner, dynamicEntities, prevAction = [0, 0, 0], lastSteerChange = 0, crossTrackRate = 0) {
+    if (!vehicle || !env) return new Array(this.obsDim).fill(0);
 
-    const dest = env.destination || { x: 1650, y: 560 };
-    const dx = dest.x - ego.x;
-    const dy = dest.y - ego.y;
+    const dest = vehicle.destination || (env && env.destination) || { x: 1650, y: 560 };
+    const dx = dest.x - vehicle.x;
+    const dy = dest.y - vehicle.y;
     const distToGoal = Math.hypot(dx, dy);
     const destAngle = Math.atan2(dy, dx);
-    let relAngle = destAngle - ego.heading;
+    let relAngle = destAngle - vehicle.heading;
     while (relAngle > Math.PI) relAngle -= Math.PI * 2;
     while (relAngle < -Math.PI) relAngle += Math.PI * 2;
 
-    // Desired road travel heading (0 = Eastbound along main road)
-    const desiredHeading = 0.0;
-    let headingErr = ego.heading - desiredHeading;
+    // Desired road travel heading based on vehicle route phase / heading
+    let desiredHeading = 0.0;
+    if (vehicle.route && vehicle.route.road === 'side') {
+      desiredHeading = Math.PI / 2; // Northbound side road
+    } else if (Math.abs(vehicle.heading - Math.PI) < Math.PI / 2 || (vehicle.routePhase === 'WESTBOUND')) {
+      desiredHeading = Math.PI; // Westbound main road
+    }
+    let headingErr = vehicle.heading - desiredHeading;
     while (headingErr > Math.PI) headingErr -= Math.PI * 2;
     while (headingErr < -Math.PI) headingErr += Math.PI * 2;
 
     // Lateral velocity perpendicular to road heading
-    const lateralVel = (ego.speed || 0) * Math.sin(headingErr);
+    const lateralVel = (vehicle.speed || 0) * Math.sin(headingErr);
 
-    const topEdgeDist = Math.max(0, Math.min(1.0, (ego.y - 465) / 190));
-    const bottomEdgeDist = Math.max(0, Math.min(1.0, (655 - ego.y) / 190));
-    const crossTrack = Math.max(-1.0, Math.min(1.0, (ego.y - 560) / 95));
+    const topEdgeDist = Math.max(0, Math.min(1.0, (vehicle.y - 465) / 190));
+    const bottomEdgeDist = Math.max(0, Math.min(1.0, (655 - vehicle.y) / 190));
+    const targetY = (vehicle.route && vehicle.route.laneY) ? vehicle.route.laneY : (vehicle.destination ? vehicle.destination.y : 560);
+    const crossTrack = Math.max(-1.0, Math.min(1.0, (vehicle.y - targetY) / 95));
 
     // 5 Raycast range sensors [-60°, -30°, 0°, +30°, +60°]
     const rayAngles = [-Math.PI / 3, -Math.PI / 6, 0, Math.PI / 6, Math.PI / 3];
@@ -7271,15 +7376,15 @@ class EgoPPOAgent {
     const maxRayLen = 140;
 
     for (const offset of rayAngles) {
-      const rayAngle = ego.heading + offset;
+      const rayAngle = vehicle.heading + offset;
       const cosA = Math.cos(rayAngle);
       const sinA = Math.sin(rayAngle);
       let hitDist = maxRayLen;
 
       if (typeof window !== 'undefined' && window.StaticCollisionSystem) {
         for (let d = 10; d <= maxRayLen; d += 15) {
-          const px = ego.x + d * cosA;
-          const py = ego.y + d * sinA;
+          const px = vehicle.x + d * cosA;
+          const py = vehicle.y + d * sinA;
           if (!window.StaticCollisionSystem.isDrivableRoad(px, py)) {
             hitDist = d;
             break;
@@ -7295,15 +7400,15 @@ class EgoPPOAgent {
     if (env && Array.isArray(env.potholes)) {
       let minDist = 150;
       for (const p of env.potholes) {
-        const pdx = p.x - ego.x;
-        const pdy = p.y - ego.y;
-        const fwd = pdx * Math.cos(ego.heading) + pdy * Math.sin(ego.heading);
+        const pdx = p.x - vehicle.x;
+        const pdy = p.y - vehicle.y;
+        const fwd = pdx * Math.cos(vehicle.heading) + pdy * Math.sin(vehicle.heading);
         if (fwd > -5 && fwd < 150) {
           const d = Math.hypot(pdx, pdy);
           if (d < minDist) {
             minDist = d;
             nearestHazardDist = Math.max(0, Math.min(1.0, d / 150));
-            let ang = Math.atan2(pdy, pdx) - ego.heading;
+            let ang = Math.atan2(pdy, pdx) - vehicle.heading;
             while (ang > Math.PI) ang -= Math.PI * 2;
             while (ang < -Math.PI) ang += Math.PI * 2;
             nearestHazardAngle = ang / Math.PI;
@@ -7312,45 +7417,49 @@ class EgoPPOAgent {
       }
     }
 
-    // Nearest Dynamic Agent (Pedestrians, Dogs, Cows)
+    // Nearest Dynamic Agent (Pedestrians, Animals, Other Vehicles, Ego)
     let nearestDynDist = 1.0;
     let nearestDynAngle = 0.0;
     const dyns = dynamicEntities || (typeof window !== 'undefined' && window.SimulationEngine && window.SimulationEngine.getDynamicObjects ? window.SimulationEngine.getDynamicObjects() : []);
-    
-    if (Array.isArray(dyns)) {
-      let minDist = 180;
-      for (const d of dyns) {
-        if (!d.active) continue;
-        const dX = d.x - ego.x;
-        const dY = d.y - ego.y;
-        const forwardD = dX * Math.cos(ego.heading) + dY * Math.sin(ego.heading);
-        if (forwardD > -10 && forwardD < 180) {
-          const euclidean = Math.hypot(dX, dY);
-          if (euclidean < minDist) {
-            minDist = euclidean;
-            nearestDynDist = Math.max(0, Math.min(1.0, euclidean / 180));
-            let ang = Math.atan2(dY, dX) - ego.heading;
-            while (ang > Math.PI) ang -= Math.PI * 2;
-            while (ang < -Math.PI) ang += Math.PI * 2;
-            nearestDynAngle = ang / Math.PI;
-          }
+    const ego = typeof window !== 'undefined' && window.SimulationEngine ? window.SimulationEngine.getEgoVehicle() : null;
+
+    const candidateEntities = Array.isArray(dyns) ? [...dyns] : [];
+    if (ego && ego !== vehicle && !candidateEntities.includes(ego)) {
+      candidateEntities.push(ego);
+    }
+
+    let minDist = 180;
+    for (const d of candidateEntities) {
+      if (d === vehicle || (d.active !== undefined && !d.active)) continue;
+      const dX = d.x - vehicle.x;
+      const dY = d.y - vehicle.y;
+      const forwardD = dX * Math.cos(vehicle.heading) + dY * Math.sin(vehicle.heading);
+      if (forwardD > -10 && forwardD < 180) {
+        const euclidean = Math.hypot(dX, dY);
+        if (euclidean < minDist) {
+          minDist = euclidean;
+          nearestDynDist = Math.max(0, Math.min(1.0, euclidean / 180));
+          let ang = Math.atan2(dY, dX) - vehicle.heading;
+          while (ang > Math.PI) ang -= Math.PI * 2;
+          while (ang < -Math.PI) ang += Math.PI * 2;
+          nearestDynAngle = ang / Math.PI;
         }
       }
     }
 
     return [
-      Math.max(0, Math.min(1.0, ego.x / 1800)),
-      Math.max(0, Math.min(1.0, ego.y / 700)),
-      Math.max(-0.5, Math.min(1.0, (ego.speed || 0) / 100)),
-      Math.cos(ego.heading),
-      Math.sin(ego.heading),
-      Math.max(-1.0, Math.min(1.0, (ego.angularVelocity || 0) / 2.5)), // 1. Angular velocity / heading change rate
-      Math.max(-1.0, Math.min(1.0, lateralVel / 80)),                  // 2. Lateral velocity
-      Math.max(-1.0, Math.min(1.0, (ego.steeringAngle || 0) / (ego.maxSteeringAngle || 0.58))), // 3. Current steering angle
-      Math.max(-1.0, Math.min(1.0, lastSteerChange / 2.0)),            // 4. Steering change from previous step
-      crossTrack,                                                      // 5. Signed cross-track error
-      Math.max(-1.0, Math.min(1.0, crossTrackRate / 3.0)),             // 6. Rate of change of cross-track error
-      headingErr / Math.PI,                                            // 7. Heading error relative to desired travel direction
+      Math.max(0, Math.min(1.0, vehicle.x / 1800)),
+      Math.max(0, Math.min(1.0, vehicle.y / 700)),
+      Math.max(-0.5, Math.min(1.0, (vehicle.speed || 0) / 100)),
+      Math.cos(vehicle.heading),
+      Math.sin(vehicle.heading),
+      Math.max(-1.0, Math.min(1.0, (vehicle.angularVelocity || 0) / 2.5)), // 1. Angular velocity / heading change rate
+      Math.max(-1.0, Math.min(1.0, lateralVel / 80)),                      // 2. Lateral velocity
+      Math.max(-1.0, Math.min(1.0, (vehicle.steeringAngle || 0) / (vehicle.maxSteeringAngle || 0.58))), // 3. Current steering angle
+      Math.max(-1.0, Math.min(1.0, lastSteerChange / 2.0)),                // 4. Steering change from previous step
+      crossTrack,                                                          // 5. Signed cross-track error
+      Math.max(-1.0, Math.min(1.0, crossTrackRate / 3.0)),                 // 6. Rate of change of cross-track error
+      headingErr / Math.PI,                                                // 7. Heading error relative to desired travel direction
       Math.max(-1.0, Math.min(1.0, dx / 1600)),
       Math.max(-1.0, Math.min(1.0, dy / 1600)),
       Math.min(1.0, distToGoal / 1600),
@@ -7562,8 +7671,9 @@ class EgoPPOAgent {
   }
 }
 
-// Alias EgoRLAgent to EgoPPOAgent for backward compatibility
+// Universal Shared-Policy Alias: Ego and all traffic vehicles reuse this single policy model
 const EgoRLAgent = EgoPPOAgent;
+const SharedPPOPolicy = EgoPPOAgent;
 
 /**
  * Reinforcement Learning Training & Evaluation Manager
@@ -7671,9 +7781,10 @@ class RLTrainingManager {
     const routePlanner = this.engine.getRoutePlanner();
     if (!ego || !env) return;
 
-    // 1. Advance dynamic pedestrians and animals (if traffic is enabled)
+    // 1. Advance dynamic pedestrians, animals, and road vehicles (via shared PPO policy if active)
+    const isTraining = this.isTraining();
     if (this.engine.trafficManager && this.engine.trafficManager.isEnabled) {
-      this.engine.trafficManager.update(dt, ego, env);
+      this.engine.trafficManager.update(dt, ego, env, this.agent, isTraining);
     }
 
     // 2. Update perception system
@@ -7695,7 +7806,6 @@ class RLTrainingManager {
     const obs = this.agent.getObservation(ego, env, routePlanner, dynEntities, this.lastAction, lastSteerChange, crossTrackRate);
     
     // Select action: Gaussian sampling in training, deterministic policy inference in evaluation
-    const isTraining = this.isTraining();
     const actData = this.agent.selectAction(obs, isTraining);
     this.lastAction = actData.action;
 
@@ -8986,6 +9096,7 @@ window.GlobalRouteSystem = GlobalRouteSystem;
 window.MLPNet = MLPNet;
 window.EgoPPOAgent = EgoPPOAgent;
 window.EgoRLAgent = EgoRLAgent;
+window.SharedPPOPolicy = SharedPPOPolicy;
 window.RLTrainingManager = RLTrainingManager;
 
 // Global Direct Accessors
