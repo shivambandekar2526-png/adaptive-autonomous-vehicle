@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Adaptive Path Planning & Collision Avoidance - Unstructured Indian Road Simulation</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="simulation-app">
+    <!-- Top Telemetry & Control Header -->
+    <header class="sim-header">
+      <div class="header-left">
+        <div class="project-identity">
+          <h1 class="sim-title">Adaptive Path Planning &amp; Collision Avoidance</h1>
+          <span class="sim-subtitle">Unstructured Indian Road Simulation &bull; Module 2: Ego Vehicle Teleop</span>
+        </div>
+      </div>
+
+      <!-- Vehicle Real-time Telemetry Readouts -->
+      <div class="header-center">
+        <div class="telemetry-pill" title="Vehicle Drive State">
+          <span class="pill-dot" id="ego-state-dot"></span>
+          <span class="pill-label">STATE:</span>
+          <span class="pill-value" id="ego-state-text">STOPPED</span>
+        </div>
+
+        <div class="telemetry-pill" title="Current Speed">
+          <span class="pill-label">SPEED:</span>
+          <span class="pill-value accent-cyan"><span id="ego-speed">0.0</span> <small>km/h</small></span>
+        </div>
+
+        <div class="telemetry-pill" title="Current Heading Angle">
+          <span class="pill-label">HEADING:</span>
+          <span class="pill-value" id="ego-heading">0.0&deg;</span>
+        </div>
+
+        <div class="telemetry-pill" title="Steering Wheel Angle">
+          <span class="pill-label">STEER:</span>
+          <span class="pill-value" id="ego-steer">0.0&deg;</span>
+        </div>
+
+        <div class="coords-display" id="coords-display" title="World Coordinates under cursor">
+          <span class="coord-tag">CURSOR:</span>
+          <span class="coord-val">X:<span id="coord-x">0</span> Y:<span id="coord-y">0</span></span>
+        </div>
+      </div>
+
+      <div class="header-right">
+        <div class="control-group">
+          <button id="btn-reset-car" class="tool-btn" title="Reset Ego Vehicle to Start Position (P)">
+            <span class="btn-icon">&#8635;</span> Reset Car
+          </button>
+          <button id="btn-grid" class="tool-btn active" title="Toggle Coordinate Grid (G)">
+            <span class="btn-icon">#</span> Grid
+          </button>
+          <button id="btn-labels" class="tool-btn active" title="Toggle Feature Labels (L)">
+            <span class="btn-icon">&para;</span> Labels
+          </button>
+          <button id="btn-zoom-in" class="tool-btn" title="Zoom In (+)">+</button>
+          <button id="btn-zoom-out" class="tool-btn" title="Zoom Out (-)">-</button>
+          <button id="btn-reset-view" class="tool-btn" title="Fit Entire World (R)">Fit</button>
+          <button id="btn-legend" class="tool-btn" title="Toggle Environment Legend">Legend</button>
+        </div>
+      </div>
+    </header>
+
+    <!-- Full Canvas Viewport Container -->
+    <main class="canvas-viewport" id="viewport-container">
+      <canvas id="sim-canvas"></canvas>
+
+      <!-- Driving Controls HUD Card (Floating Top-Left) -->
+      <aside class="controls-card" id="controls-card">
+        <div class="card-header">
+          <span class="card-title">Ego Vehicle Controls</span>
+          <span class="badge-mode">Manual Teleop</span>
+        </div>
+        <div class="key-guide">
+          <div class="key-row">
+            <span class="key-cap">W</span> / <span class="key-cap">&uarr;</span> <span>Accelerate</span>
+          </div>
+          <div class="key-row">
+            <span class="key-cap">S</span> / <span class="key-cap">&darr;</span> <span>Brake / Reverse</span>
+          </div>
+          <div class="key-row">
+            <span class="key-cap">A</span> / <span class="key-cap">&larr;</span> <span>Steer Left</span>
+          </div>
+          <div class="key-row">
+            <span class="key-cap">D</span> / <span class="key-cap">&rarr;</span> <span>Steer Right</span>
+          </div>
+          <div class="key-row">
+            <span class="key-cap key-space">SPACE</span> <span>Stop / Handbrake</span>
+          </div>
+          <div class="key-row">
+            <span class="key-cap">P</span> <span>Reset Car Position</span>
+          </div>
+        </div>
+      </aside>
+
+      <!-- Environment & Entity Legend Overlay (Collapsible) -->
+      <aside class="legend-panel" id="legend-panel">
+        <div class="legend-header">
+          <h3>Simulation Elements</h3>
+          <button id="legend-close-btn" class="close-btn">&times;</button>
+        </div>
+        <div class="legend-content">
+          <div class="legend-item">
+            <span class="legend-swatch ego-swatch"></span>
+            <span><strong>Ego Vehicle</strong> (Autonomous Test Car)</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-swatch destination-swatch"></span>
+            <span><strong>Destination Waypoint</strong> (Target Goal)</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-swatch road-swatch"></span>
+            <span>Main &amp; Side Road (Unstructured)</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-swatch curb-swatch"></span>
+            <span>Curb / Pavement (Black &amp; Yellow)</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-swatch pothole-swatch"></span>
+            <span>Irregular Potholes (Hazards)</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-swatch debris-swatch"></span>
+            <span>Construction Debris &amp; Barricades</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-swatch signal-swatch"></span>
+            <span>Intersection Traffic Signal</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-swatch vehicle-swatch"></span>
+            <span>Parked Objects (Auto / Scooter / Thela)</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-swatch building-swatch"></span>
+            <span>Roadside Commercial &amp; Compounds</span>
+          </div>
+        </div>
+        <div class="legend-footer">
+          <small>&bull; [W/A/S/D] Drive &bull; [Space] Stop &bull; Drag to Pan &bull; [R] Fit View</small>
+        </div>
+      </aside>
+
+      <!-- Mini Notification / Hint Banner -->
+      <div class="hint-banner" id="hint-banner">
+        <span>Module 2 Active: Ego Vehicle spawned on Main Road. Drive with [W/A/S/D] or [Arrow Keys].</span>
+      </div>
+    </main>
+  </div>
+
+  <script src="script.js"></script>
+</body>
+</html>
+
+

@@ -1,0 +1,506 @@
+/* ==========================================================================
+   Base & CSS Variables - Simulation Environment
+   ========================================================================== */
+:root {
+  --bg-dark: #080c14;
+  --panel-bg: rgba(13, 19, 33, 0.92);
+  --panel-border: rgba(56, 189, 248, 0.18);
+  --panel-border-hover: rgba(56, 189, 248, 0.4);
+  
+  --text-main: #f1f5f9;
+  --text-sub: #94a3b8;
+  --text-muted: #64748b;
+  
+  --accent-cyan: #06b6d4;
+  --accent-sky: #38bdf8;
+  --accent-amber: #f59e0b;
+  --accent-emerald: #10b981;
+  --accent-rose: #f43f5e;
+
+  --btn-bg: rgba(30, 41, 59, 0.8);
+  --btn-hover: rgba(51, 65, 85, 0.95);
+  --btn-active: rgba(6, 182, 212, 0.25);
+  --btn-active-border: #06b6d4;
+
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace;
+  
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  user-select: none;
+}
+
+html, body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background-color: var(--bg-dark);
+  font-family: var(--font-sans);
+  color: var(--text-main);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ==========================================================================
+   Full Application Container
+   ========================================================================== */
+.simulation-app {
+  width: 100vw;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  overflow: hidden;
+}
+
+/* ==========================================================================
+   Top Telemetry & Navigation Header
+   ========================================================================== */
+.sim-header {
+  height: 58px;
+  min-height: 58px;
+  background: var(--panel-bg);
+  border-bottom: 1px solid var(--panel-border);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 16px;
+  z-index: 100;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+}
+
+.header-left {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.project-identity {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.sim-title {
+  font-size: 1rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  color: #ffffff;
+  white-space: nowrap;
+}
+
+.sim-subtitle {
+  font-size: 0.74rem;
+  color: var(--accent-sky);
+  font-weight: 500;
+  letter-spacing: 0.02em;
+}
+
+/* Center Telemetry Readouts */
+.header-center {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.telemetry-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(15, 23, 42, 0.75);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  padding: 4px 10px;
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: 0.76rem;
+  white-space: nowrap;
+}
+
+.pill-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background-color: var(--accent-emerald);
+  box-shadow: 0 0 6px var(--accent-emerald);
+}
+
+.pill-dot.stopped {
+  background-color: var(--text-muted);
+  box-shadow: none;
+}
+
+.pill-dot.accelerating {
+  background-color: var(--accent-emerald);
+  box-shadow: 0 0 8px var(--accent-emerald);
+  animation: pulse-fast 0.8s infinite alternate;
+}
+
+.pill-dot.braking {
+  background-color: var(--accent-rose);
+  box-shadow: 0 0 8px var(--accent-rose);
+}
+
+.pill-dot.reversing {
+  background-color: var(--accent-amber);
+  box-shadow: 0 0 8px var(--accent-amber);
+}
+
+.pill-label {
+  color: var(--text-muted);
+  font-weight: 600;
+}
+
+.pill-value {
+  color: var(--text-main);
+  font-weight: 700;
+}
+
+.pill-value.accent-cyan {
+  color: var(--accent-cyan);
+}
+
+.coords-display {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(2, 6, 23, 0.6);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  padding: 4px 10px;
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+}
+
+.coord-tag {
+  color: var(--accent-sky);
+  font-weight: 700;
+}
+
+.coord-val {
+  color: var(--text-sub);
+}
+
+@keyframes pulse-fast {
+  from { opacity: 0.5; transform: scale(0.9); }
+  to { opacity: 1; transform: scale(1.3); }
+}
+
+/* Header Controls */
+.header-right {
+  display: flex;
+  align-items: center;
+}
+
+.control-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.tool-btn {
+  background: var(--btn-bg);
+  color: var(--text-sub);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  padding: 6px 12px;
+  border-radius: var(--radius-sm);
+  font-family: var(--font-sans);
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  transition: all 0.2s ease;
+}
+
+.tool-btn:hover {
+  background: var(--btn-hover);
+  color: var(--text-main);
+  border-color: rgba(255, 255, 255, 0.25);
+}
+
+.tool-btn.active {
+  background: var(--btn-active);
+  color: var(--accent-cyan);
+  border-color: var(--btn-active-border);
+}
+
+.tool-btn:active {
+  transform: translateY(1px);
+}
+
+.btn-icon {
+  font-family: var(--font-mono);
+  font-weight: bold;
+}
+
+/* ==========================================================================
+   Canvas Viewport
+   ========================================================================== */
+.canvas-viewport {
+  flex: 1;
+  width: 100%;
+  height: calc(100vh - 58px);
+  position: relative;
+  overflow: hidden;
+  background-color: #121722;
+  cursor: crosshair;
+}
+
+#sim-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  touch-action: none;
+}
+
+/* ==========================================================================
+   Ego Vehicle Controls HUD Card
+   ========================================================================== */
+.controls-card {
+  position: absolute;
+  top: 16px;
+  left: 16px;
+  background: var(--panel-bg);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--radius-md);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+  z-index: 50;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 225px;
+  pointer-events: auto;
+}
+
+.controls-card .card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  padding-bottom: 8px;
+}
+
+.controls-card .card-title {
+  font-size: 0.8rem;
+  font-weight: 700;
+  color: var(--text-main);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.badge-mode {
+  font-size: 0.68rem;
+  font-family: var(--font-mono);
+  color: var(--accent-cyan);
+  background: rgba(6, 182, 212, 0.15);
+  border: 1px solid rgba(6, 182, 212, 0.3);
+  padding: 2px 6px;
+  border-radius: var(--radius-xs);
+  font-weight: 600;
+}
+
+.key-guide {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.key-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.74rem;
+  color: var(--text-sub);
+}
+
+.key-cap {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  height: 20px;
+  padding: 0 5px;
+  background: #1e293b;
+  border: 1px solid #475569;
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: var(--accent-cyan);
+  box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+}
+
+.key-space {
+  min-width: 50px;
+  font-size: 0.65rem;
+}
+
+/* ==========================================================================
+   Legend Overlay Panel
+   ========================================================================== */
+.legend-panel {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  width: 290px;
+  background: var(--panel-bg);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--radius-md);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+  z-index: 50;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  transition: opacity 0.25s ease, transform 0.25s ease;
+  transform: translateY(0);
+  opacity: 1;
+}
+
+.legend-panel.hidden {
+  opacity: 0;
+  transform: translateY(-10px);
+  pointer-events: none;
+}
+
+.legend-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  padding-bottom: 8px;
+}
+
+.legend-header h3 {
+  font-size: 0.85rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--accent-sky);
+}
+
+.close-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-size: 1.2rem;
+  cursor: pointer;
+  line-height: 1;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+.close-btn:hover {
+  color: var(--text-main);
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.legend-content {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 0.8rem;
+  color: var(--text-sub);
+}
+
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.legend-swatch {
+  width: 14px;
+  height: 14px;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+
+.ego-swatch { background: #38bdf8; border: 1px solid #ffffff; box-shadow: 0 0 6px rgba(56, 189, 248, 0.8); }
+.destination-swatch { background: #10b981; border: 1px solid #34d399; box-shadow: 0 0 6px rgba(16, 185, 129, 0.8); }
+.road-swatch { background: #373c47; border: 1px solid #5a6273; }
+.curb-swatch { background: #eab308; border: 1px solid #0f172a; }
+.pothole-swatch { background: #18191d; border: 1px dashed #78716c; }
+.debris-swatch { background: #f97316; border: 1px solid #fb923c; }
+.signal-swatch { background: #22c55e; border: 1px solid #16a34a; }
+.vehicle-swatch { background: #facc15; border: 1px solid #15803d; }
+.building-swatch { background: #1e293b; border: 1px solid #475569; }
+
+.legend-footer {
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  padding-top: 8px;
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+/* ==========================================================================
+   Hint Banner
+   ========================================================================== */
+.hint-banner {
+  position: absolute;
+  bottom: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(15, 23, 42, 0.85);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  padding: 6px 18px;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  color: var(--text-sub);
+  font-family: var(--font-mono);
+  backdrop-filter: blur(8px);
+  pointer-events: none;
+  box-shadow: 0 4px 15px rgba(0, 0, 0, 0.4);
+}
+
+/* ==========================================================================
+   Responsive Adaptations
+   ========================================================================== */
+@media (max-width: 1100px) {
+  .controls-card {
+    display: none;
+  }
+}
+
+@media (max-width: 900px) {
+  .sim-subtitle {
+    display: none;
+  }
+  .coords-display {
+    display: none;
+  }
+  .legend-panel {
+    width: 250px;
+  }
+}
+
+@media (max-width: 600px) {
+  .sim-header {
+    padding: 0 8px;
+  }
+  .sim-title {
+    font-size: 0.85rem;
+  }
+  .tool-btn {
+    padding: 4px 8px;
+    font-size: 0.72rem;
+  }
+}
+
