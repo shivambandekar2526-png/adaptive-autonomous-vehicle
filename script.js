@@ -729,16 +729,33 @@ class RoadNetworkGraph {
       this.connectNodes(`node-mc-${i + 1}`, `node-mc-${i}`, { road: 'main', lane: 'center' });
     }
 
-    // 6. Connect Lateral Transitions between Main Lanes (Lane switching & Overtaking paths):
+    // 6. Connect Lateral & Diagonal Transitions between Main Lanes (Lane switching & Overtaking paths):
     for (let i = 0; i < centerX.length; i++) {
       // Eastbound <-> Center
       this.connectNodes(`node-me-${i}`, `node-mc-${i}`, { road: 'main', lane: 'transition', speedLimit: 60 });
       this.connectNodes(`node-mc-${i}`, `node-me-${i}`, { road: 'main', lane: 'transition', speedLimit: 60 });
+
+      // Forward Diagonal transitions:
+      // Eastbound -> Center Forward: node-me-i -> node-mc-(i+1)
+      if (i < centerX.length - 1) {
+        this.connectNodes(`node-me-${i}`, `node-mc-${i + 1}`, { road: 'main', lane: 'transition', speedLimit: 75 });
+        this.connectNodes(`node-mc-${i}`, `node-me-${i + 1}`, { road: 'main', lane: 'transition', speedLimit: 75 });
+      }
+
       // Center <-> Westbound (matched by coordinates)
       const westIdx = westX.indexOf(centerX[i]);
       if (westIdx !== -1) {
         this.connectNodes(`node-mw-${westIdx}`, `node-mc-${i}`, { road: 'main', lane: 'transition', speedLimit: 60 });
         this.connectNodes(`node-mc-${i}`, `node-mw-${westIdx}`, { road: 'main', lane: 'transition', speedLimit: 60 });
+
+        // Westbound forward diagonal transition
+        if (westIdx < westX.length - 1) {
+          const nextCenterIdx = centerX.indexOf(westX[westIdx + 1]);
+          if (nextCenterIdx !== -1) {
+            this.connectNodes(`node-mw-${westIdx}`, `node-mc-${nextCenterIdx}`, { road: 'main', lane: 'transition', speedLimit: 75 });
+            this.connectNodes(`node-mc-${nextCenterIdx}`, `node-mw-${westIdx}`, { road: 'main', lane: 'transition', speedLimit: 75 });
+          }
+        }
       }
     }
 
@@ -1129,8 +1146,32 @@ class GlobalRoutePlanner {
         const neighbor = edge.toNode;
         if (!neighbor || closedSet.has(neighbor.id)) continue;
 
+        // Check if edge intersects static solid obstacles (buildings, debris, parked cars)
+        if (typeof StaticCollisionSystem !== 'undefined') {
+          let edgeBlocked = false;
+          const samples = 6;
+          for (let s = 0; s <= samples; s++) {
+            const sx = currentNode.x + (s / samples) * (neighbor.x - currentNode.x);
+            const sy = currentNode.y + (s / samples) * (neighbor.y - currentNode.y);
+            if (StaticCollisionSystem.checkSolidCollision(sx, sy, 15).collided) {
+              edgeBlocked = true;
+              break;
+            }
+          }
+          if (edgeBlocked) continue; // Skip edge obstructed by static obstacle
+        }
+
         // Base edge cost = edge length
         let edgeCost = edge.length;
+
+        // Check pothole hazard on edge: add penalty to prefer clean tarmac corridors
+        if (typeof StaticCollisionSystem !== 'undefined') {
+          const midX = (currentNode.x + neighbor.x) / 2;
+          const midY = (currentNode.y + neighbor.y) / 2;
+          if (StaticCollisionSystem.checkPothole(midX, midY, 18).inPothole) {
+            edgeCost += 500;
+          }
+        }
 
         // Preference weighting:
         // - Main flow lanes preferred over lateral transitions
@@ -1332,8 +1373,187 @@ class GlobalRoutePlanner {
     return minDistance;
   }
 
+  /**
+   * Computes comprehensive route-following navigation target telemetry:
+   * Finds the active segment on the global route, calculates signed cross-track error,
+   * traces forward along the polyline to find the lookahead target point,
+   * detects upcoming turns / intersections, and calculates progress.
+   *
+   * @param {Object} ego - { x, y, heading, speed }
+   * @param {number} [lookaheadDistance=50] - Forward lookahead distance (px)
+   * @returns {Object} Navigation target & telemetry
+   */
+  getNavigationTarget(ego, lookaheadDistance = 50) {
+    if (!this.currentRoute || !this.currentRoute.waypoints || this.currentRoute.waypoints.length < 2 || !ego) {
+      return {
+        hasRoute: false,
+        targetLookahead: { x: ego ? ego.x + 50 : 0, y: ego ? ego.y : 0 },
+        targetHeading: ego ? ego.heading : 0,
+        segmentHeading: ego ? ego.heading : 0,
+        crossTrackError: 0,
+        progressPercent: 0,
+        distanceToGoal: 0,
+        distanceRemainingAlongRoute: 0,
+        navState: 'NO_ROUTE',
+        currentNode: null,
+        targetWaypoint: null,
+        isTurn: false,
+        targetSpeedLimit: 90
+      };
+    }
+
+    const wps = this.currentRoute.waypoints;
+    const n = wps.length;
+
+    // 1. Find closest segment on the route polyline
+    let minDistance = Infinity;
+    let closestSegIdx = 0;
+    let closestProj = { x: wps[0].x, y: wps[0].y };
+
+    for (let i = 0; i < n - 1; i++) {
+      const p1 = wps[i];
+      const p2 = wps[i + 1];
+
+      const dx = p2.x - p1.x;
+      const dy = p2.y - p1.y;
+      const lenSq = dx * dx + dy * dy;
+
+      if (lenSq === 0) continue;
+
+      let t = ((ego.x - p1.x) * dx + (ego.y - p1.y) * dy) / lenSq;
+      t = Math.max(0, Math.min(1, t));
+
+      const projX = p1.x + t * dx;
+      const projY = p1.y + t * dy;
+      const d = Math.hypot(ego.x - projX, ego.y - projY);
+
+      if (d < minDistance) {
+        minDistance = d;
+        closestSegIdx = i;
+        closestProj = { x: projX, y: projY };
+      }
+    }
+
+    // 2. Calculate signed cross-track error
+    const segP1 = wps[closestSegIdx];
+    const segP2 = wps[closestSegIdx + 1];
+    const segDx = segP2.x - segP1.x;
+    const segDy = segP2.y - segP1.y;
+    const segLen = Math.hypot(segDx, segDy) || 1;
+    const segHeading = Math.atan2(segDy, segDx);
+
+    // Normal vector pointing to the left of the segment
+    const normX = -segDy / segLen;
+    const normY = segDx / segLen;
+
+    // Signed cross-track error: positive = left of route, negative = right of route
+    const crossTrackError = (ego.x - closestProj.x) * normX + (ego.y - closestProj.y) * normY;
+
+    // 3. Trace forward along polyline from closestProj by lookaheadDistance
+    let remainingLookahead = lookaheadDistance;
+    let currIdx = closestSegIdx;
+    let currPt = { x: closestProj.x, y: closestProj.y };
+    let lookaheadPt = { x: segP2.x, y: segP2.y };
+    let lookaheadHeading = segHeading;
+    let lookaheadSpeedLimit = segP2.speedLimit || 90;
+
+    while (currIdx < n - 1 && remainingLookahead > 0) {
+      const nextWp = wps[currIdx + 1];
+      const distToNext = Math.hypot(nextWp.x - currPt.x, nextWp.y - currPt.y);
+
+      if (remainingLookahead <= distToNext) {
+        const ratio = remainingLookahead / (distToNext || 1);
+        lookaheadPt = {
+          x: currPt.x + ratio * (nextWp.x - currPt.x),
+          y: currPt.y + ratio * (nextWp.y - currPt.y)
+        };
+        lookaheadHeading = Math.atan2(nextWp.y - currPt.y, nextWp.x - currPt.x);
+        lookaheadSpeedLimit = nextWp.speedLimit || 90;
+        remainingLookahead = 0;
+        break;
+      } else {
+        remainingLookahead -= distToNext;
+        currPt = { x: nextWp.x, y: nextWp.y };
+        currIdx++;
+        if (currIdx < n - 1) {
+          const nextNext = wps[currIdx + 1];
+          lookaheadHeading = Math.atan2(nextNext.y - nextWp.y, nextNext.x - nextWp.x);
+          lookaheadSpeedLimit = nextNext.speedLimit || 90;
+        }
+      }
+    }
+
+    if (remainingLookahead > 0) {
+      lookaheadPt = { x: wps[n - 1].x, y: wps[n - 1].y };
+      lookaheadHeading = wps[n - 1].heading || segHeading;
+    }
+
+    // 4. Calculate remaining distance along route to destination
+    let distRemaining = Math.hypot(wps[closestSegIdx + 1].x - closestProj.x, wps[closestSegIdx + 1].y - closestProj.y);
+    for (let i = closestSegIdx + 1; i < n - 1; i++) {
+      distRemaining += Math.hypot(wps[i + 1].x - wps[i].x, wps[i + 1].y - wps[i].y);
+    }
+    const directDistToGoal = Math.hypot(wps[n - 1].x - ego.x, wps[n - 1].y - ego.y);
+
+    const totalDist = this.currentRoute.totalDistance || 1;
+    const progressDone = Math.max(0, totalDist - distRemaining);
+    const progressPercent = Math.min(100, Math.max(0, (progressDone / totalDist) * 100));
+
+    // 5. Detect Turns / Heading Changes ahead
+    let headingDiff = Math.abs(lookaheadHeading - segHeading);
+    while (headingDiff > Math.PI) headingDiff -= Math.PI * 2;
+    headingDiff = Math.abs(headingDiff);
+
+    const isTurn = (headingDiff > 0.35) || (segP1.road === 'intersection') || (segP2.road === 'intersection');
+
+    // 6. Determine Navigation State
+    let navState = 'TRACKING';
+    if (directDistToGoal <= 45 || distRemaining <= 35) {
+      navState = 'ARRIVED';
+    } else if (directDistToGoal <= 140 || distRemaining <= 130) {
+      navState = 'ARRIVING';
+    } else if (Math.abs(crossTrackError) > 35) {
+      navState = 'RECOVERING';
+    } else if (isTurn) {
+      navState = headingDiff > 0.6 ? 'TURNING' : 'APPROACHING_TURN';
+    }
+
+    const activeNode = wps[closestSegIdx].nodeId || `wp-${closestSegIdx}`;
+    const targetWpNode = wps[Math.min(closestSegIdx + 1, n - 1)].nodeId || `wp-${closestSegIdx + 1}`;
+
+    this.lastNavTarget = {
+      hasRoute: true,
+      currentNode: activeNode,
+      targetWaypoint: targetWpNode,
+      targetLookahead: lookaheadPt,
+      targetHeading: lookaheadHeading,
+      segmentHeading: segHeading,
+      crossTrackError: crossTrackError,
+      progressPercent: Math.round(progressPercent),
+      distanceToGoal: Math.round(directDistToGoal),
+      distanceRemainingAlongRoute: Math.round(distRemaining),
+      navState: navState,
+      isTurn: isTurn,
+      targetSpeedLimit: lookaheadSpeedLimit,
+      closestSegmentIndex: closestSegIdx
+    };
+
+    return this.lastNavTarget;
+  }
+
   getRoute() {
     return this.currentRoute;
+  }
+
+  getNavTelemetry() {
+    return this.lastNavTarget || {
+      hasRoute: false,
+      currentNode: '--',
+      targetWaypoint: '--',
+      progressPercent: 0,
+      distanceToGoal: 0,
+      navState: 'IDLE'
+    };
   }
 
   toggleDebug(forceState) {
@@ -1400,6 +1620,34 @@ class GlobalRoutePlanner {
       ctx.strokeStyle = '#0f172a';
       ctx.lineWidth = 1.5;
       ctx.stroke();
+    }
+
+    // 4. Render Active Pure Pursuit Lookahead Reticle & Leader
+    if (this.lastNavTarget && this.lastNavTarget.targetLookahead) {
+      const tgt = this.lastNavTarget.targetLookahead;
+
+      // Cyan Glowing Target Lookahead Crosshair
+      ctx.save();
+      ctx.strokeStyle = '#06b6d4'; // Cyan
+      ctx.fillStyle = 'rgba(6, 182, 212, 0.35)';
+      ctx.lineWidth = 2;
+      ctx.shadowColor = '#06b6d4';
+      ctx.shadowBlur = 8;
+
+      ctx.beginPath();
+      ctx.arc(tgt.x, tgt.y, 8, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+
+      // Crosshairs
+      ctx.beginPath();
+      ctx.moveTo(tgt.x - 12, tgt.y);
+      ctx.lineTo(tgt.x + 12, tgt.y);
+      ctx.moveTo(tgt.x, tgt.y - 12);
+      ctx.lineTo(tgt.x, tgt.y + 12);
+      ctx.stroke();
+
+      ctx.restore();
     }
 
     ctx.restore();
@@ -4907,24 +5155,39 @@ class PathPlanner {
       }
     }
 
-    // --- 2. Destination Progress & Alignment (STRONG Goal-Aware Scoring) ---
-    const deltaGoal = endDistToGoal - startDistToGoal;
-    let goalProgressCost = 0;
+    // --- 2. Destination / Route Progress & Alignment (Global Road Route Aware Scoring) ---
+    let targetX = destination.x;
+    let targetY = destination.y;
+    let targetHeading = Math.atan2(destination.y - endWp.y, destination.x - endWp.x);
 
-    if (deltaGoal < 0) {
-      // Moving closer to destination -> Significant reward (negative cost bonus)
-      goalProgressCost = deltaGoal * 4.2;
-    } else {
-      // Moving away or sideways -> Heavy penalty
-      goalProgressCost = 1400 + deltaGoal * 6.5;
+    // If global route planner is active, score progress toward the route lookahead point
+    if (typeof GlobalRouteSystem !== 'undefined') {
+      const navTarget = GlobalRouteSystem.getNavigationTarget({ x: egoX, y: egoY, heading: endWp.heading }, 65);
+      if (navTarget && navTarget.hasRoute && navTarget.targetLookahead) {
+        targetX = navTarget.targetLookahead.x;
+        targetY = navTarget.targetLookahead.y;
+        targetHeading = navTarget.targetHeading;
+      }
     }
 
-    // Alignment angle toward destination
-    const targetHeading = Math.atan2(destination.y - endWp.y, destination.x - endWp.x);
+    const startDistToTarget = Math.hypot(targetX - egoX, targetY - egoY);
+    const endDistToTarget = Math.hypot(targetX - endWp.x, targetY - endWp.y);
+    const deltaTarget = endDistToTarget - startDistToTarget;
+
+    let goalProgressCost = 0;
+    if (deltaTarget < 0) {
+      // Moving along global route -> Significant reward
+      goalProgressCost = deltaTarget * 4.2;
+    } else {
+      // Moving away or sideways from route -> Heavy penalty
+      goalProgressCost = 1400 + deltaTarget * 6.5;
+    }
+
+    // Alignment angle toward route tangent vector
     let headingDiff = targetHeading - endWp.heading;
     while (headingDiff > Math.PI) headingDiff -= Math.PI * 2;
     while (headingDiff < -Math.PI) headingDiff += Math.PI * 2;
-    const goalHeadingCost = Math.abs(headingDiff) * 200;
+    const goalHeadingCost = Math.abs(headingDiff) * 220;
 
     const totalGoalCost = goalProgressCost + goalHeadingCost;
 
@@ -5683,12 +5946,19 @@ class AutonomousVehicleController {
     }
     this.isStuck = (this.stuckTimer >= 2.5);
 
-    // 2. Check Destination Arrival (Destination Goal at x: 1650, y: 560)
+    // 2. Check Global Route Navigation & Destination Arrival
     const destX = destination ? destination.x : 1650;
     const destY = destination ? destination.y : 560;
     const distToGoal = Math.hypot(destX - egoX, destY - egoY);
 
-    if (distToGoal <= this.arrivalDistance || this.hasArrived) {
+    // Dynamic Lookahead Distance (scales with vehicle speed: 35px at low speed, up to 65px at cruising speed)
+    const dynamicLookahead = Math.max(35, Math.min(65, 0.35 * Math.abs(currentSpeed) + 25));
+    let nav = null;
+    if (typeof GlobalRouteSystem !== 'undefined') {
+      nav = GlobalRouteSystem.getNavigationTarget(egoVehicle, dynamicLookahead);
+    }
+
+    if (distToGoal <= this.arrivalDistance || (nav && nav.navState === 'ARRIVED') || this.hasArrived) {
       this.hasArrived = true;
       this.controlState = 'ARRIVED';
       this.targetSpeed = 0;
@@ -5767,33 +6037,68 @@ class AutonomousVehicleController {
         break;
     }
 
-    // 5. Lateral Path Tracking (Smooth Steering Control)
+    // Adaptive Speed Regulation for Curves, Turns, Intersections & Approaching Destination
+    if (nav && nav.hasRoute) {
+      if (nav.navState === 'ARRIVING') {
+        // Progressive smooth deceleration when approaching destination
+        const arrivalRatio = Math.max(0.15, Math.min(1.0, nav.distanceToGoal / 140));
+        this.targetSpeed = Math.min(this.targetSpeed, Math.max(22, this.config.cruiseSpeed * arrivalRatio));
+      } else if (nav.isTurn) {
+        // Reduce speed on curves / T-junction turns to maintain stable tracking
+        this.targetSpeed = Math.min(this.targetSpeed, 40);
+      }
+    }
+
+    // 5. Lateral Route Following & Path Tracking (Pure Pursuit + Stanley Cross-Track Correction)
     let desiredSteerAngle = 0;
 
     // Prevent steering oscillation when waiting, stopped, or stuck
     if (this.controlState === 'WAITING' || this.controlState === 'STOPPED' || this.isStuck) {
       desiredSteerAngle = 0;
       egoVehicle.inputs.steer = 0;
-    } else if (selectedPath && selectedPath.waypoints && selectedPath.waypoints.length > 0) {
-      // Pick lookahead point along spline trajectory
+    } else if (selectedPath && selectedPath.waypoints && selectedPath.waypoints.length > 0 && selectedPath.obstacleCost > 40) {
+      // Local obstacle avoidance trajectory override
       const lookaheadIdx = Math.min(this.config.lookaheadWaypointIdx, selectedPath.waypoints.length - 1);
       const targetWp = selectedPath.waypoints[lookaheadIdx] || selectedPath.endPoint;
 
-      // Target heading from ego position to target waypoint
       const targetHeading = Math.atan2(targetWp.y - egoY, targetWp.x - egoX);
       let headingError = targetHeading - egoHeading;
       while (headingError > Math.PI) headingError -= Math.PI * 2;
       while (headingError < -Math.PI) headingError += Math.PI * 2;
 
-      // Calculate desired steer input [-1.0, 1.0]
       desiredSteerAngle = Math.max(-1.0, Math.min(1.0, headingError * this.config.steerGain));
+    } else if (nav && nav.hasRoute && nav.targetLookahead) {
+      // Global Route Waypoint Pure Pursuit with Stanley Cross-Track Error Compensation
+      const targetWp = nav.targetLookahead;
+      const targetHeading = Math.atan2(targetWp.y - egoY, targetWp.x - egoX);
+      let headingError = targetHeading - egoHeading;
+      while (headingError > Math.PI) headingError -= Math.PI * 2;
+      while (headingError < -Math.PI) headingError += Math.PI * 2;
 
-      // Speed reduction on sharp turns to maintain stability
-      if (Math.abs(desiredSteerAngle) > 0.4) {
+      // Stanley Cross-Track Error Correction: steer back toward route centerline
+      const crossTrackSteer = Math.atan2(-0.85 * nav.crossTrackError, Math.max(18, Math.abs(currentSpeed)));
+
+      // Route Segment Heading Alignment
+      let routeAlignError = nav.targetHeading - egoHeading;
+      while (routeAlignError > Math.PI) routeAlignError -= Math.PI * 2;
+      while (routeAlignError < -Math.PI) routeAlignError += Math.PI * 2;
+
+      // Combined Proportional Steering Command
+      let rawSteer = 1.65 * headingError + 0.35 * routeAlignError + crossTrackSteer;
+
+      // Anti-Oscillation Deadband: prevent micro-steering jitter when vehicle is well-aligned on route
+      if (Math.abs(headingError) < 0.025 && Math.abs(nav.crossTrackError) < 2.5) {
+        rawSteer *= 0.35;
+      }
+
+      desiredSteerAngle = Math.max(-1.0, Math.min(1.0, rawSteer));
+
+      // Curvature speed reduction
+      if (Math.abs(desiredSteerAngle) > 0.42) {
         this.targetSpeed = Math.min(this.targetSpeed, this.config.cautionSpeed);
       }
     } else {
-      // Direct waypoint heading to destination if planner has no path
+      // Direct waypoint heading to destination fallback
       const directHeading = Math.atan2(destY - egoY, destX - egoX);
       let headingError = directHeading - egoHeading;
       while (headingError > Math.PI) headingError -= Math.PI * 2;
@@ -5801,7 +6106,7 @@ class AutonomousVehicleController {
       desiredSteerAngle = Math.max(-1.0, Math.min(1.0, headingError * 1.5));
     }
 
-    // Smooth steering rate transition
+    // Smooth steering rate transition (anti-oscillation low-pass filter)
     if (this.controlState !== 'WAITING' && this.controlState !== 'STOPPED' && !this.isStuck) {
       egoVehicle.inputs.steer += (desiredSteerAngle - egoVehicle.inputs.steer) * this.config.steerRateLimit * dt;
       egoVehicle.inputs.steer = Math.max(-1.0, Math.min(1.0, egoVehicle.inputs.steer));
@@ -5823,6 +6128,14 @@ class AutonomousVehicleController {
       egoVehicle.inputs.throttle = 0.1;
       egoVehicle.inputs.brake = 0;
       egoVehicle.inputs.handbrake = false;
+    }
+
+    // Strict Reverse Guard: Prevent unintended backward movement unless explicitly commanded
+    if (this.controlState !== 'REVERSING') {
+      egoVehicle.inputs.throttle = Math.max(0, egoVehicle.inputs.throttle);
+      if (egoVehicle.speed < 0) {
+        egoVehicle.speed = 0;
+      }
     }
   }
 
@@ -5973,6 +6286,12 @@ class SimulationAppController {
       plannerDecision: document.getElementById('planner-decision'),
       selectedPathLabel: document.getElementById('selected-path-label'),
       pathCost: document.getElementById('path-cost'),
+
+      // Global Route Navigation Telemetry Elements
+      routePill: document.getElementById('route-pill'),
+      routeNodeDisplay: document.getElementById('route-node-display'),
+      routeProgressDisplay: document.getElementById('route-progress-display'),
+      routeNavState: document.getElementById('route-nav-state'),
 
       // Controls
       btnRoute: document.getElementById('btn-route'),
@@ -6495,6 +6814,21 @@ class SimulationAppController {
 
       if (this.dom.pathCost) {
         this.dom.pathCost.textContent = best ? best.totalCost.toFixed(0) : '0';
+      }
+    }
+
+    // Update Global Route Navigation Telemetry
+    if (this.routePlanner) {
+      const nav = this.routePlanner.getNavTelemetry();
+      if (this.dom.routeNodeDisplay) {
+        this.dom.routeNodeDisplay.textContent = nav.currentNode ? `${nav.currentNode}` : '--';
+      }
+      if (this.dom.routeProgressDisplay) {
+        this.dom.routeProgressDisplay.textContent = `${nav.progressPercent}% (${nav.distanceToGoal}px)`;
+      }
+      if (this.dom.routeNavState) {
+        this.dom.routeNavState.textContent = nav.navState || 'TRACKING';
+        this.dom.routeNavState.className = 'pill-value ' + (nav.navState === 'ARRIVED' ? 'accent-emerald' : (nav.isTurn ? 'accent-amber' : 'accent-cyan'));
       }
     }
   }
