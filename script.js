@@ -1066,11 +1066,16 @@ class GlobalRoutePlanner {
   planRoute(startPos, destPos, options = {}) {
     if (!this.network || !startPos || !destPos) return null;
 
-    // 1. Find nearest valid road nodes for start and destination
+    // 1. Find nearest valid unobstructed road nodes for start and destination
     let startNode = null;
     if (startPos.heading !== undefined) {
-      // Find candidate nodes that align with vehicle heading
-      const candidates = Array.from(this.network.nodes.values()).map(node => {
+      // Find candidate nodes that are clear of static obstacles and align with vehicle heading
+      const candidates = Array.from(this.network.nodes.values()).filter(node => {
+        if (typeof StaticCollisionSystem !== 'undefined') {
+          if (StaticCollisionSystem.checkSolidCollision(node.x, node.y, 16).collided) return false;
+        }
+        return true;
+      }).map(node => {
         const dist = Math.hypot(node.x - startPos.x, node.y - startPos.y);
         const angleToNode = Math.atan2(node.y - startPos.y, node.x - startPos.x);
         let headingDiff = Math.abs(angleToNode - startPos.heading);
@@ -1086,11 +1091,21 @@ class GlobalRoutePlanner {
     }
 
     if (!startNode) {
-      const nearestStart = this.network.getNearestNode(startPos);
+      const nearestStart = this.network.getNearestNode(startPos, (node) => {
+        if (typeof StaticCollisionSystem !== 'undefined') {
+          return !StaticCollisionSystem.checkSolidCollision(node.x, node.y, 16).collided;
+        }
+        return true;
+      });
       startNode = nearestStart ? nearestStart.node : null;
     }
 
-    const nearestGoal = this.network.getNearestNode(destPos);
+    const nearestGoal = this.network.getNearestNode(destPos, (node) => {
+      if (typeof StaticCollisionSystem !== 'undefined') {
+        return !StaticCollisionSystem.checkSolidCollision(node.x, node.y, 16).collided;
+      }
+      return true;
+    });
     const goalNode = nearestGoal ? nearestGoal.node : null;
 
     if (!startNode || !goalNode) {
@@ -4912,7 +4927,7 @@ class DetectionManager {
 class PathPlanner {
   constructor(options = {}) {
     // Lookahead and Rollout Parameters
-    this.horizonDistance = options.horizonDistance || 175; // px (approx 43.7 m)
+    this.horizonDistance = options.horizonDistance || 120; // px (approx 30 m)
     this.numWaypoints = options.numWaypoints || 18;        // steps along trajectory
     this.wheelbase = 26;                                   // Ego vehicle wheelbase (px)
 
@@ -4976,6 +4991,12 @@ class PathPlanner {
     const evaluatedPaths = this.candidateDefinitions.map(def => {
       const path = this.generateRollout(egoX, egoY, egoHeading, def.steerAngle, def.id, def.label);
       this.scoreTrajectory(path, obstacles, destination, currentSteer, environmentData, egoX, egoY);
+
+      // Continuity / Hysteresis bonus: slight preference for sustaining active trajectory to eliminate jitter
+      if (this.selectedPath && path.id === this.selectedPath.id) {
+        path.totalCost -= 50;
+      }
+
       return path;
     });
 
@@ -5103,15 +5124,30 @@ class PathPlanner {
           continue;
         }
 
-        const dist = Math.hypot(wp.x - obs.x, wp.y - obs.y);
-        const clearance = dist - (egoRadius + (obs.radius || 12));
+        // Oriented Bounding Box Collision & Clearance Check
+        const obsHeading = obs.heading || 0;
+        const cosO = Math.cos(obsHeading);
+        const sinO = Math.sin(obsHeading);
+        const dx = wp.x - obs.x;
+        const dy = wp.y - obs.y;
+        const longDist = Math.abs(dx * cosO + dy * sinO);
+        const latDist = Math.abs(dy * cosO - dx * sinO);
 
+        const egoHalfWidth = 9;
+        const egoHalfLength = 16;
+        const obsHalfWidth = (obs.width || (obs.radius ? obs.radius * 1.5 : 18)) / 2;
+        const obsHalfLength = (obs.length || (obs.radius ? obs.radius * 2 : 32)) / 2;
+
+        const collisionLat = obsHalfWidth + egoHalfWidth;
+        const collisionLong = obsHalfLength + egoHalfLength;
+
+        const clearance = Math.hypot(Math.max(0, longDist - collisionLong), Math.max(0, latDist - collisionLat));
         if (clearance < minClearance) {
           minClearance = clearance;
         }
 
-        // Direct Collision Check (clearance <= 2px)
-        if (clearance <= 2) {
+        // Direct Collision Check (inside physical extent)
+        if (longDist <= collisionLong && latDist <= collisionLat) {
           hasCollision = true;
           if (collisionIdx === -1) {
             collisionIdx = i;
@@ -5121,8 +5157,8 @@ class PathPlanner {
           break;
         }
 
-        // Proximity Soft Penalty (clearance < 50px)
-        if (clearance < 50) {
+        // Proximity Soft Penalty (clearance < 40px)
+        if (clearance < 40) {
           const threatMult = obs.riskLevel === 'DANGER' ? 2.5 : (obs.riskLevel === 'CAUTION' ? 1.6 : 1.0);
           const penalty = threatMult * (this.weights.clearance / (clearance + 4));
           totalObstacleCost += penalty;
@@ -5131,10 +5167,10 @@ class PathPlanner {
 
       if (hasCollision) break;
 
-      // C. Pothole Road Surface Hazard Check
+      // C. Pothole Road Surface Hazard Check (passable surface hazard, prefer clean tarmac when practical)
       const potholeCheck = StaticCollisionSystem.checkPothole(wp.x, wp.y, egoRadius * 0.8);
       if (potholeCheck.inPothole) {
-        potholePenalty += 2000; // Heavy penalty: planner strongly prefers clean tarmac around potholes
+        potholePenalty += 400; // Moderate penalty: prefers avoiding when practical, passable if avoiding would cause collision
       }
 
       // D. Drivable Road Envelope Check
@@ -5145,11 +5181,12 @@ class PathPlanner {
         isOffRoad = true;
         roadCost += 5000;
       } else {
-        // Preferred lane centering: gently penalize running too close to road shoulder
+        // Preferred lane centering & shoulder avoidance: strongly penalize running into road shoulders (y < 480 or y > 640)
         if (onMainRoad) {
-          const distFromCenter = Math.abs(wp.y - 560);
-          if (distFromCenter > 70) {
-            roadCost += (distFromCenter - 70) * 3.0;
+          if (wp.y > 640) {
+            roadCost += (wp.y - 640) * 85;
+          } else if (wp.y < 480) {
+            roadCost += (480 - wp.y) * 85;
           }
         }
       }
@@ -5550,7 +5587,10 @@ class DecisionManager {
         const forwardDist = dx * cosH + dy * sinH;
         const lateralDist = Math.abs(dy * cosH - dx * sinH);
 
-        if (forwardDist > 0 && forwardDist < this.config.criticalDistance && lateralDist < 20) {
+        const criticalLat = (plannerState === 'AVOIDANCE') ? 12 : 18;
+        const criticalLong = (plannerState === 'AVOIDANCE') ? 18 : this.config.criticalDistance;
+
+        if (forwardDist > 0 && forwardDist < criticalLong && lateralDist < criticalLat) {
           imminentDanger = true;
           dangerReason = `Obstacle ahead (${obj.type || 'hazard'} ${Math.round(forwardDist)}px)`;
           break;
@@ -5770,13 +5810,13 @@ class DecisionManager {
       }
     }
 
-    // 4. Traffic Blockage Resolution -> REVERSE vs WAIT
+    // 4. Traffic Blockage Resolution -> WAIT for gap (or REVERSE only if persistently stuck)
     if (ctx.frontBlocked) {
       if (!ctx.pathFeasible) {
-        if (ctx.rearClear) {
+        if (ctx.isStuck && ctx.rearClear) {
           return {
             decision: 'REVERSE',
-            reason: 'Reversing to clear traffic blockage'
+            reason: 'Reversing to clear persistent traffic blockage'
           };
         } else {
           return {
@@ -6056,7 +6096,7 @@ class AutonomousVehicleController {
     if (this.controlState === 'WAITING' || this.controlState === 'STOPPED' || this.isStuck) {
       desiredSteerAngle = 0;
       egoVehicle.inputs.steer = 0;
-    } else if (selectedPath && selectedPath.waypoints && selectedPath.waypoints.length > 0 && selectedPath.obstacleCost > 40) {
+    } else if (selectedPath && selectedPath.waypoints && selectedPath.waypoints.length > 0 && plannerState === 'AVOIDANCE') {
       // Local obstacle avoidance trajectory override
       const lookaheadIdx = Math.min(this.config.lookaheadWaypointIdx, selectedPath.waypoints.length - 1);
       const targetWp = selectedPath.waypoints[lookaheadIdx] || selectedPath.endPoint;
@@ -6066,32 +6106,32 @@ class AutonomousVehicleController {
       while (headingError > Math.PI) headingError -= Math.PI * 2;
       while (headingError < -Math.PI) headingError += Math.PI * 2;
 
-      desiredSteerAngle = Math.max(-1.0, Math.min(1.0, headingError * this.config.steerGain));
+      desiredSteerAngle = Math.max(-0.65, Math.min(0.65, 0.85 * (selectedPath.steerAngle || 0) + 0.65 * headingError));
     } else if (nav && nav.hasRoute && nav.targetLookahead) {
       // Global Route Waypoint Pure Pursuit with Stanley Cross-Track Error Compensation
       const targetWp = nav.targetLookahead;
       const targetHeading = Math.atan2(targetWp.y - egoY, targetWp.x - egoX);
-      let headingError = targetHeading - egoHeading;
-      while (headingError > Math.PI) headingError -= Math.PI * 2;
-      while (headingError < -Math.PI) headingError += Math.PI * 2;
+      let lookaheadHeadingError = targetHeading - egoHeading;
+      while (lookaheadHeadingError > Math.PI) lookaheadHeadingError -= Math.PI * 2;
+      while (lookaheadHeadingError < -Math.PI) lookaheadHeadingError += Math.PI * 2;
 
-      // Stanley Cross-Track Error Correction: steer back toward route centerline
-      const crossTrackSteer = Math.atan2(-0.85 * nav.crossTrackError, Math.max(18, Math.abs(currentSpeed)));
-
-      // Route Segment Heading Alignment
+      // Route Segment Heading Alignment (provides yaw rate derivative damping)
       let routeAlignError = nav.targetHeading - egoHeading;
       while (routeAlignError > Math.PI) routeAlignError -= Math.PI * 2;
       while (routeAlignError < -Math.PI) routeAlignError += Math.PI * 2;
 
-      // Combined Proportional Steering Command
-      let rawSteer = 1.65 * headingError + 0.35 * routeAlignError + crossTrackSteer;
+      // Stanley Cross-Track Convergence Angle (bounded to prevent sharp overshooting)
+      const crossTrackAngle = Math.max(-0.35, Math.min(0.35, Math.atan2(-0.45 * nav.crossTrackError, Math.max(25, Math.abs(currentSpeed)))));
+
+      // Combined Proportional-Derivative Lateral Command
+      let rawSteer = 0.85 * routeAlignError + 0.65 * lookaheadHeadingError + crossTrackAngle;
 
       // Anti-Oscillation Deadband: prevent micro-steering jitter when vehicle is well-aligned on route
-      if (Math.abs(headingError) < 0.025 && Math.abs(nav.crossTrackError) < 2.5) {
+      if (Math.abs(routeAlignError) < 0.025 && Math.abs(nav.crossTrackError) < 2.5) {
         rawSteer *= 0.35;
       }
 
-      desiredSteerAngle = Math.max(-1.0, Math.min(1.0, rawSteer));
+      desiredSteerAngle = Math.max(-0.75, Math.min(0.75, rawSteer));
 
       // Curvature speed reduction
       if (Math.abs(desiredSteerAngle) > 0.42) {
@@ -6104,6 +6144,37 @@ class AutonomousVehicleController {
       while (headingError > Math.PI) headingError -= Math.PI * 2;
       while (headingError < -Math.PI) headingError += Math.PI * 2;
       desiredSteerAngle = Math.max(-1.0, Math.min(1.0, headingError * 1.5));
+    }
+
+    // Obstacle Clearance Lateral Guard: Do not turn back across the obstacle's lane while approaching or alongside it
+    if (perceptionData && Array.isArray(perceptionData.detectedObjects) && this.controlState !== 'WAITING' && this.controlState !== 'STOPPED') {
+      for (const obs of perceptionData.detectedObjects) {
+        if (obs.type === 'pothole') continue;
+        const dx = obs.x - egoX;
+        const dy = obs.y - egoY;
+        const longDist = dx * Math.cos(egoHeading) + dy * Math.sin(egoHeading);
+        const latDist = Math.abs(dy * Math.cos(egoHeading) - dx * Math.sin(egoHeading));
+
+        if (longDist > -25 && longDist < 140 && latDist < 80) {
+          const toObsY = obs.y - egoY;
+          if (toObsY < 0) {
+            // Obstacle is to the left: prevent steering left past parallel (0 rad)
+            if (egoHeading < 0) {
+              desiredSteerAngle = Math.max(-egoHeading * 1.5, desiredSteerAngle);
+            } else {
+              desiredSteerAngle = Math.max(-egoHeading * 1.2, desiredSteerAngle);
+            }
+          } else if (toObsY > 0) {
+            // Obstacle is to the right: prevent steering right past parallel (0 rad)
+            if (egoHeading > 0) {
+              desiredSteerAngle = Math.min(-egoHeading * 1.5, desiredSteerAngle);
+            } else {
+              desiredSteerAngle = Math.min(-egoHeading * 1.2, desiredSteerAngle);
+            }
+          }
+          break;
+        }
+      }
     }
 
     // Smooth steering rate transition (anti-oscillation low-pass filter)
