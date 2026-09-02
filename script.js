@@ -783,6 +783,14 @@ class RoadNetworkGraph {
     // D. Westbound Main (node-mw-5: 1050, 520) -> Turn Right onto Northbound Side Road (node-sn-0: 950, 460)
     const mw1050Idx = westX.indexOf(1050);
     this.connectNodes(`node-mw-${mw1050Idx}`, 'node-sn-0', { road: 'intersection', lane: 'turn_right', speedLimit: 45 });
+
+    // 9. Connect Terminal Turnaround Transitions (Closed-loop continuous circulation):
+    // East End Turnaround: Eastbound end (node-me-12: 1750, 600) -> Westbound start (node-mw-0: 1750, 520)
+    this.connectNodes(`node-me-${eastX.length - 1}`, 'node-mw-0', { road: 'main', lane: 'turnaround', speedLimit: 45 });
+    // West End Turnaround: Westbound end (node-mw-12: 50, 520) -> Eastbound start (node-me-0: 50, 600)
+    this.connectNodes(`node-mw-${westX.length - 1}`, 'node-me-0', { road: 'main', lane: 'turnaround', speedLimit: 45 });
+    // Side Road Top Turnaround: Northbound top (node-sn-4: 950, 50) -> Southbound top (node-ss-0: 880, 50)
+    this.connectNodes(`node-sn-${northY.length - 1}`, 'node-ss-0', { road: 'side', lane: 'turnaround', speedLimit: 40 });
   }
 
   addNode(node) {
@@ -3023,6 +3031,317 @@ class EgoVehicle {
    ============================================================================ */
 
 /**
+ * Separate Traffic Agent Navigation System for non-ego road vehicles
+ * (Cars, Motorcycles/Bikes, Auto-Rickshaws)
+ *
+ * Architecture:
+ * TRAFFIC DESTINATION -> GLOBAL ROUTE -> WAYPOINT FOLLOWING -> BASIC FOLLOWING -> DESTINATION
+ */
+class TrafficAgentNavigator {
+  constructor(vehicle, roadNetwork) {
+    this.vehicle = vehicle;
+    this.network = roadNetwork || (typeof window !== 'undefined' && window.RoadNetworkSystem ? window.RoadNetworkSystem : (typeof RoadNetworkSystem !== 'undefined' ? RoadNetworkSystem : null));
+    
+    this.destination = null;
+    this.route = null;
+    this.routeWaypoints = [];
+    this.currentWaypointIndex = 0;
+    this.navState = 'CRUISING'; // 'CRUISING', 'FOLLOWING', 'AVOIDING', 'STOPPED', 'YIELDING'
+    
+    // Lookahead, headway, and dynamics parameters
+    this.lookaheadDistance = (vehicle.type === 'motorcycle') ? 32 : 42;
+    this.waypointTolerance = 26;
+    this.minSafeDistance = Math.max(32, (vehicle.length || 44) * 0.75 + 14);
+    this.timeHeadway = 1.3; // seconds
+    this.maxTurnRate = (vehicle.type === 'motorcycle') ? 4.5 : 3.2; // rad/s
+    this.maxAccel = (vehicle.type === 'motorcycle') ? 180 : 120; // px/s^2
+    this.maxDecel = 280; // px/s^2
+    this.leadVehicle = null;
+    this.leadDistance = Infinity;
+
+    // Initialize initial destination & route on the road graph
+    this.initDestinationAndRoute();
+  }
+
+  /**
+   * Determine initial destination based on vehicle position and road orientation
+   */
+  initDestinationAndRoute() {
+    if (!this.network) return;
+    const v = this.vehicle;
+
+    if (v.route && v.route.road === 'side') {
+      // Side road vehicle heading South: destination is Eastbound main road
+      this.destination = { x: 1750, y: 600, road: 'main', lane: 'eastbound' };
+    } else {
+      const isEastbound = (Math.abs(v.heading) < 0.8 || (v.heading > -0.8 && v.heading < 0.8));
+      if (isEastbound) {
+        this.destination = { x: 1750, y: 600, road: 'main', lane: 'eastbound' };
+      } else {
+        this.destination = { x: 50, y: 520, road: 'main', lane: 'westbound' };
+      }
+    }
+
+    this.planRouteTo(this.destination);
+  }
+
+  /**
+   * Plan route from current position to destination using RoadNetworkSystem
+   */
+  planRouteTo(destPos) {
+    if (!this.network || !destPos) return null;
+    const planner = new GlobalRoutePlanner(this.network);
+    const startPos = { x: this.vehicle.x, y: this.vehicle.y, heading: this.vehicle.heading };
+    const routeObj = planner.planRoute(startPos, destPos);
+
+    if (routeObj && Array.isArray(routeObj.waypoints) && routeObj.waypoints.length > 0) {
+      this.route = routeObj;
+      this.routeWaypoints = routeObj.waypoints;
+      this.currentWaypointIndex = 0;
+      this.destination = destPos;
+      return this.route;
+    }
+    return null;
+  }
+
+  /**
+   * Select next destination when current destination is reached
+   */
+  onReachedDestination() {
+    const v = this.vehicle;
+    if (v.x >= 1680) {
+      // At East end of main road -> smoothly transition to Westbound lane (node-mw-0 -> node-mw-12)
+      this.destination = { x: 50, y: 520, road: 'main', lane: 'westbound' };
+    } else if (v.x <= 120) {
+      // At West end of main road -> smoothly transition to Eastbound lane (node-me-0 -> node-me-12)
+      this.destination = { x: 1750, y: 600, road: 'main', lane: 'eastbound' };
+    } else if (v.y <= 90 && (v.x >= 840 && v.x <= 980)) {
+      // At top of side road -> transition to Southbound lane towards main road
+      this.destination = { x: 1750, y: 600, road: 'main', lane: 'eastbound' };
+    } else {
+      // Default to Eastbound
+      this.destination = { x: 1750, y: 600, road: 'main', lane: 'eastbound' };
+    }
+
+    this.planRouteTo(this.destination);
+  }
+
+  /**
+   * Continuous navigation update loop: Waypoint following + Vehicle following + Obstacle awareness
+   */
+  update(dt, egoVehicle, allEntities, environmentData) {
+    if (!this.vehicle.active) return;
+    if (dt <= 0 || dt > 0.1) dt = 0.016;
+
+    const v = this.vehicle;
+
+    // 1. Ensure a valid active route exists
+    if (!this.routeWaypoints || this.routeWaypoints.length === 0 || this.currentWaypointIndex >= this.routeWaypoints.length) {
+      this.onReachedDestination();
+    }
+    if (!this.routeWaypoints || this.routeWaypoints.length === 0) return;
+
+    // 2. Advance Waypoint Progress
+    let currWp = this.routeWaypoints[this.currentWaypointIndex];
+    let distToWp = Math.hypot(currWp.x - v.x, currWp.y - v.y);
+
+    while (distToWp < this.waypointTolerance && this.currentWaypointIndex < this.routeWaypoints.length - 1) {
+      this.currentWaypointIndex++;
+      currWp = this.routeWaypoints[this.currentWaypointIndex];
+      distToWp = Math.hypot(currWp.x - v.x, currWp.y - v.y);
+    }
+
+    // Check destination arrival
+    const lastWp = this.routeWaypoints[this.routeWaypoints.length - 1];
+    const distToEnd = Math.hypot(lastWp.x - v.x, lastWp.y - v.y);
+    if (this.currentWaypointIndex >= this.routeWaypoints.length - 1 && distToEnd < 35) {
+      this.onReachedDestination();
+      return;
+    }
+
+    // 3. Pure Pursuit Lookahead Target
+    let lookaheadTarget = currWp;
+    for (let i = this.currentWaypointIndex; i < this.routeWaypoints.length; i++) {
+      const wp = this.routeWaypoints[i];
+      const d = Math.hypot(wp.x - v.x, wp.y - v.y);
+      if (d >= this.lookaheadDistance) {
+        lookaheadTarget = wp;
+        break;
+      }
+      lookaheadTarget = wp;
+    }
+
+    const targetHeading = Math.atan2(lookaheadTarget.y - v.y, lookaheadTarget.x - v.x);
+    let headingDiff = targetHeading - v.heading;
+    while (headingDiff > Math.PI) headingDiff -= Math.PI * 2;
+    while (headingDiff < -Math.PI) headingDiff += Math.PI * 2;
+
+    // 4. Basic Vehicle Following & Lead Vehicle Detection
+    let targetSpeed = currWp.speedLimit ? Math.min(v.baseSpeed, currWp.speedLimit) : v.baseSpeed;
+    this.leadVehicle = null;
+    this.leadDistance = Infinity;
+
+    const cosH = Math.cos(v.heading);
+    const sinH = Math.sin(v.heading);
+
+    // Check all dynamic entities (including ego vehicle)
+    const candidates = [];
+    if (egoVehicle) candidates.push(egoVehicle);
+    if (Array.isArray(allEntities)) {
+      for (const ent of allEntities) {
+        if (ent.id !== v.id && ent.active) candidates.push(ent);
+      }
+    }
+
+    for (const cand of candidates) {
+      // Skip irrelevant sidewalk pedestrians
+      if ((cand.type === 'pedestrian' || cand.type === 'animal') && window.StaticCollisionSystem) {
+        if (window.StaticCollisionSystem.isSidewalk(cand.x, cand.y) && !window.StaticCollisionSystem.isMovingTowardRoad(cand.x, cand.y, cand.heading || 0, cand.speed || 0)) {
+          continue;
+        }
+      }
+
+      const dx = cand.x - v.x;
+      const dy = cand.y - v.y;
+      const fwd = dx * cosH + dy * sinH;
+      const lat = Math.abs(dy * cosH - dx * sinH);
+      const candRadius = cand.radius || 14;
+
+      // In vehicle forward travel corridor
+      if (fwd > 0 && fwd < 130 && lat < (v.radius + candRadius + 8)) {
+        if (fwd < this.leadDistance) {
+          this.leadDistance = fwd;
+          this.leadVehicle = cand;
+        }
+      }
+    }
+
+    // Regulate speed for lead vehicle following
+    if (this.leadVehicle) {
+      const lead = this.leadVehicle;
+      const d = this.leadDistance;
+      const leadSpeed = Math.max(0, lead.speed || 0);
+      const safeDistance = Math.max(this.minSafeDistance, this.timeHeadway * v.speed);
+
+      if (d <= 28) {
+        // Critical bumper buffer -> complete stop
+        targetSpeed = 0;
+        this.navState = 'STOPPED';
+      } else if (d < safeDistance + 35) {
+        if (d <= safeDistance) {
+          const gapRatio = Math.max(0, (d - 24) / (safeDistance - 24));
+          targetSpeed = Math.min(targetSpeed, leadSpeed * Math.min(1.0, gapRatio));
+        } else {
+          // Approaching lead vehicle in buffer zone
+          const blend = (d - safeDistance) / 35;
+          const approachSpeed = leadSpeed + (v.baseSpeed - leadSpeed) * blend;
+          targetSpeed = Math.min(targetSpeed, approachSpeed);
+        }
+        this.navState = (targetSpeed < 5) ? 'STOPPED' : 'FOLLOWING';
+      }
+    } else {
+      this.navState = 'CRUISING';
+    }
+
+    // 5. Basic Obstacle & Pothole Awareness
+    for (let s = 15; s <= 65; s += 10) {
+      const checkX = v.x + cosH * s;
+      const checkY = v.y + sinH * s;
+      let isBlocked = false;
+
+      if (window.StaticCollisionSystem && window.StaticCollisionSystem.checkSolidCollision(checkX, checkY, v.radius).collided) {
+        isBlocked = true;
+      }
+
+      if (!isBlocked && environmentData && Array.isArray(environmentData.debris)) {
+        for (const d of environmentData.debris) {
+          const hw = (d.width || 30) / 2;
+          const hh = (d.height || 30) / 2;
+          if (Math.abs(checkX - d.x) < hw + v.radius && Math.abs(checkY - d.y) < hh + v.radius) {
+            isBlocked = true;
+            break;
+          }
+        }
+      }
+
+      if (isBlocked) {
+        targetSpeed = 0;
+        this.navState = 'STOPPED';
+        break;
+      }
+    }
+
+    // Pothole ahead in corridor: moderate speed reduction
+    if (window.StaticCollisionSystem) {
+      const potCheck = window.StaticCollisionSystem.checkPothole(v.x + cosH * 35, v.y + sinH * 35, v.radius * 0.7);
+      if (potCheck.inPothole) {
+        targetSpeed = Math.min(targetSpeed, v.baseSpeed * 0.55);
+      }
+    }
+
+    // 6. Smooth Acceleration & Deceleration Physics
+    if (v.speed < targetSpeed) {
+      v.speed = Math.min(targetSpeed, v.speed + this.maxAccel * dt);
+    } else if (v.speed > targetSpeed) {
+      v.speed = Math.max(targetSpeed, v.speed - this.maxDecel * dt);
+    }
+
+    if (v.speed < 1 && targetSpeed === 0) {
+      v.speed = 0;
+      v.isStopped = true;
+      v.isBraking = true;
+      v.state = 'STOPPED';
+    } else {
+      v.isStopped = false;
+      v.isBraking = (v.speed > targetSpeed + 5);
+      v.state = this.navState;
+    }
+
+    // 7. Steering & Heading Integration
+    if (v.speed > 0) {
+      const turnStep = Math.sign(headingDiff) * Math.min(Math.abs(headingDiff), this.maxTurnRate * dt);
+      v.heading += turnStep;
+      v.heading = Math.atan2(Math.sin(v.heading), Math.cos(v.heading));
+    }
+
+    // 8. Position Integration with Strict Boundary Prevention
+    const proposedX = v.x + v.speed * Math.cos(v.heading) * dt;
+    const proposedY = v.y + v.speed * Math.sin(v.heading) * dt;
+
+    if (window.StaticCollisionSystem) {
+      const solidCheck = window.StaticCollisionSystem.checkSolidCollision(proposedX, proposedY, v.radius);
+      const isSidewalk = window.StaticCollisionSystem.isSidewalk(proposedX, proposedY);
+      let solidBlocked = solidCheck.collided;
+
+      if (!solidBlocked && environmentData && Array.isArray(environmentData.debris)) {
+        for (const d of environmentData.debris) {
+          const hw = (d.width || 30) / 2;
+          const hh = (d.height || 30) / 2;
+          if (Math.abs(proposedX - d.x) < hw + v.radius && Math.abs(proposedY - d.y) < hh + v.radius) {
+            solidBlocked = true;
+            break;
+          }
+        }
+      }
+
+      if (solidBlocked || isSidewalk) {
+        // Stop before solid object or sidewalk
+        v.speed = 0;
+        v.isStopped = true;
+        v.isBraking = true;
+        v.state = 'STOPPED';
+      } else {
+        v.x = proposedX;
+        v.y = proposedY;
+      }
+    } else {
+      v.x = proposedX;
+      v.y = proposedY;
+    }
+  }
+}
+
+/**
  * Reusable Dynamic Entity Representation for simulation world
  * Types: 'car', 'motorcycle', 'auto_rickshaw', 'pedestrian', 'animal'
  */
@@ -3058,12 +3377,12 @@ class DynamicObject {
       minY: 0,
       maxY: 1000
     };
-    this.initPersistentDestination();
+    this.behavior = config.behavior || 'CRUISING';
 
     // Local Navigation & Planning State
     this.isBraking = false;
     this.isStopped = false;
-    this.state = 'CRUISING'; // 'CRUISING', 'AVOIDING', 'BRAKING', 'STOPPED', 'CROSSING', 'WANDERING'
+    this.state = 'CRUISING'; // 'CRUISING', 'FOLLOWING', 'AVOIDING', 'BRAKING', 'STOPPED', 'CROSSING', 'WANDERING'
     this.selectedPath = null;
     this.speedJitter = 0;
     this.stateTimer = Math.random() * 3 + 2;
@@ -3073,6 +3392,13 @@ class DynamicObject {
     this.targetLateralOffset = 0;
     this.crossingDirection = config.crossingDirection || 1; // +1 down, -1 up
     this.active = true;
+
+    // Initialize dedicated TrafficAgentNavigator for road vehicles (cars, motorcycles, auto-rickshaws)
+    if (this.type === 'car' || this.type === 'motorcycle' || this.type === 'auto_rickshaw') {
+      this.navigator = new TrafficAgentNavigator(this, window.RoadNetworkSystem || RoadNetworkSystem);
+    } else {
+      this.navigator = null;
+    }
   }
 
   /**
@@ -3365,152 +3691,13 @@ class DynamicObject {
 
   /**
    * Master navigation and control loop for non-ego road vehicles (Cars, Bikes, Autos)
+   * Powered by dedicated TrafficAgentNavigator system
    */
   navigateTrafficVehicle(dt, egoVehicle, allEntities, environmentData) {
-    this.updatePersistentDestination();
-
-    // 1. Gather all obstacles and collision threats
-    const threats = this.perceiveThreats(egoVehicle, allEntities);
-
-    // 2. Generate local candidate rollout paths
-    const candidatePaths = this.generateLocalPaths();
-
-    // 3. Score candidate paths
-    let bestPath = null;
-    let minCost = Infinity;
-
-    for (const path of candidatePaths) {
-      const cost = this.scoreLocalPath(path, threats, environmentData);
-      path.cost = cost;
-      if (path.feasible && cost < minCost) {
-        minCost = cost;
-        bestPath = path;
-      }
+    if (!this.navigator) {
+      this.navigator = new TrafficAgentNavigator(this, window.RoadNetworkSystem || RoadNetworkSystem);
     }
-
-    this.selectedPath = bestPath;
-
-    // 4. Calculate Forward Lookahead Threat & Target Speed
-    let targetSpeed = this.baseSpeed;
-    this.isBraking = false;
-    let obstacleDirectlyAhead = false;
-    let closestObstacleDist = Infinity;
-
-    // Check direct forward corridor for obstacles and vehicles
-    const cosH = Math.cos(this.heading);
-    const sinH = Math.sin(this.heading);
-
-    for (const threat of threats) {
-      if ((threat.type === 'pedestrian' || threat.type === 'animal') && window.StaticCollisionSystem) {
-        if (window.StaticCollisionSystem.isSidewalk(threat.x, threat.y) && !window.StaticCollisionSystem.isMovingTowardRoad(threat.x, threat.y, threat.heading || 0, threat.speed || 0)) {
-          continue;
-        }
-      }
-
-      const dx = threat.x - this.x;
-      const dy = threat.y - this.y;
-      const fwd = dx * cosH + dy * sinH;
-      const lat = Math.abs(dy * cosH - dx * sinH);
-
-      // In forward corridor
-      if (fwd > 0 && fwd < 110 && lat < (this.radius + (threat.radius || 12) + 6)) {
-        if (fwd < closestObstacleDist) {
-          closestObstacleDist = fwd;
-        }
-
-        // Relative speed & TTC
-        const relVx = (threat.speed || 0) * Math.cos(threat.heading || 0) - this.speed * cosH;
-        const relVy = (threat.speed || 0) * Math.sin(threat.heading || 0) - this.speed * sinH;
-        const closingSpeed = -(relVx * (dx / (fwd || 1)) + relVy * (dy / (fwd || 1)));
-
-        // Critical safety gap
-        const safeGap = this.length * 0.75 + (threat.radius || 12);
-
-        if (fwd < safeGap + 12 || (closingSpeed > 5 && (fwd - safeGap) / closingSpeed < 1.6)) {
-          obstacleDirectlyAhead = true;
-        }
-      }
-    }
-
-    // Check Potholes in forward path
-    const potholeCheck = this.detectPotholeAhead(65);
-
-    // 5. Intelligent Speed & Braking Resolution
-    if (!bestPath || obstacleDirectlyAhead) {
-      // Path is completely blocked or imminent collision -> FULL STOP
-      targetSpeed = 0;
-      this.isBraking = true;
-      this.state = 'STOPPED';
-    } else if (closestObstacleDist < 60) {
-      // Developing proximity -> SLOW down significantly
-      targetSpeed = this.baseSpeed * 0.35;
-      this.isBraking = true;
-      this.state = 'BRAKING';
-    } else if (bestPath.steerOffset !== 0) {
-      // Executing avoidance maneuver around obstacle/pothole
-      targetSpeed = this.baseSpeed * 0.7;
-      this.state = 'AVOIDING';
-    } else if (potholeCheck) {
-      // Approaching pothole without alternate path -> SLOW
-      targetSpeed = this.baseSpeed * 0.4;
-      this.isBraking = true;
-      this.state = 'BRAKING';
-    } else {
-      // Normal clear road cruising with organic speed variation
-      if (this.stateTimer <= 0) {
-        this.stateTimer = Math.random() * 3 + 2;
-        this.speedJitter = (Math.random() * 8 - 4);
-      }
-      targetSpeed = this.baseSpeed + (this.speedJitter || 0);
-      this.state = 'CRUISING';
-    }
-
-    // 6. Smooth Acceleration & Deceleration Physics
-    const maxAccel = this.type === 'motorcycle' ? 180 : 120;
-    const maxDecel = 280;
-
-    if (this.speed < targetSpeed) {
-      this.speed = Math.min(targetSpeed, this.speed + maxAccel * dt);
-    } else if (this.speed > targetSpeed) {
-      this.speed = Math.max(targetSpeed, this.speed - maxDecel * dt);
-    }
-
-    if (this.speed < 1 && targetSpeed === 0) {
-      this.speed = 0;
-      this.state = 'STOPPED';
-    }
-
-    // 7. Steering & Kinematics Update
-    if (bestPath && this.speed > 0) {
-      const turnRate = this.type === 'motorcycle' ? 4.5 : 3.0;
-      let targetHeading = bestPath.targetHeading;
-      let headingDiff = targetHeading - this.heading;
-      while (headingDiff > Math.PI) headingDiff -= Math.PI * 2;
-      while (headingDiff < -Math.PI) headingDiff += Math.PI * 2;
-
-      this.heading += Math.sign(headingDiff) * Math.min(Math.abs(headingDiff), turnRate * dt);
-      this.heading = Math.atan2(Math.sin(this.heading), Math.cos(this.heading));
-    }
-
-    // Position integration with solid obstacle collision check
-    const proposedX = this.x + this.speed * Math.cos(this.heading) * dt;
-    const proposedY = this.y + this.speed * Math.sin(this.heading) * dt;
-
-    if (window.StaticCollisionSystem) {
-      const solidCol = window.StaticCollisionSystem.checkSolidCollision(proposedX, proposedY, this.radius);
-      if (solidCol.collided) {
-        // Stop before solid object
-        this.speed = 0;
-        this.isBraking = true;
-        this.state = 'STOPPED';
-      } else {
-        this.x = proposedX;
-        this.y = proposedY;
-      }
-    } else {
-      this.x = proposedX;
-      this.y = proposedY;
-    }
+    this.navigator.update(dt, egoVehicle, allEntities, environmentData);
   }
 
   updatePedestrian(dt) {
@@ -4065,52 +4252,52 @@ class TrafficManager {
         type: 'car',
         subType: 'sedan',
         x: 350,
-        y: 595,
+        y: 600,
         length: 50,
         width: 25,
         heading: 0, // Eastbound
         speed: 85,
         color: '#dc2626',
-        route: { road: 'main', laneY: 595 }
+        route: { road: 'main', laneY: 600 }
       }),
       new DynamicObject({
         id: 'car-2',
         type: 'car',
         subType: 'hatchback',
         x: 1350,
-        y: 525,
+        y: 520,
         length: 46,
         width: 23,
         heading: Math.PI, // Westbound
         speed: 90,
         color: '#2563eb',
-        route: { road: 'main', laneY: 525 }
+        route: { road: 'main', laneY: 520 }
       }),
       new DynamicObject({
         id: 'car-3',
         type: 'car',
         subType: 'suv',
         x: 580,
-        y: 605,
+        y: 600,
         length: 52,
         width: 26,
         heading: 0, // Eastbound
         speed: 75,
         color: '#e2e8f0',
-        route: { road: 'main', laneY: 605 }
+        route: { road: 'main', laneY: 600 }
       }),
       new DynamicObject({
         id: 'car-4',
         type: 'car',
         subType: 'taxi',
-        x: 895,
+        x: 880,
         y: 100,
         length: 46,
         width: 23,
         heading: Math.PI / 2, // Southbound on side road
         speed: 65,
         color: '#f59e0b',
-        route: { road: 'side', laneX: 895 }
+        route: { road: 'side', laneX: 880 }
       }),
 
       // --- 2. Motorcycles & Bikes (4) ---
@@ -4119,52 +4306,52 @@ class TrafficManager {
         type: 'motorcycle',
         subType: 'sport_bike',
         x: 480,
-        y: 575,
+        y: 600,
         length: 28,
         width: 12,
         heading: 0, // Eastbound
-        speed: 120,
+        speed: 110,
         color: '#ea580c',
-        route: { road: 'main', laneY: 575 }
+        route: { road: 'main', laneY: 600 }
       }),
       new DynamicObject({
         id: 'bike-2',
         type: 'motorcycle',
         subType: 'commuter',
         x: 1450,
-        y: 515,
+        y: 520,
         length: 27,
         width: 11,
         heading: Math.PI, // Westbound
         speed: 105,
         color: '#1e293b',
-        route: { road: 'main', laneY: 515 }
+        route: { road: 'main', laneY: 520 }
       }),
       new DynamicObject({
         id: 'bike-3',
         type: 'motorcycle',
         subType: 'scooter',
         x: 180,
-        y: 615,
+        y: 600,
         length: 25,
         width: 12,
         heading: 0, // Eastbound
         speed: 80,
         color: '#06b6d4',
-        route: { road: 'main', laneY: 615 }
+        route: { road: 'main', laneY: 600 }
       }),
       new DynamicObject({
         id: 'bike-4',
         type: 'motorcycle',
         subType: 'scooter',
-        x: 940,
-        y: 200,
+        x: 880,
+        y: 220,
         length: 25,
         width: 12,
         heading: Math.PI / 2, // Southbound on side road
         speed: 85,
         color: '#ec4899',
-        route: { road: 'side', laneX: 940 }
+        route: { road: 'side', laneX: 880 }
       }),
 
       // --- 3. Auto-Rickshaws (3) ---
@@ -4172,40 +4359,40 @@ class TrafficManager {
         id: 'auto-1',
         type: 'auto_rickshaw',
         subType: 'cng_auto',
-        x: 1020,
-        y: 605,
+        x: 1050,
+        y: 600,
         length: 44,
         width: 26,
         heading: 0, // Eastbound
         speed: 70,
         color: '#15803d',
-        route: { road: 'main', laneY: 605 }
+        route: { road: 'main', laneY: 600 }
       }),
       new DynamicObject({
         id: 'auto-2',
         type: 'auto_rickshaw',
         subType: 'cng_auto',
-        x: 620,
-        y: 525,
+        x: 650,
+        y: 520,
         length: 44,
         width: 26,
         heading: Math.PI, // Westbound
         speed: 65,
         color: '#15803d',
-        route: { road: 'main', laneY: 525 }
+        route: { road: 'main', laneY: 520 }
       }),
       new DynamicObject({
         id: 'auto-3',
         type: 'auto_rickshaw',
         subType: 'cng_auto',
-        x: 955,
+        x: 880,
         y: 60,
         length: 44,
         width: 26,
         heading: Math.PI / 2, // Southbound on side road
         speed: 60,
         color: '#15803d',
-        route: { road: 'side', laneX: 955 }
+        route: { road: 'side', laneX: 880 }
       }),
 
       // --- 4. Pedestrians (4) ---
