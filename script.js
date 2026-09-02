@@ -6428,15 +6428,15 @@ class AutonomousVehicleController {
 
     // Actuation parameters
     this.config = {
-      cruiseSpeed: 95,          // px/s (~24 km/h)
-      cautionSpeed: 42,         // px/s (~10 km/h)
+      cruiseSpeed: 75,          // px/s (~18 km/h smooth city cruising)
+      cautionSpeed: 40,         // px/s (~10 km/h)
       replanSpeed: 25,          // px/s (~6 km/h)
       reverseSpeed: -26,        // px/s (controlled backward speed)
       lookaheadWaypointIdx: 3,  // Lookahead point index along 18-point trajectory spline (~30-40px)
       steerGain: 2.2,           // Proportional lateral tracking gain
-      steerRateLimit: 4.5,      // rad/s (smooth steering rate limit)
-      speedDecelGain: 25,       // Longitudinal braking sensitivity
-      speedAccelGain: 35,       // Longitudinal throttle sensitivity
+      steerRateLimit: 8.0,      // rad/s (smooth steering rate limit)
+      speedDecelGain: 20,       // Longitudinal braking sensitivity
+      speedAccelGain: 25,       // Longitudinal throttle sensitivity
       rearSafetyBuffer: 60      // px safety buffer required for reversing
     };
   }
@@ -6516,8 +6516,8 @@ class AutonomousVehicleController {
     const destY = destination ? destination.y : 560;
     const distToGoal = Math.hypot(destX - egoX, destY - egoY);
 
-    // Dynamic Lookahead Distance (scales with vehicle speed: 35px at low speed, up to 65px at cruising speed)
-    const dynamicLookahead = Math.max(35, Math.min(65, 0.35 * Math.abs(currentSpeed) + 25));
+    // Dynamic Lookahead Distance (scales smoothly with vehicle speed: 40px at standstill up to 85px at cruising speed)
+    const dynamicLookahead = Math.max(40, Math.min(85, 0.6 * Math.abs(currentSpeed) + 40));
     let nav = null;
     if (typeof GlobalRouteSystem !== 'undefined') {
       nav = GlobalRouteSystem.getNavigationTarget(egoVehicle, dynamicLookahead);
@@ -6642,7 +6642,7 @@ class AutonomousVehicleController {
       }
     }
 
-    // 5. Lateral Route Following & Path Tracking (Pure Pursuit + Stanley Cross-Track Correction)
+    // 5. Lateral Route Following & Path Tracking (Pure Pursuit + Alignment Damping)
     let desiredSteerAngle = 0;
 
     // Prevent steering oscillation when waiting, stopped, or stuck
@@ -6661,7 +6661,7 @@ class AutonomousVehicleController {
 
       desiredSteerAngle = Math.max(-0.65, Math.min(0.65, 0.85 * (selectedPath.steerAngle || 0) + 0.65 * headingError));
     } else if (nav && nav.hasRoute && nav.targetLookahead) {
-      // Global Route Waypoint Pure Pursuit with Stanley Cross-Track Error Compensation
+      // Global Route Waypoint Pure Pursuit with Segment Alignment Damping
       const targetWp = nav.targetLookahead;
       const targetHeading = Math.atan2(targetWp.y - egoY, targetWp.x - egoX);
       let lookaheadHeadingError = targetHeading - egoHeading;
@@ -6673,18 +6673,11 @@ class AutonomousVehicleController {
       while (routeAlignError > Math.PI) routeAlignError -= Math.PI * 2;
       while (routeAlignError < -Math.PI) routeAlignError += Math.PI * 2;
 
-      // Stanley Cross-Track Convergence Angle (bounded to prevent sharp overshooting)
-      const crossTrackAngle = Math.max(-0.35, Math.min(0.35, Math.atan2(-0.45 * nav.crossTrackError, Math.max(25, Math.abs(currentSpeed)))));
-
-      // Combined Proportional-Derivative Lateral Command
-      let rawSteer = 0.85 * routeAlignError + 0.65 * lookaheadHeadingError + crossTrackAngle;
-
-      // Anti-Oscillation Deadband: prevent micro-steering jitter when vehicle is well-aligned on route
-      if (Math.abs(routeAlignError) < 0.025 && Math.abs(nav.crossTrackError) < 2.5) {
-        rawSteer *= 0.35;
-      }
-
-      desiredSteerAngle = Math.max(-0.75, Math.min(0.75, rawSteer));
+      // Pure pursuit delta = atan2(2 * L * sin(alpha), lookaheadDist)
+      const L = egoVehicle.wheelbase || 26;
+      const delta = Math.atan2(2 * L * Math.sin(lookaheadHeadingError), dynamicLookahead);
+      const targetSteer = 0.85 * (delta / (egoVehicle.maxSteeringAngle || 0.55)) + 0.15 * (routeAlignError / (egoVehicle.maxSteeringAngle || 0.55));
+      desiredSteerAngle = Math.max(-0.85, Math.min(0.85, targetSteer));
 
       // Curvature speed reduction
       if (Math.abs(desiredSteerAngle) > 0.42) {
@@ -6699,8 +6692,8 @@ class AutonomousVehicleController {
       desiredSteerAngle = Math.max(-1.0, Math.min(1.0, headingError * 1.5));
     }
 
-    // Obstacle Clearance Lateral Guard: Do not turn back across the obstacle's lane while approaching or alongside it
-    if (perceptionData && Array.isArray(perceptionData.detectedObjects) && this.controlState !== 'WAITING' && this.controlState !== 'STOPPED') {
+    // Obstacle Clearance Lateral Guard: only active during local avoidance maneuvers
+    if (plannerState === 'AVOIDANCE' && perceptionData && Array.isArray(perceptionData.detectedObjects) && this.controlState !== 'WAITING' && this.controlState !== 'STOPPED') {
       for (const obs of perceptionData.detectedObjects) {
         if (obs.type === 'pothole') continue;
         const dx = obs.x - egoX;
@@ -6732,7 +6725,8 @@ class AutonomousVehicleController {
 
     // Smooth steering rate transition (anti-oscillation low-pass filter)
     if (this.controlState !== 'WAITING' && this.controlState !== 'STOPPED' && !this.isStuck) {
-      egoVehicle.inputs.steer += (desiredSteerAngle - egoVehicle.inputs.steer) * this.config.steerRateLimit * dt;
+      const steerRate = 8.0;
+      egoVehicle.inputs.steer += (desiredSteerAngle - egoVehicle.inputs.steer) * steerRate * dt;
       egoVehicle.inputs.steer = Math.max(-1.0, Math.min(1.0, egoVehicle.inputs.steer));
     }
 
