@@ -1865,25 +1865,30 @@ class DynamicObject {
     // Dimensions
     this.length = config.length || 44;
     this.width = config.width || 22;
-    this.radius = config.radius || 8; // For circular / pedestrian bounds
+    this.radius = config.radius || Math.max(this.length, this.width) / 2;
 
     // Visual Palette
     this.color = config.color || '#dc2626';
     this.accentColor = config.accentColor || '#1e293b';
 
-    // Route / Waypoint / Path config
+    // Route / Persistent Destination Configuration
     this.route = config.route || {
       road: 'main',
       laneY: this.y,
-      minX: -80,
-      maxX: 1880,
-      minY: -80,
-      maxY: 1080
+      minX: 0,
+      maxX: 1800,
+      minY: 0,
+      maxY: 1000
     };
+    this.initPersistentDestination();
 
-    // State and Controlled Randomness
-    this.behavior = config.behavior || 'CRUISING'; // 'CRUISING', 'CROSSING', 'WANDERING', 'PAUSED'
-    this.stateTimer = Math.random() * 3 + 2;        // Countdown to next random behavior shift
+    // Local Navigation & Planning State
+    this.isBraking = false;
+    this.isStopped = false;
+    this.state = 'CRUISING'; // 'CRUISING', 'AVOIDING', 'BRAKING', 'STOPPED', 'CROSSING', 'WANDERING'
+    this.selectedPath = null;
+    this.speedJitter = 0;
+    this.stateTimer = Math.random() * 3 + 2;
     this.pauseTimer = 0;
     this.swayPhase = Math.random() * Math.PI * 2;
     this.lateralOffset = 0;
@@ -1893,27 +1898,85 @@ class DynamicObject {
   }
 
   /**
-   * Update kinematics and controlled randomness
-   * @param {number} dt - Delta time in seconds
+   * Initialize persistent road network destinations
    */
-  update(dt) {
+  initPersistentDestination() {
+    if (this.type === 'pedestrian' || this.type === 'animal') return;
+
+    if (this.route.road === 'side') {
+      this.routePhase = 'APPROACH_JUNCTION';
+      this.destination = { x: this.route.laneX || 895, y: 470 };
+    } else {
+      const isEastbound = (this.heading === 0 || Math.abs(this.heading) < 0.3);
+      if (isEastbound) {
+        this.routePhase = 'EASTBOUND';
+        this.destination = { x: 1720, y: this.route.laneY || 600 };
+      } else {
+        this.routePhase = 'WESTBOUND';
+        this.destination = { x: 80, y: this.route.laneY || 525 };
+      }
+    }
+  }
+
+  /**
+   * Update persistent destination when reaching road waypoint (Never disappears / wraps abruptly)
+   */
+  updatePersistentDestination() {
+    if (this.type === 'pedestrian' || this.type === 'animal') return;
+
+    const distToGoal = Math.hypot(this.destination.x - this.x, this.destination.y - this.y);
+
+    if (distToGoal < 75) {
+      if (this.routePhase === 'EASTBOUND') {
+        // At East end of main road -> smoothly switch to Westbound lane
+        this.routePhase = 'WESTBOUND';
+        const targetY = 515 + (Math.random() * 18 - 9);
+        this.route.laneY = targetY;
+        this.destination = { x: 80, y: targetY };
+      } else if (this.routePhase === 'WESTBOUND') {
+        // At West end of main road -> smoothly switch to Eastbound lane
+        this.routePhase = 'EASTBOUND';
+        const targetY = 595 + (Math.random() * 18 - 9);
+        this.route.laneY = targetY;
+        this.destination = { x: 1720, y: targetY };
+      } else if (this.routePhase === 'APPROACH_JUNCTION') {
+        // Side road vehicle arrived at T-junction -> merge onto Main Road
+        const chooseEast = Math.random() < 0.5;
+        if (chooseEast) {
+          this.routePhase = 'EASTBOUND';
+          this.route.road = 'main';
+          this.route.laneY = 600;
+          this.destination = { x: 1720, y: 600 };
+        } else {
+          this.routePhase = 'WESTBOUND';
+          this.route.road = 'main';
+          this.route.laneY = 525;
+          this.destination = { x: 80, y: 525 };
+        }
+      }
+    }
+  }
+
+  /**
+   * Update kinematics, intelligent local path planning and collision avoidance
+   * @param {number} dt - Delta time in seconds
+   * @param {EgoVehicle} egoVehicle - Ego vehicle reference
+   * @param {Array<DynamicObject>} allEntities - All active traffic entities
+   * @param {Object} environmentData - Static environment definition
+   */
+  update(dt, egoVehicle, allEntities, environmentData) {
     if (!this.active) return;
     if (dt <= 0 || dt > 0.1) dt = 0.016;
 
     this.swayPhase += 6.0 * dt;
     if (this.swayPhase > Math.PI * 2) this.swayPhase -= Math.PI * 2;
-
     this.stateTimer -= dt;
 
     switch (this.type) {
       case 'car':
-        this.updateCar(dt);
-        break;
       case 'motorcycle':
-        this.updateMotorcycle(dt);
-        break;
       case 'auto_rickshaw':
-        this.updateAutoRickshaw(dt);
+        this.navigateTrafficVehicle(dt, egoVehicle, allEntities, environmentData);
         break;
       case 'pedestrian':
         this.updatePedestrian(dt);
@@ -1927,7 +1990,172 @@ class DynamicObject {
     }
   }
 
-  // --- Dynamic Behaviors & Road-Constrained Movement ---
+  // --- Intelligent Local Traffic Planner & Collision Prevention ---
+
+  /**
+   * Perceive surrounding dynamic threats within local sensor range
+   */
+  perceiveThreats(egoVehicle, allEntities) {
+    const threats = [];
+
+    // 1. Ego Vehicle
+    if (egoVehicle) {
+      const dx = egoVehicle.x - this.x;
+      const dy = egoVehicle.y - this.y;
+      const dist = Math.hypot(dx, dy);
+      if (dist < 180) {
+        threats.push({
+          id: 'ego',
+          type: 'ego_vehicle',
+          x: egoVehicle.x,
+          y: egoVehicle.y,
+          radius: 18,
+          speed: egoVehicle.speed || 0,
+          heading: egoVehicle.heading || 0
+        });
+      }
+    }
+
+    // 2. Other Dynamic Traffic Entities
+    if (Array.isArray(allEntities)) {
+      for (const ent of allEntities) {
+        if (ent.id === this.id || !ent.active) continue;
+        const dx = ent.x - this.x;
+        const dy = ent.y - this.y;
+        const dist = Math.hypot(dx, dy);
+        if (dist < 180) {
+          threats.push({
+            id: ent.id,
+            type: ent.type,
+            x: ent.x,
+            y: ent.y,
+            radius: ent.radius || 14,
+            speed: ent.speed || 0,
+            heading: ent.heading || 0
+          });
+        }
+      }
+    }
+
+    return threats;
+  }
+
+  /**
+   * Generate short candidate trajectories for local navigation
+   */
+  generateLocalPaths() {
+    const isBike = (this.type === 'motorcycle');
+    const lookaheadDist = isBike ? 65 : 80;
+    const numPoints = 6;
+    const stepSize = lookaheadDist / numPoints;
+
+    // Desired base heading toward persistent destination
+    const destAngle = Math.atan2(this.destination.y - this.y, this.destination.x - this.x);
+    let baseAngleDiff = destAngle - this.heading;
+    while (baseAngleDiff > Math.PI) baseAngleDiff -= Math.PI * 2;
+    while (baseAngleDiff < -Math.PI) baseAngleDiff += Math.PI * 2;
+
+    const baseOffset = Math.sign(baseAngleDiff) * Math.min(Math.abs(baseAngleDiff), 0.28);
+    const avoidAngle = isBike ? 0.40 : 0.32;
+
+    const steerAngles = [
+      { id: 'STRAIGHT',     offset: baseOffset },
+      { id: 'SLIGHT_LEFT',  offset: baseOffset - 0.15 },
+      { id: 'SLIGHT_RIGHT', offset: baseOffset + 0.15 },
+      { id: 'AVOID_LEFT',   offset: baseOffset - avoidAngle },
+      { id: 'AVOID_RIGHT',  offset: baseOffset + avoidAngle }
+    ];
+
+    return steerAngles.map(def => {
+      const waypoints = [];
+      let curX = this.x;
+      let curY = this.y;
+      const targetHeading = this.heading + def.offset;
+
+      for (let i = 1; i <= numPoints; i++) {
+        curX += stepSize * Math.cos(targetHeading);
+        curY += stepSize * Math.sin(targetHeading);
+        waypoints.push({ x: curX, y: curY });
+      }
+
+      return {
+        id: def.id,
+        steerOffset: def.offset,
+        targetHeading: targetHeading,
+        waypoints: waypoints,
+        endPoint: waypoints[waypoints.length - 1],
+        feasible: true,
+        cost: 0
+      };
+    });
+  }
+
+  /**
+   * Score candidate path against collision threats, obstacles, potholes, destination progress, and road bounds
+   */
+  scoreLocalPath(path, threats, environmentData) {
+    let cost = 0;
+    const myRadius = this.radius;
+
+    // 1. Evaluate Waypoints against Threats, Obstacles, Potholes & Road Bounds
+    for (let i = 0; i < path.waypoints.length; i++) {
+      const wp = path.waypoints[i];
+
+      // A. Dynamic threats (Ego, other cars, bikes, autos, pedestrians, animals)
+      for (const threat of threats) {
+        const dist = Math.hypot(wp.x - threat.x, wp.y - threat.y);
+        const clearance = dist - (myRadius + threat.radius);
+
+        if (clearance <= 2) {
+          path.feasible = false;
+          return 10000;
+        }
+
+        if (clearance < 35) {
+          cost += 350 / (clearance + 2);
+        }
+      }
+
+      // B. Solid static collision obstacles (buildings, barricades, parked cars, trees, signal)
+      if (window.StaticCollisionSystem) {
+        const solidCol = window.StaticCollisionSystem.checkSolidCollision(wp.x, wp.y, myRadius);
+        if (solidCol.collided) {
+          path.feasible = false;
+          return 10000;
+        }
+
+        // C. Pothole Road Surface Hazard
+        const pot = window.StaticCollisionSystem.checkPothole(wp.x, wp.y, myRadius * 0.75);
+        if (pot.inPothole) {
+          cost += 1800; // Strong penalty to steer around potholes if clear road exists
+        }
+      }
+
+      // D. Drivable Road Constraints
+      const onMain = (wp.y >= 470 && wp.y <= 650) && (wp.x >= 0 && wp.x <= 1800);
+      const onSide = (wp.x >= 840 && wp.x <= 990) && (wp.y >= 0 && wp.y <= 580);
+      if (!onMain && !onSide) {
+        path.feasible = false;
+        return 8000;
+      }
+    }
+
+    // 2. Goal Progress toward Persistent Destination
+    const startDist = Math.hypot(this.destination.x - this.x, this.destination.y - this.y);
+    const endDist = Math.hypot(this.destination.x - path.endPoint.x, this.destination.y - path.endPoint.y);
+    const deltaGoal = endDist - startDist;
+
+    if (deltaGoal < 0) {
+      cost += deltaGoal * 2.5; // Bonus for progress towards goal
+    } else {
+      cost += 400 + deltaGoal * 3.0;
+    }
+
+    // 3. Smoothness & Steering Effort
+    cost += Math.pow(Math.abs(path.steerOffset), 1.6) * 35;
+
+    return cost;
+  }
 
   /**
    * Check if a pothole is directly in front of this dynamic vehicle
@@ -1943,183 +2171,154 @@ class DynamicObject {
       const forwardDist = dx * cosH + dy * sinH;
       const lateralDist = Math.abs(dy * cosH - dx * sinH);
 
-      if (forwardDist > 10 && forwardDist < (lookahead + p.radius) && lateralDist < (p.radius + this.width / 2 + 6)) {
+      if (forwardDist > 5 && forwardDist < (lookahead + p.radius) && lateralDist < (p.radius + this.width / 2 + 4)) {
         return { pothole: p, forwardDist, lateralDist, pY: p.y, pX: p.x };
       }
     }
     return null;
   }
 
-  updateCar(dt) {
-    // 1. Pothole reaction: detect pothole ahead in lane
-    const potholeInfo = this.detectPotholeAhead(70);
-    let targetSpeed = this.baseSpeed;
+  /**
+   * Master navigation and control loop for non-ego road vehicles (Cars, Bikes, Autos)
+   */
+  navigateTrafficVehicle(dt, egoVehicle, allEntities, environmentData) {
+    this.updatePersistentDestination();
 
-    if (potholeInfo) {
-      // Slow down when approaching pothole
-      targetSpeed = this.baseSpeed * 0.6;
-      // Gentle lateral nudge away from pothole
-      const steerAway = (this.y >= potholeInfo.pY) ? 12 : -12;
-      this.targetLateralOffset = steerAway;
-    } else {
-      if (this.stateTimer <= 0) {
-        this.stateTimer = Math.random() * 4 + 3;
-        this.targetLateralOffset = (Math.random() * 12 - 6);
-      }
-      targetSpeed = this.baseSpeed + (Math.random() * 6 - 3);
-    }
+    // 1. Gather all obstacles and collision threats
+    const threats = this.perceiveThreats(egoVehicle, allEntities);
 
-    this.speed += (targetSpeed - this.speed) * 3.0 * dt;
-    this.lateralOffset += (this.targetLateralOffset - this.lateralOffset) * 1.8 * dt;
+    // 2. Generate local candidate rollout paths
+    const candidatePaths = this.generateLocalPaths();
 
-    if (this.route.road === 'main') {
-      const isEastbound = this.heading === 0 || Math.abs(this.heading) < 0.2;
-      
-      if (isEastbound) {
-        this.heading = 0; // Strictly Eastbound
-        const nominalY = this.route.laneY || 600;
-        this.y = nominalY + this.lateralOffset;
-        this.x += this.speed * dt;
+    // 3. Score candidate paths
+    let bestPath = null;
+    let minCost = Infinity;
 
-        if (this.x > (this.route.maxX || 1880)) {
-          this.x = this.route.minX || -80;
-          this.lateralOffset = 0;
-        }
-      } else {
-        this.heading = Math.PI; // Strictly Westbound
-        const nominalY = this.route.laneY || 520;
-        this.y = nominalY + this.lateralOffset;
-        this.x -= this.speed * dt;
-
-        if (this.x < (this.route.minX || -80)) {
-          this.x = this.route.maxX || 1880;
-          this.lateralOffset = 0;
-        }
-      }
-    } else if (this.route.road === 'side') {
-      this.heading = Math.PI / 2; // Strictly Southbound
-      const nominalX = this.route.laneX || 895;
-      this.x = nominalX + this.lateralOffset;
-      this.y += this.speed * dt;
-
-      if (this.y > (this.route.maxY || 470)) {
-        this.y = this.route.minY || -60;
-        this.lateralOffset = 0;
+    for (const path of candidatePaths) {
+      const cost = this.scoreLocalPath(path, threats, environmentData);
+      path.cost = cost;
+      if (path.feasible && cost < minCost) {
+        minCost = cost;
+        bestPath = path;
       }
     }
-  }
 
-  updateMotorcycle(dt) {
-    // Motorcycles: nimble, smooth lane adherence, avoids potholes
-    const potholeInfo = this.detectPotholeAhead(60);
+    this.selectedPath = bestPath;
+
+    // 4. Calculate Forward Lookahead Threat & Target Speed
     let targetSpeed = this.baseSpeed;
+    this.isBraking = false;
+    let obstacleDirectlyAhead = false;
+    let closestObstacleDist = Infinity;
 
-    if (potholeInfo) {
+    // Check direct forward corridor for obstacles and vehicles
+    const cosH = Math.cos(this.heading);
+    const sinH = Math.sin(this.heading);
+
+    for (const threat of threats) {
+      const dx = threat.x - this.x;
+      const dy = threat.y - this.y;
+      const fwd = dx * cosH + dy * sinH;
+      const lat = Math.abs(dy * cosH - dx * sinH);
+
+      // In forward corridor
+      if (fwd > 0 && fwd < 110 && lat < (this.radius + (threat.radius || 12) + 6)) {
+        if (fwd < closestObstacleDist) {
+          closestObstacleDist = fwd;
+        }
+
+        // Relative speed & TTC
+        const relVx = (threat.speed || 0) * Math.cos(threat.heading || 0) - this.speed * cosH;
+        const relVy = (threat.speed || 0) * Math.sin(threat.heading || 0) - this.speed * sinH;
+        const closingSpeed = -(relVx * (dx / (fwd || 1)) + relVy * (dy / (fwd || 1)));
+
+        // Critical safety gap
+        const safeGap = this.length * 0.75 + (threat.radius || 12);
+
+        if (fwd < safeGap + 12 || (closingSpeed > 5 && (fwd - safeGap) / closingSpeed < 1.6)) {
+          obstacleDirectlyAhead = true;
+        }
+      }
+    }
+
+    // Check Potholes in forward path
+    const potholeCheck = this.detectPotholeAhead(65);
+
+    // 5. Intelligent Speed & Braking Resolution
+    if (!bestPath || obstacleDirectlyAhead) {
+      // Path is completely blocked or imminent collision -> FULL STOP
+      targetSpeed = 0;
+      this.isBraking = true;
+      this.state = 'STOPPED';
+    } else if (closestObstacleDist < 60) {
+      // Developing proximity -> SLOW down significantly
+      targetSpeed = this.baseSpeed * 0.35;
+      this.isBraking = true;
+      this.state = 'BRAKING';
+    } else if (bestPath.steerOffset !== 0) {
+      // Executing avoidance maneuver around obstacle/pothole
       targetSpeed = this.baseSpeed * 0.7;
-      const steerAway = (this.y >= potholeInfo.pY) ? 14 : -14;
-      this.targetLateralOffset = steerAway;
+      this.state = 'AVOIDING';
+    } else if (potholeCheck) {
+      // Approaching pothole without alternate path -> SLOW
+      targetSpeed = this.baseSpeed * 0.4;
+      this.isBraking = true;
+      this.state = 'BRAKING';
     } else {
+      // Normal clear road cruising with organic speed variation
       if (this.stateTimer <= 0) {
         this.stateTimer = Math.random() * 3 + 2;
-        this.targetLateralOffset = (Math.random() * 16 - 8);
+        this.speedJitter = (Math.random() * 8 - 4);
       }
-      targetSpeed = this.baseSpeed + (Math.random() * 8 - 4);
+      targetSpeed = this.baseSpeed + (this.speedJitter || 0);
+      this.state = 'CRUISING';
     }
 
-    this.speed += (targetSpeed - this.speed) * 4.0 * dt;
-    this.lateralOffset += (this.targetLateralOffset - this.lateralOffset) * 2.5 * dt;
+    // 6. Smooth Acceleration & Deceleration Physics
+    const maxAccel = this.type === 'motorcycle' ? 180 : 120;
+    const maxDecel = 280;
 
-    if (this.route.road === 'main') {
-      const isEastbound = this.heading === 0 || Math.abs(this.heading) < 0.2;
+    if (this.speed < targetSpeed) {
+      this.speed = Math.min(targetSpeed, this.speed + maxAccel * dt);
+    } else if (this.speed > targetSpeed) {
+      this.speed = Math.max(targetSpeed, this.speed - maxDecel * dt);
+    }
 
-      if (isEastbound) {
-        this.heading = 0; // Strictly Eastbound
-        const nominalY = this.route.laneY || 580;
-        this.y = nominalY + this.lateralOffset + Math.sin(this.swayPhase * 0.4) * 1.5;
-        this.x += this.speed * dt;
+    if (this.speed < 1 && targetSpeed === 0) {
+      this.speed = 0;
+      this.state = 'STOPPED';
+    }
 
-        if (this.x > (this.route.maxX || 1880)) {
-          this.x = this.route.minX || -80;
-          this.lateralOffset = 0;
-        }
+    // 7. Steering & Kinematics Update
+    if (bestPath && this.speed > 0) {
+      const turnRate = this.type === 'motorcycle' ? 4.5 : 3.0;
+      let targetHeading = bestPath.targetHeading;
+      let headingDiff = targetHeading - this.heading;
+      while (headingDiff > Math.PI) headingDiff -= Math.PI * 2;
+      while (headingDiff < -Math.PI) headingDiff += Math.PI * 2;
+
+      this.heading += Math.sign(headingDiff) * Math.min(Math.abs(headingDiff), turnRate * dt);
+      this.heading = Math.atan2(Math.sin(this.heading), Math.cos(this.heading));
+    }
+
+    // Position integration with solid obstacle collision check
+    const proposedX = this.x + this.speed * Math.cos(this.heading) * dt;
+    const proposedY = this.y + this.speed * Math.sin(this.heading) * dt;
+
+    if (window.StaticCollisionSystem) {
+      const solidCol = window.StaticCollisionSystem.checkSolidCollision(proposedX, proposedY, this.radius);
+      if (solidCol.collided) {
+        // Stop before solid object
+        this.speed = 0;
+        this.isBraking = true;
+        this.state = 'STOPPED';
       } else {
-        this.heading = Math.PI; // Strictly Westbound
-        const nominalY = this.route.laneY || 515;
-        this.y = nominalY + this.lateralOffset + Math.sin(this.swayPhase * 0.4) * 1.5;
-        this.x -= this.speed * dt;
-
-        if (this.x < (this.route.minX || -80)) {
-          this.x = this.route.maxX || 1880;
-          this.lateralOffset = 0;
-        }
+        this.x = proposedX;
+        this.y = proposedY;
       }
-    } else if (this.route.road === 'side') {
-      this.heading = Math.PI / 2; // Strictly Southbound
-      const nominalX = this.route.laneX || 940;
-      this.x = nominalX + this.lateralOffset;
-      this.y += this.speed * dt;
-
-      if (this.y > (this.route.maxY || 470)) {
-        this.y = this.route.minY || -60;
-        this.lateralOffset = 0;
-      }
-    }
-  }
-
-  updateAutoRickshaw(dt) {
-    // Auto-rickshaws: moderate cruising speed, steady lane tracking, avoids potholes
-    const potholeInfo = this.detectPotholeAhead(60);
-    let targetSpeed = this.baseSpeed;
-
-    if (potholeInfo) {
-      targetSpeed = this.baseSpeed * 0.65;
-      const steerAway = (this.y >= potholeInfo.pY) ? 12 : -12;
-      this.targetLateralOffset = steerAway;
     } else {
-      if (this.stateTimer <= 0) {
-        this.stateTimer = Math.random() * 4 + 2.5;
-        this.targetLateralOffset = (Math.random() * 12 - 6);
-      }
-      targetSpeed = this.baseSpeed + (Math.random() * 6 - 3);
-    }
-
-    this.speed += (targetSpeed - this.speed) * 3.0 * dt;
-    this.lateralOffset += (this.targetLateralOffset - this.lateralOffset) * 2.0 * dt;
-
-    if (this.route.road === 'main') {
-      const isEastbound = this.heading === 0 || Math.abs(this.heading) < 0.2;
-
-      if (isEastbound) {
-        this.heading = 0; // Strictly Eastbound
-        const nominalY = this.route.laneY || 615;
-        this.y = nominalY + this.lateralOffset;
-        this.x += this.speed * dt;
-
-        if (this.x > (this.route.maxX || 1880)) {
-          this.x = this.route.minX || -80;
-          this.lateralOffset = 0;
-        }
-      } else {
-        this.heading = Math.PI; // Strictly Westbound
-        const nominalY = this.route.laneY || 535;
-        this.y = nominalY + this.lateralOffset;
-        this.x -= this.speed * dt;
-
-        if (this.x < (this.route.minX || -80)) {
-          this.x = this.route.maxX || 1880;
-          this.lateralOffset = 0;
-        }
-      }
-    } else if (this.route.road === 'side') {
-      this.heading = Math.PI / 2; // Strictly Southbound
-      const nominalX = this.route.laneX || 955;
-      this.x = nominalX + this.lateralOffset;
-      this.y += this.speed * dt;
-
-      if (this.y > (this.route.maxY || 470)) {
-        this.y = this.route.minY || -60;
-        this.lateralOffset = 0;
-      }
+      this.x = proposedX;
+      this.y = proposedY;
     }
   }
 
@@ -2160,7 +2359,7 @@ class DynamicObject {
         }
       }
 
-      // Wrap around sidewalk ends
+      // Turn around on sidewalk ends
       if (this.x > 1780) {
         this.heading = Math.PI;
       } else if (this.x < 40) {
@@ -2197,9 +2396,9 @@ class DynamicObject {
         }
       }
 
-      // Wrap on world edges
-      if (this.x > 1820) this.x = -20;
-      if (this.x < -20) this.x = 1820;
+      // Turn around on world edges
+      if (this.x > 1800) this.heading = Math.PI;
+      if (this.x < 20) this.heading = 0;
 
     } else if (this.subType === 'dog') {
       if (this.pauseTimer > 0) {
@@ -2224,8 +2423,8 @@ class DynamicObject {
         }
       }
 
-      if (this.x > 1820) this.x = -20;
-      if (this.x < -20) this.x = 1820;
+      if (this.x > 1800) this.heading = Math.PI;
+      if (this.x < 20) this.heading = 0;
     }
   }
 
@@ -2317,10 +2516,18 @@ class DynamicObject {
     ctx.fillRect(halfL - 2, -halfW + 2, 2, 4);
     ctx.fillRect(halfL - 2, halfW - 6, 2, 4);
 
-    // Rear Taillights
-    ctx.fillStyle = '#ef4444';
+    // Rear Taillights (glow when braking or stopped)
+    if (this.isBraking || this.speed < 5) {
+      ctx.fillStyle = '#f43f5e';
+      ctx.shadowColor = '#ef4444';
+      ctx.shadowBlur = 8;
+    } else {
+      ctx.fillStyle = '#991b1b';
+      ctx.shadowBlur = 0;
+    }
     ctx.fillRect(-halfL, -halfW + 2, 2, 4);
     ctx.fillRect(-halfL, halfW - 6, 2, 4);
+    ctx.shadowBlur = 0;
   }
 
   /**
@@ -2370,6 +2577,18 @@ class DynamicObject {
     // Helmet Visor
     ctx.fillStyle = '#0f172a';
     ctx.fillRect(0, -3, 2, 6);
+
+    // Rear Taillight
+    if (this.isBraking || this.speed < 5) {
+      ctx.fillStyle = '#f43f5e';
+      ctx.shadowColor = '#ef4444';
+      ctx.shadowBlur = 6;
+    } else {
+      ctx.fillStyle = '#991b1b';
+      ctx.shadowBlur = 0;
+    }
+    ctx.fillRect(-halfL, -1.5, 2, 3);
+    ctx.shadowBlur = 0;
   }
 
   /**
@@ -2412,9 +2631,21 @@ class DynamicObject {
     ctx.fillStyle = '#38bdf8';
     ctx.fillRect(halfL - 10, -halfW + 3, 3, this.width - 6);
 
-    // Rear Black Bumper
+    // Rear Black Bumper & Taillights
     ctx.fillStyle = '#1e293b';
     ctx.fillRect(-halfL, -halfW + 2, 3, this.width - 4);
+
+    if (this.isBraking || this.speed < 5) {
+      ctx.fillStyle = '#f43f5e';
+      ctx.shadowColor = '#ef4444';
+      ctx.shadowBlur = 8;
+    } else {
+      ctx.fillStyle = '#991b1b';
+      ctx.shadowBlur = 0;
+    }
+    ctx.fillRect(-halfL, -halfW + 3, 2, 4);
+    ctx.fillRect(-halfL, halfW - 7, 2, 4);
+    ctx.shadowBlur = 0;
   }
 
   /**
@@ -2649,33 +2880,33 @@ class TrafficManager {
         heading: 0, // Eastbound
         speed: 85,
         color: '#dc2626',
-        route: { road: 'main', laneY: 595, minX: -80, maxX: 1880 }
+        route: { road: 'main', laneY: 595 }
       }),
       new DynamicObject({
         id: 'car-2',
         type: 'car',
         subType: 'hatchback',
-        x: 1200,
+        x: 1350,
         y: 525,
         length: 46,
         width: 23,
         heading: Math.PI, // Westbound
         speed: 90,
         color: '#2563eb',
-        route: { road: 'main', laneY: 525, minX: -80, maxX: 1880 }
+        route: { road: 'main', laneY: 525 }
       }),
       new DynamicObject({
         id: 'car-3',
         type: 'car',
         subType: 'suv',
-        x: 750,
-        y: 615,
+        x: 580,
+        y: 605,
         length: 52,
         width: 26,
         heading: 0, // Eastbound
         speed: 75,
         color: '#e2e8f0',
-        route: { road: 'main', laneY: 615, minX: -80, maxX: 1880 }
+        route: { road: 'main', laneY: 605 }
       }),
       new DynamicObject({
         id: 'car-4',
@@ -2688,7 +2919,7 @@ class TrafficManager {
         heading: Math.PI / 2, // Southbound on side road
         speed: 65,
         color: '#f59e0b',
-        route: { road: 'side', laneX: 895, minY: -60, maxY: 470 }
+        route: { road: 'side', laneX: 895 }
       }),
 
       // --- 2. Motorcycles & Bikes (4) ---
@@ -2696,14 +2927,14 @@ class TrafficManager {
         id: 'bike-1',
         type: 'motorcycle',
         subType: 'sport_bike',
-        x: 520,
-        y: 580,
+        x: 480,
+        y: 575,
         length: 28,
         width: 12,
         heading: 0, // Eastbound
         speed: 120,
         color: '#ea580c',
-        route: { road: 'main', laneY: 580, minX: -80, maxX: 1880 }
+        route: { road: 'main', laneY: 575 }
       }),
       new DynamicObject({
         id: 'bike-2',
@@ -2716,20 +2947,20 @@ class TrafficManager {
         heading: Math.PI, // Westbound
         speed: 105,
         color: '#1e293b',
-        route: { road: 'main', laneY: 515, minX: -80, maxX: 1880 }
+        route: { road: 'main', laneY: 515 }
       }),
       new DynamicObject({
         id: 'bike-3',
         type: 'motorcycle',
         subType: 'scooter',
         x: 180,
-        y: 635,
+        y: 615,
         length: 25,
         width: 12,
         heading: 0, // Eastbound
         speed: 80,
         color: '#06b6d4',
-        route: { road: 'main', laneY: 635, minX: -80, maxX: 1880 }
+        route: { road: 'main', laneY: 615 }
       }),
       new DynamicObject({
         id: 'bike-4',
@@ -2742,7 +2973,7 @@ class TrafficManager {
         heading: Math.PI / 2, // Southbound on side road
         speed: 85,
         color: '#ec4899',
-        route: { road: 'side', laneX: 940, minY: -60, maxY: 470 }
+        route: { road: 'side', laneX: 940 }
       }),
 
       // --- 3. Auto-Rickshaws (3) ---
@@ -2750,27 +2981,27 @@ class TrafficManager {
         id: 'auto-1',
         type: 'auto_rickshaw',
         subType: 'cng_auto',
-        x: 980,
-        y: 625,
+        x: 1020,
+        y: 605,
         length: 44,
         width: 26,
         heading: 0, // Eastbound
         speed: 70,
         color: '#15803d',
-        route: { road: 'main', laneY: 625, minX: -80, maxX: 1880 }
+        route: { road: 'main', laneY: 605 }
       }),
       new DynamicObject({
         id: 'auto-2',
         type: 'auto_rickshaw',
         subType: 'cng_auto',
-        x: 600,
-        y: 535,
+        x: 620,
+        y: 525,
         length: 44,
         width: 26,
         heading: Math.PI, // Westbound
         speed: 65,
         color: '#15803d',
-        route: { road: 'main', laneY: 535, minX: -80, maxX: 1880 }
+        route: { road: 'main', laneY: 525 }
       }),
       new DynamicObject({
         id: 'auto-3',
@@ -2783,7 +3014,7 @@ class TrafficManager {
         heading: Math.PI / 2, // Southbound on side road
         speed: 60,
         color: '#15803d',
-        route: { road: 'side', laneX: 955, minY: -60, maxY: 470 }
+        route: { road: 'side', laneX: 955 }
       }),
 
       // --- 4. Pedestrians (4) ---
@@ -2892,9 +3123,11 @@ class TrafficManager {
     ];
   }
 
-  update(dt) {
+  update(dt, egoVehicle, environmentData) {
     if (!this.isEnabled) return;
-    this.entities.forEach(entity => entity.update(dt));
+    const ego = egoVehicle || (window.SimulationEngine ? window.SimulationEngine.getEgoVehicle() : null);
+    const env = environmentData || window.EnvironmentData;
+    this.entities.forEach(entity => entity.update(dt, ego, this.entities, env));
   }
 
   render(ctx) {
@@ -4586,9 +4819,9 @@ class SimulationAppController {
       this.egoVehicle.update(dt);
     }
 
-    // 2. Update Dynamic Traffic & Entities (Module 3)
+    // 2. Update Dynamic Traffic & Entities (Module 3 + Local Traffic Intelligence)
     if (this.trafficManager) {
-      this.trafficManager.update(dt);
+      this.trafficManager.update(dt, this.egoVehicle, EnvironmentData);
     }
 
     // 3. Update Perception & Risk Assessment (Module 4)
