@@ -4545,27 +4545,27 @@ class TrafficManager {
   constructor() {
     this.entities = [];
     this.isEnabled = true;
-    this.includeVehicles = false; // Road vehicles (cars, bikes, autos) disabled for current RL training
+    this.includeVehicles = true; // Road vehicles (cars, bikes, autos) enabled via Shared-Policy RL
     this.initDefaultEntities();
   }
 
   /**
-   * Road vehicle definitions (Cars, Motorcycles, Auto-Rickshaws)
-   * Preserved for seamless re-enabling when needed.
+   * Road vehicle definitions (3 Cars, 2 Motorcycles, 2 Auto-Rickshaws)
+   * Controlled via the single universal Shared PPO Policy
    */
   createRoadVehicles() {
     return [
-      // --- 1. Dynamic Cars (4) ---
+      // --- 1. Dynamic Cars (3) ---
       new DynamicObject({
         id: 'car-1',
         type: 'car',
         subType: 'sedan',
-        x: 350,
+        x: 380,
         y: 600,
         length: 50,
         width: 25,
         heading: 0, // Eastbound
-        speed: 85,
+        speed: 70,
         color: '#dc2626',
         route: { road: 'main', laneY: 600 }
       }),
@@ -4578,48 +4578,35 @@ class TrafficManager {
         length: 46,
         width: 23,
         heading: Math.PI, // Westbound
-        speed: 90,
+        speed: 75,
         color: '#2563eb',
         route: { road: 'main', laneY: 520 }
       }),
       new DynamicObject({
         id: 'car-3',
         type: 'car',
-        subType: 'suv',
-        x: 580,
-        y: 600,
-        length: 52,
-        width: 26,
-        heading: 0, // Eastbound
-        speed: 75,
-        color: '#e2e8f0',
-        route: { road: 'main', laneY: 600 }
-      }),
-      new DynamicObject({
-        id: 'car-4',
-        type: 'car',
         subType: 'taxi',
         x: 880,
-        y: 100,
+        y: 120,
         length: 46,
         width: 23,
         heading: Math.PI / 2, // Southbound on side road
-        speed: 65,
+        speed: 60,
         color: '#f59e0b',
         route: { road: 'side', laneX: 880 }
       }),
 
-      // --- 2. Motorcycles & Bikes (4) ---
+      // --- 2. Motorcycles & Bikes (2) ---
       new DynamicObject({
         id: 'bike-1',
         type: 'motorcycle',
         subType: 'sport_bike',
-        x: 480,
+        x: 220,
         y: 600,
         length: 28,
         width: 12,
         heading: 0, // Eastbound
-        speed: 110,
+        speed: 85,
         color: '#ea580c',
         route: { road: 'main', laneY: 600 }
       }),
@@ -4627,53 +4614,27 @@ class TrafficManager {
         id: 'bike-2',
         type: 'motorcycle',
         subType: 'commuter',
-        x: 1450,
+        x: 1480,
         y: 520,
         length: 27,
         width: 11,
         heading: Math.PI, // Westbound
-        speed: 105,
+        speed: 85,
         color: '#1e293b',
         route: { road: 'main', laneY: 520 }
       }),
-      new DynamicObject({
-        id: 'bike-3',
-        type: 'motorcycle',
-        subType: 'scooter',
-        x: 180,
-        y: 600,
-        length: 25,
-        width: 12,
-        heading: 0, // Eastbound
-        speed: 80,
-        color: '#06b6d4',
-        route: { road: 'main', laneY: 600 }
-      }),
-      new DynamicObject({
-        id: 'bike-4',
-        type: 'motorcycle',
-        subType: 'scooter',
-        x: 880,
-        y: 220,
-        length: 25,
-        width: 12,
-        heading: Math.PI / 2, // Southbound on side road
-        speed: 85,
-        color: '#ec4899',
-        route: { road: 'side', laneX: 880 }
-      }),
 
-      // --- 3. Auto-Rickshaws (3) ---
+      // --- 3. Auto-Rickshaws (2) ---
       new DynamicObject({
         id: 'auto-1',
         type: 'auto_rickshaw',
         subType: 'cng_auto',
-        x: 1050,
+        x: 700,
         y: 600,
         length: 44,
         width: 26,
         heading: 0, // Eastbound
-        speed: 70,
+        speed: 60,
         color: '#15803d',
         route: { road: 'main', laneY: 600 }
       }),
@@ -4681,27 +4642,14 @@ class TrafficManager {
         id: 'auto-2',
         type: 'auto_rickshaw',
         subType: 'cng_auto',
-        x: 650,
+        x: 1050,
         y: 520,
         length: 44,
         width: 26,
         heading: Math.PI, // Westbound
-        speed: 65,
-        color: '#15803d',
-        route: { road: 'main', laneY: 520 }
-      }),
-      new DynamicObject({
-        id: 'auto-3',
-        type: 'auto_rickshaw',
-        subType: 'cng_auto',
-        x: 880,
-        y: 60,
-        length: 44,
-        width: 26,
-        heading: Math.PI / 2, // Southbound on side road
         speed: 60,
         color: '#15803d',
-        route: { road: 'side', laneX: 880 }
+        route: { road: 'main', laneY: 520 }
       })
     ];
   }
@@ -8019,10 +7967,13 @@ class RLTrainingManager {
     ctx.setTransform(1, 0, 0, 1, 0, 0); // Screen coordinates
 
     const m = this.getMetrics();
+    const roadVehicles = this.engine && this.engine.trafficManager ? this.engine.trafficManager.getEntities().filter(e => e.type === 'car' || e.type === 'motorcycle' || e.type === 'auto_rickshaw') : [];
+    const rlVehicleCount = 1 + roadVehicles.length;
+
     const cardX = 20;
     const cardY = 120;
-    const cardW = 280;
-    const cardH = 240;
+    const cardW = 290;
+    const cardH = 260;
 
     // Glassmorphic Card Background
     ctx.fillStyle = 'rgba(15, 23, 42, 0.94)';
@@ -8037,26 +7988,30 @@ class RLTrainingManager {
     // Card Header Badge
     ctx.fillStyle = this.isTraining() ? '#06b6d4' : '#10b981';
     ctx.font = 'bold 12px "Segoe UI", sans-serif';
-    ctx.fillText(`🧠 PPO CONTINUOUS RL (${this.mode})`, cardX + 14, cardY + 22);
+    ctx.fillText(`🧠 SHARED-POLICY MARL (${this.mode})`, cardX + 14, cardY + 22);
+
+    ctx.fillStyle = '#10b981';
+    ctx.font = 'bold 11px "Segoe UI", sans-serif';
+    ctx.fillText(`TRAFFIC RL: ON  |  RL VEHICLES: ${rlVehicleCount} (${roadVehicles.length} Traffic + Ego)`, cardX + 14, cardY + 40);
 
     ctx.fillStyle = '#94a3b8';
     ctx.font = '11px "Segoe UI", sans-serif';
-    ctx.fillText(`Episode: ${m.episode}  (Step: ${m.step})`, cardX + 14, cardY + 42);
-    ctx.fillText(`Reward: ${m.currentReward}  |  Avg(100): ${m.avgReward100}`, cardX + 14, cardY + 60);
-    ctx.fillText(`Success (100): ${m.successRate100}  |  AvgLen: ${m.avgLength100}`, cardX + 14, cardY + 78);
-    ctx.fillText(`Smoothness: SteerΔ ${m.avgSteerChange100} | LatErr ${m.avgLateralError100}px`, cardX + 14, cardY + 96);
-    ctx.fillText(`Collisions: ${m.totalCollisions}  |  Off-Road: ${m.totalOffRoad}`, cardX + 14, cardY + 114);
-    ctx.fillText(`Goal Dist: ${m.distToGoal}  |  Best: ${m.bestReward}`, cardX + 14, cardY + 132);
-    ctx.fillText(`Last End: ${m.lastReason}`, cardX + 14, cardY + 150);
+    ctx.fillText(`Episode: ${m.episode}  (Step: ${m.step})`, cardX + 14, cardY + 58);
+    ctx.fillText(`Reward: ${m.currentReward}  |  Avg(100): ${m.avgReward100}`, cardX + 14, cardY + 76);
+    ctx.fillText(`Success (100): ${m.successRate100}  |  AvgLen: ${m.avgLength100}`, cardX + 14, cardY + 94);
+    ctx.fillText(`Smoothness: SteerΔ ${m.avgSteerChange100} | LatErr ${m.avgLateralError100}px`, cardX + 14, cardY + 112);
+    ctx.fillText(`Collisions: ${m.totalCollisions}  |  Off-Road: ${m.totalOffRoad}`, cardX + 14, cardY + 130);
+    ctx.fillText(`Goal Dist: ${m.distToGoal}  |  Best: ${m.bestReward}`, cardX + 14, cardY + 148);
+    ctx.fillText(`Last End: ${m.lastReason}`, cardX + 14, cardY + 166);
 
     // Continuous Control Gauges
-    ctx.fillText(`Steering: [ ${m.steer} ]`, cardX + 14, cardY + 174);
-    ctx.fillText(`Throttle: [ ${m.throttle} ]  Brake: [ ${m.brake} ]`, cardX + 14, cardY + 194);
+    ctx.fillText(`Steering: [ ${m.steer} ]`, cardX + 14, cardY + 190);
+    ctx.fillText(`Throttle: [ ${m.throttle} ]  Brake: [ ${m.brake} ]`, cardX + 14, cardY + 210);
 
     // Mini Steering Meter Bar
     const barX = cardX + 150;
-    const barY = cardY + 166;
-    const barW = 105;
+    const barY = cardY + 182;
+    const barW = 115;
     const barH = 10;
     ctx.fillStyle = 'rgba(30, 41, 59, 0.9)';
     ctx.fillRect(barX, barY, barW, barH);
@@ -8895,8 +8850,30 @@ class SimulationAppController {
     }
 
     // Render Real-time Reinforcement Learning HUD Overlay (Module 7)
-    if (this.rlTrainingManager) {
+    if (this.rlTrainingManager && this.rlTrainingManager.isActive()) {
       this.rlTrainingManager.renderHUD(this.ctx, this.camera);
+    } else if (this.trafficManager) {
+      // Render Shared-Policy Traffic RL HUD Badge in Manual / Autonomous mode
+      const roadVehicles = this.trafficManager.getEntities().filter(e => e.type === 'car' || e.type === 'motorcycle' || e.type === 'auto_rickshaw');
+      if (roadVehicles.length > 0 && this.ctx) {
+        this.ctx.save();
+        this.ctx.setTransform(1, 0, 0, 1, 0, 0);
+        this.ctx.fillStyle = 'rgba(15, 23, 42, 0.90)';
+        this.ctx.strokeStyle = 'rgba(16, 185, 129, 0.6)';
+        this.ctx.lineWidth = 1.2;
+        this.ctx.beginPath();
+        this.ctx.roundRect(20, 120, 240, 52, 8);
+        this.ctx.fill();
+        this.ctx.stroke();
+
+        this.ctx.fillStyle = '#10b981';
+        this.ctx.font = 'bold 12px "Segoe UI", sans-serif';
+        this.ctx.fillText('🤖 SHARED-POLICY TRAFFIC RL', 32, 140);
+        this.ctx.fillStyle = '#94a3b8';
+        this.ctx.font = '11px "Segoe UI", sans-serif';
+        this.ctx.fillText(`TRAFFIC RL: ON  |  RL VEHICLES: ${1 + roadVehicles.length}`, 32, 158);
+        this.ctx.restore();
+      }
     }
 
     // Render Future Submodules
