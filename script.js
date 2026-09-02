@@ -556,6 +556,196 @@ const StaticCollisionSystem = {
 };
 
 /* ============================================================================
+   3A. VEHICLE-TO-VEHICLE ORIENTED BOUNDING BOX (OBB) COLLISION SYSTEM
+   ============================================================================ */
+
+/**
+ * High-performance Separating Axis Theorem (SAT) Oriented Bounding Box collision
+ * detection and physical non-penetration separation for all vehicles in the simulation.
+ */
+const VehicleCollisionSystem = {
+  /**
+   * Compute the 4 oriented polygon corners of any vehicle in world coordinates
+   * @param {Object} vehicle - Vehicle instance (EgoVehicle or DynamicObject)
+   * @returns {Array<{x: number, y: number}>} 4 oriented corners [FL, FR, RR, RL]
+   */
+  getVehicleCorners(vehicle) {
+    if (!vehicle) return [];
+    const x = vehicle.x || 0;
+    const y = vehicle.y || 0;
+    const len = vehicle.length || (vehicle.radius ? vehicle.radius * 2 : 48);
+    const wid = vehicle.width || (vehicle.radius ? vehicle.radius * 1.4 : 24);
+    const heading = vehicle.heading || 0;
+
+    const hl = len / 2;
+    const hw = wid / 2;
+    const cosH = Math.cos(heading);
+    const sinH = Math.sin(heading);
+
+    return [
+      { x: x + hl * cosH - hw * sinH, y: y + hl * sinH + hw * cosH }, // Front-Left
+      { x: x + hl * cosH + hw * sinH, y: y + hl * sinH - hw * cosH }, // Front-Right
+      { x: x - hl * cosH + hw * sinH, y: y - hl * sinH - hw * cosH }, // Rear-Right
+      { x: x - hl * cosH - hw * sinH, y: y - hl * sinH + hw * cosH }  // Rear-Left
+    ];
+  },
+
+  /**
+   * Separating Axis Theorem (SAT) 2D Oriented Bounding Box intersection test
+   * @param {Object} v1 - First vehicle
+   * @param {Object} v2 - Second vehicle
+   * @returns {{collided: boolean, overlap: number, normal: {x: number, y: number}}}
+   */
+  checkOBBCollision(v1, v2) {
+    if (!v1 || !v2 || v1 === v2) return { collided: false, overlap: 0, normal: { x: 0, y: 0 } };
+
+    // 1. Broadphase bounding sphere distance check
+    const dx = v2.x - v1.x;
+    const dy = v2.y - v1.y;
+    const distSq = dx * dx + dy * dy;
+
+    const len1 = v1.length || (v1.radius ? v1.radius * 2 : 48);
+    const wid1 = v1.width || (v1.radius ? v1.radius * 1.4 : 24);
+    const rad1 = Math.hypot(len1 / 2, wid1 / 2);
+
+    const len2 = v2.length || (v2.radius ? v2.radius * 2 : 48);
+    const wid2 = v2.width || (v2.radius ? v2.radius * 1.4 : 24);
+    const rad2 = Math.hypot(len2 / 2, wid2 / 2);
+
+    const sumRad = rad1 + rad2;
+    if (distSq > sumRad * sumRad) {
+      return { collided: false, overlap: 0, normal: { x: 0, y: 0 } };
+    }
+
+    // 2. Narrowphase SAT: Test 4 candidate normal axes (2 from v1 edges, 2 from v2 edges)
+    const corners1 = this.getVehicleCorners(v1);
+    const corners2 = this.getVehicleCorners(v2);
+
+    const h1 = v1.heading || 0;
+    const h2 = v2.heading || 0;
+
+    const axes = [
+      { x: Math.cos(h1), y: Math.sin(h1) },
+      { x: -Math.sin(h1), y: Math.cos(h1) },
+      { x: Math.cos(h2), y: Math.sin(h2) },
+      { x: -Math.sin(h2), y: Math.cos(h2) }
+    ];
+
+    let minOverlap = Infinity;
+    let bestNormal = { x: 0, y: 0 };
+    let bestScore = Infinity;
+
+    for (const axis of axes) {
+      const len = Math.hypot(axis.x, axis.y) || 1;
+      const nx = axis.x / len;
+      const ny = axis.y / len;
+
+      // Project corners of v1
+      let min1 = Infinity, max1 = -Infinity;
+      for (const c of corners1) {
+        const proj = c.x * nx + c.y * ny;
+        if (proj < min1) min1 = proj;
+        if (proj > max1) max1 = proj;
+      }
+
+      // Project corners of v2
+      let min2 = Infinity, max2 = -Infinity;
+      for (const c of corners2) {
+        const proj = c.x * nx + c.y * ny;
+        if (proj < min2) min2 = proj;
+        if (proj > max2) max2 = proj;
+      }
+
+      // Check 1D projection overlap
+      const overlap = Math.min(max1, max2) - Math.max(min1, min2);
+      if (overlap <= 0.05) {
+        return { collided: false, overlap: 0, normal: { x: 0, y: 0 } }; // Found separating axis!
+      }
+
+      // Prefer axes aligned with relative movement/displacement for realistic vehicle separation
+      const centerProj = Math.abs(dx * nx + dy * ny);
+      const score = overlap / (centerProj + 1.0);
+
+      if (score < bestScore) {
+        bestScore = score;
+        minOverlap = overlap;
+        bestNormal = { x: nx, y: ny };
+      }
+    }
+
+    // Orient normal vector from v1 towards v2
+    if (dx * bestNormal.x + dy * bestNormal.y < 0) {
+      bestNormal.x = -bestNormal.x;
+      bestNormal.y = -bestNormal.y;
+    }
+
+    return {
+      collided: true,
+      overlap: minOverlap,
+      normal: bestNormal
+    };
+  },
+
+  /**
+   * Check and physically resolve all vehicle-to-vehicle collisions in the simulation
+   * Prevents vehicles from passing through or overlapping each other.
+   * @param {Array<Object>} vehicles - Array of active vehicles (Ego + all road vehicles)
+   * @returns {Array<Object>} List of resolved collision events
+   */
+  resolveVehicleCollisions(vehicles) {
+    if (!Array.isArray(vehicles) || vehicles.length < 2) return [];
+
+    const collisionEvents = [];
+
+    // Reset collision flags before check pass
+    for (const v of vehicles) {
+      if (v) v.isCollided = false;
+    }
+
+    // Check all pairs: ego<->car, ego<->bike, ego<->auto, car<->car, car<->bike, car<->auto, etc.
+    for (let i = 0; i < vehicles.length; i++) {
+      const v1 = vehicles[i];
+      if (!v1 || v1.active === false) continue;
+
+      for (let j = i + 1; j < vehicles.length; j++) {
+        const v2 = vehicles[j];
+        if (!v2 || v2.active === false) continue;
+
+        const res = this.checkOBBCollision(v1, v2);
+        if (res.collided) {
+          v1.isCollided = true;
+          v2.isCollided = true;
+
+          collisionEvents.push({
+            v1: v1.id || 'ego',
+            v2: v2.id || 'ego',
+            overlap: res.overlap,
+            normal: res.normal
+          });
+
+          // Physical non-penetration separation (push apart along penetration normal)
+          const sep = (res.overlap + 0.5) * 0.5;
+          v1.x -= res.normal.x * sep;
+          v1.y -= res.normal.y * sep;
+          v2.x += res.normal.x * sep;
+          v2.y += res.normal.y * sep;
+
+          // Physics velocity arrest: reduce forward speed upon collision to prevent passing through
+          if (v1.speed !== undefined && Math.abs(v1.speed) > 1.0) {
+            v1.speed = Math.max(0, v1.speed * 0.1);
+          }
+          if (v2.speed !== undefined && Math.abs(v2.speed) > 1.0) {
+            v2.speed = Math.max(0, v2.speed * 0.1);
+          }
+        }
+      }
+    }
+
+    return collisionEvents;
+  }
+};
+
+/* ============================================================================
    3B. ROAD NETWORK GRAPH & TOPOLOGY SYSTEM (DETERMINISTIC ROAD NETWORK)
    ============================================================================ */
 
@@ -4767,8 +4957,15 @@ class TrafficManager {
 
   initDefaultEntities() {
     this.entities = this.createPedestriansAndAnimals();
+    this.vehicleAgents = new Map();
     if (this.includeVehicles) {
-      this.entities.push(...this.createRoadVehicles());
+      const roadVehicles = this.createRoadVehicles();
+      this.entities.push(...roadVehicles);
+      for (const v of roadVehicles) {
+        v.initPersistentDestination();
+        const agent = new RLVehicleAgent(v, v.destination);
+        this.vehicleAgents.set(v.id, agent);
+      }
     }
   }
 
@@ -4782,27 +4979,34 @@ class TrafficManager {
     const ego = egoVehicle || (window.SimulationEngine ? window.SimulationEngine.getEgoVehicle() : null);
     const env = environmentData || window.EnvironmentData;
 
+    // 1. Advance all active dynamic entities (RL vehicles via RLVehicleAgent, pedestrians/animals via kinematics)
     for (const entity of this.entities) {
       if (!entity.active) continue;
 
       const isRoadVehicle = (entity.type === 'car' || entity.type === 'motorcycle' || entity.type === 'auto_rickshaw');
       if (isRoadVehicle && sharedPolicy) {
-        // Run universal shared PPO policy for this traffic road vehicle
-        const targetY = (entity.route && entity.route.laneY) ? entity.route.laneY : (entity.destination ? entity.destination.y : 560);
-        const crossTrack = (entity.y - targetY) / 95;
-        const crossTrackRate = (crossTrack - (entity.prevCrossTrack || 0)) / Math.max(0.001, dt);
-        const lastSteerChange = (entity.lastAction ? entity.lastAction[0] : 0) - (entity.prevSteerAction || 0);
-
-        const obs = sharedPolicy.getObservation(entity, env, null, this.entities, entity.lastAction || [0, 0, 0], lastSteerChange, crossTrackRate);
-        const actData = sharedPolicy.selectAction(obs, isTraining);
-        entity.prevSteerAction = entity.lastAction ? entity.lastAction[0] : 0;
-        entity.lastAction = actData.action;
-        entity.prevCrossTrack = crossTrack;
-
-        entity.applyRLAction(actData.action, dt);
+        let agent = this.vehicleAgents.get(entity.id);
+        if (!agent) {
+          entity.initPersistentDestination();
+          agent = new RLVehicleAgent(entity, entity.destination);
+          this.vehicleAgents.set(entity.id, agent);
+        }
+        agent.step(sharedPolicy, env, this.entities, dt, isTraining);
       } else {
         entity.update(dt, ego, this.entities, env);
       }
+    }
+
+    // 2. Physical Vehicle-to-Vehicle Collision Detection & Non-Penetration Resolution
+    const allVehicles = [];
+    if (ego) allVehicles.push(ego);
+    for (const e of this.entities) {
+      if (e.active && (e.type === 'car' || e.type === 'motorcycle' || e.type === 'auto_rickshaw')) {
+        allVehicles.push(e);
+      }
+    }
+    if (typeof VehicleCollisionSystem !== 'undefined') {
+      VehicleCollisionSystem.resolveVehicleCollisions(allVehicles);
     }
   }
 
@@ -7624,6 +7828,71 @@ const EgoRLAgent = EgoPPOAgent;
 const SharedPPOPolicy = EgoPPOAgent;
 
 /**
+ * Unified RL Vehicle Agent controller implementation.
+ * Reused identically for Ego Vehicle and every traffic road vehicle (cars, motorcycles, auto-rickshaws).
+ * Operates on the single shared PPO policy model.
+ */
+class RLVehicleAgent {
+  constructor(vehicle, destination, options = {}) {
+    this.vehicle = vehicle;
+    this.destination = destination || (vehicle && vehicle.destination) || { x: 1650, y: 560 };
+    this.lastAction = [0, 0, 0];
+    this.prevSteerAction = 0;
+    this.prevCrossTrack = 0;
+    this.isCollided = false;
+    this.episodeReward = 0;
+    this.options = options;
+  }
+
+  getObservation(sharedPolicy, env, allEntities, dt = 0.035) {
+    if (!this.vehicle) return new Array(26).fill(0);
+    const targetY = (this.vehicle.route && this.vehicle.route.laneY) ? this.vehicle.route.laneY : (this.destination ? this.destination.y : 560);
+    const crossTrack = (this.vehicle.y - targetY) / 95;
+    const crossTrackRate = (crossTrack - this.prevCrossTrack) / Math.max(0.001, dt);
+    const lastSteerChange = this.lastAction[0] - this.prevSteerAction;
+
+    return sharedPolicy.getObservation(
+      this.vehicle,
+      env,
+      null,
+      allEntities,
+      this.lastAction,
+      lastSteerChange,
+      crossTrackRate
+    );
+  }
+
+  step(sharedPolicy, env, allEntities, dt = 0.035, isTraining = false) {
+    if (!this.vehicle || this.vehicle.active === false) return null;
+
+    // 1. Individual vehicle observation from spatial perspective
+    const obs = this.getObservation(sharedPolicy, env, allEntities, dt);
+
+    // 2. Query single shared policy for continuous action [steer, throttle, brake]
+    const actData = sharedPolicy.selectAction(obs, isTraining);
+
+    this.prevSteerAction = this.lastAction[0];
+    this.lastAction = actData.action;
+    const targetY = (this.vehicle.route && this.vehicle.route.laneY) ? this.vehicle.route.laneY : (this.destination ? this.destination.y : 560);
+    this.prevCrossTrack = (this.vehicle.y - targetY) / 95;
+
+    // 3. Actuate action through existing vehicle physics
+    if (typeof this.vehicle.applyRLAction === 'function') {
+      this.vehicle.applyRLAction(actData.action, dt);
+    } else if (this.vehicle.inputs) {
+      this.vehicle.inputs.steer = actData.action[0];
+      this.vehicle.inputs.throttle = actData.action[1];
+      this.vehicle.inputs.brake = actData.action[2];
+      this.vehicle.inputs.handbrake = false;
+      this.vehicle.update(dt);
+    }
+
+    this.isCollided = !!this.vehicle.isCollided;
+    return { obs, actionData: actData };
+  }
+}
+
+/**
  * Reinforcement Learning Training & Evaluation Manager
  * Controls the episode training loop, reward computation, 100-episode statistics tracking, and HUD.
  */
@@ -7719,6 +7988,7 @@ class RLTrainingManager {
 
     const dest = env.destination || { x: 1650, y: 560 };
     this.prevDistanceToGoal = Math.hypot(dest.x - ego.x, dest.y - ego.y);
+    this.egoAgent = new RLVehicleAgent(ego, dest);
   }
 
   update(dt) {
@@ -7726,49 +7996,40 @@ class RLTrainingManager {
 
     const ego = this.engine.getEgoVehicle();
     const env = window.EnvironmentData;
-    const routePlanner = this.engine.getRoutePlanner();
     if (!ego || !env) return;
 
-    // 1. Advance dynamic pedestrians, animals, and road vehicles (via shared PPO policy if active)
+    if (!this.egoAgent) {
+      const dest = env.destination || { x: 1650, y: 560 };
+      this.egoAgent = new RLVehicleAgent(ego, dest);
+    }
+
+    // 1. Advance dynamic pedestrians, animals, and road vehicles (via shared PPO policy and RLVehicleAgent)
     const isTraining = this.isTraining();
     if (this.engine.trafficManager && this.engine.trafficManager.isEnabled) {
       this.engine.trafficManager.update(dt, ego, env, this.agent, isTraining);
     }
 
     // 2. Update perception system
+    const dynEntities = this.engine.trafficManager && this.engine.trafficManager.isEnabled ? this.engine.trafficManager.getEntities() : [];
     if (this.engine.detectionManager) {
-      this.engine.detectionManager.update(
-        ego,
-        env,
-        this.engine.trafficManager && this.engine.trafficManager.isEnabled ? this.engine.trafficManager.getEntities() : [],
-        dt
-      );
+      this.engine.detectionManager.update(ego, env, dynEntities, dt);
     }
 
-    // 3. Control-State Observations
-    const currentCrossTrack = (ego.y - 560) / 95;
-    const crossTrackRate = (currentCrossTrack - this.prevCrossTrack) / Math.max(0.001, dt);
-    const lastSteerChange = this.lastAction[0] - this.prevSteerAction;
-
-    const dynEntities = this.engine.trafficManager && this.engine.trafficManager.isEnabled ? this.engine.trafficManager.getEntities() : [];
-    const obs = this.agent.getObservation(ego, env, routePlanner, dynEntities, this.lastAction, lastSteerChange, crossTrackRate);
-    
-    // Select action: Gaussian sampling in training, deterministic policy inference in evaluation
-    const actData = this.agent.selectAction(obs, isTraining);
-    this.lastAction = actData.action;
-
-    // Apply continuous PPO actions directly to EgoVehicle physics inputs
-    ego.inputs.steer = actData.action[0];
-    ego.inputs.throttle = actData.action[1];
-    ego.inputs.brake = actData.action[2];
-    ego.inputs.handbrake = false;
-
-    // Advance vehicle physics
-    ego.update(dt);
+    // 3. Ego Vehicle Control via RLVehicleAgent & Shared PPO Policy
+    const prevSteer = this.lastAction[0];
+    const stepResult = this.egoAgent.step(this.agent, env, dynEntities, dt, isTraining);
+    const actData = stepResult ? stepResult.actionData : { action: [0, 0, 0] };
+    this.lastAction = this.egoAgent.lastAction;
     this.currentStep++;
 
+    // 4. Physical Vehicle-to-Vehicle Collision Resolution across all vehicles
+    const roadVehicles = dynEntities.filter(e => e.active && (e.type === 'car' || e.type === 'motorcycle' || e.type === 'auto_rickshaw'));
+    if (typeof VehicleCollisionSystem !== 'undefined') {
+      VehicleCollisionSystem.resolveVehicleCollisions([ego, ...roadVehicles]);
+    }
+
     // Track step smoothness metrics
-    const steerDelta = Math.abs(actData.action[0] - this.prevSteerAction);
+    const steerDelta = Math.abs(actData.action[0] - prevSteer);
     const latError = Math.abs(ego.y - 560);
     this.currentEpAbsSteerSum += Math.abs(actData.action[0]);
     this.currentEpSteerChangeSum += steerDelta;
@@ -7805,6 +8066,7 @@ class RLTrainingManager {
     reward -= 0.03 * (actData.action[0] * actData.action[0]);
 
     // Lateral divergence penalty: If lateral error is increasing away from centerline
+    const currentCrossTrack = this.prevCrossTrack || 0;
     const newCrossTrack = (ego.y - 560) / 95;
     const newCrossTrackRate = (newCrossTrack - currentCrossTrack) / Math.max(0.001, dt);
     if (newCrossTrack * newCrossTrackRate > 0) {
@@ -9062,6 +9324,7 @@ window.TrafficManager = TrafficManager;
 window.DetectionManager = DetectionManager;
 window.PathPlanner = PathPlanner;
 window.StaticCollisionSystem = StaticCollisionSystem;
+window.VehicleCollisionSystem = VehicleCollisionSystem;
 window.DecisionManager = DecisionManager;
 window.AutonomousVehicleController = AutonomousVehicleController;
 window.RoadNetworkSystem = RoadNetworkSystem;
@@ -9074,6 +9337,7 @@ window.MLPNet = MLPNet;
 window.EgoPPOAgent = EgoPPOAgent;
 window.EgoRLAgent = EgoRLAgent;
 window.SharedPPOPolicy = SharedPPOPolicy;
+window.RLVehicleAgent = RLVehicleAgent;
 window.RLTrainingManager = RLTrainingManager;
 
 // Global Direct Accessors
