@@ -1053,7 +1053,7 @@ class GlobalRoutePlanner {
   constructor(roadNetwork) {
     this.network = roadNetwork || (typeof RoadNetworkSystem !== 'undefined' ? RoadNetworkSystem : null);
     this.currentRoute = null;
-    this.showDebug = true; // Enabled by default to visibly lead to destination
+    this.blockedLocations = [];
     this.replanThreshold = 50; // Replan if ego drifts > 50px from route polyline
     this.lastEgoPos = { x: 0, y: 0 };
     this.activeWaypointIndex = 0;
@@ -1062,6 +1062,81 @@ class GlobalRoutePlanner {
     if (this.network && typeof EnvironmentData !== 'undefined' && EnvironmentData.destination) {
       this.planRoute({ x: 140, y: 580, heading: 0 }, EnvironmentData.destination);
     }
+  }
+
+  /**
+   * Mark a temporary/persistent failed route location to force alternate routing
+   */
+  markBlockedLocation(x, y, radius = 45, durationMs = 15000) {
+    if (!this.blockedLocations) this.blockedLocations = [];
+    this.blockedLocations.push({
+      x,
+      y,
+      radius,
+      expiry: Date.now() + durationMs
+    });
+  }
+
+  /**
+   * Smooth corner transitions with C1 Bezier fillets for progressive curve steering
+   */
+  smoothCornerWaypoints(rawWps) {
+    if (!rawWps || rawWps.length < 3) return rawWps;
+    const smoothed = [rawWps[0]];
+
+    for (let i = 1; i < rawWps.length - 1; i++) {
+      const prev = rawWps[i - 1];
+      const curr = rawWps[i];
+      const next = rawWps[i + 1];
+
+      const d1x = curr.x - prev.x;
+      const d1y = curr.y - prev.y;
+      const len1 = Math.hypot(d1x, d1y);
+
+      const d2x = next.x - curr.x;
+      const d2y = next.y - curr.y;
+      const len2 = Math.hypot(d2x, d2y);
+
+      if (len1 < 10 || len2 < 10) {
+        smoothed.push(curr);
+        continue;
+      }
+
+      const h1 = Math.atan2(d1y, d1x);
+      const h2 = Math.atan2(d2y, d2x);
+      let diff = Math.abs(h2 - h1);
+      while (diff > Math.PI) diff -= Math.PI * 2;
+      diff = Math.abs(diff);
+
+      if (diff > 0.18) {
+        // Corner fillet smoothing
+        const filletDist = Math.min(32, len1 * 0.35, len2 * 0.35);
+        const startX = curr.x - (d1x / len1) * filletDist;
+        const startY = curr.y - (d1y / len1) * filletDist;
+        const endX = curr.x + (d2x / len2) * filletDist;
+        const endY = curr.y + (d2y / len2) * filletDist;
+
+        for (let t = 0.25; t <= 0.75; t += 0.25) {
+          const u = 1 - t;
+          const bx = u * u * startX + 2 * u * t * curr.x + t * t * endX;
+          const by = u * u * startY + 2 * u * t * curr.y + t * t * endY;
+          smoothed.push({
+            x: bx,
+            y: by,
+            road: curr.road,
+            lane: curr.lane,
+            heading: Math.atan2(endY - startY, endX - startX),
+            speedLimit: curr.speedLimit,
+            nodeId: curr.nodeId
+          });
+        }
+      } else {
+        smoothed.push(curr);
+      }
+    }
+
+    smoothed.push(rawWps[rawWps.length - 1]);
+    return smoothed;
   }
 
   /**
@@ -1196,6 +1271,21 @@ class GlobalRoutePlanner {
           }
         }
 
+        // Check persistent/temporary blocked locations from recovery system
+        if (this.blockedLocations && this.blockedLocations.length > 0) {
+          const now = Date.now();
+          for (const b of this.blockedLocations) {
+            if (b.expiry > now) {
+              const dNode = Math.hypot(neighbor.x - b.x, neighbor.y - b.y);
+              const dMid = Math.hypot(((currentNode.x + neighbor.x) / 2) - b.x, ((currentNode.y + neighbor.y) / 2) - b.y);
+              if (dNode < (b.radius || 45) || dMid < (b.radius || 45)) {
+                edgeCost += 5000;
+                break;
+              }
+            }
+          }
+        }
+
         // Preference weighting:
         // - Main flow lanes preferred over lateral transitions
         if (edge.lane === 'transition') {
@@ -1240,11 +1330,11 @@ class GlobalRoutePlanner {
     }
 
     // 4. Generate Ordered Waypoint Sequence
-    const waypoints = [];
+    const rawWaypoints = [];
     let totalDist = 0;
 
     // Add start position as initial waypoint
-    waypoints.push({
+    rawWaypoints.push({
       x: startPos.x,
       y: startPos.y,
       road: startNode.road,
@@ -1256,7 +1346,7 @@ class GlobalRoutePlanner {
 
     for (let i = 0; i < pathNodes.length; i++) {
       const node = pathNodes[i];
-      waypoints.push({
+      rawWaypoints.push({
         x: node.x,
         y: node.y,
         road: node.road,
@@ -1272,7 +1362,7 @@ class GlobalRoutePlanner {
     }
 
     // Add final destination marker waypoint
-    waypoints.push({
+    rawWaypoints.push({
       x: destPos.x,
       y: destPos.y,
       road: goalNode.road,
@@ -1283,11 +1373,15 @@ class GlobalRoutePlanner {
     });
     totalDist += Math.hypot(destPos.x - goalNode.x, destPos.y - goalNode.y);
 
+    // Apply C1 Bezier corner fillet smoothing to eliminate sharp waypoint corners
+    const waypoints = this.smoothCornerWaypoints(rawWaypoints);
+
     const route = {
       startNode,
       goalNode,
       nodes: pathNodes,
       segments: pathEdges,
+      rawWaypoints,
       waypoints,
       totalDistance: totalDist,
       estimatedTime: totalDist / 85, // Estimated seconds at average cruising speed
@@ -6417,15 +6511,23 @@ class AutonomousVehicleController {
   constructor(options = {}) {
     this.isAutonomous = false;
     this.controlState = 'MANUAL'; // 'MANUAL', 'CRUISING', 'AVOIDING', 'BRAKING', 'STOPPED', 'WAITING', 'YIELDING', 'REVERSING', 'REPLANNING', 'ARRIVED'
+    this.recoveryState = 'FOLLOW_ROUTE'; // 'FOLLOW_ROUTE', 'BLOCKED', 'RECOVERY', 'REPLAN'
     this.targetSpeed = 0;
     this.targetHeading = 0;
     this.hasArrived = false;
     this.arrivalDistance = 45; // px
 
-    // Stuck Detection State
+    // Persistent Stuck Detection & Recovery State Machine
     this.stuckTimer = 0;
     this.lastStuckCheckPos = { x: 0, y: 0 };
     this.isStuck = false;
+    this.lastProgressTime = Date.now();
+    this.lastMinDistRemaining = null;
+    this.recoveryAttempts = 0;
+    this.maxRecoveryAttempts = 3;
+    this.lastFailedLocation = null;
+    this.failedLocations = [];
+    this.recoveryTimer = 0;
 
     // Actuation parameters
     this.config = {
@@ -6435,7 +6537,7 @@ class AutonomousVehicleController {
       reverseSpeed: -26,        // px/s (controlled backward speed)
       lookaheadWaypointIdx: 3,  // Lookahead point index along 18-point trajectory spline (~30-40px)
       steerGain: 2.2,           // Proportional lateral tracking gain
-      steerRateLimit: 8.0,      // rad/s (smooth steering rate limit)
+      steerRateLimit: 6.5,      // rad/s (smooth steering rate limit)
       speedDecelGain: 20,       // Longitudinal braking sensitivity
       speedAccelGain: 25,       // Longitudinal throttle sensitivity
       rearSafetyBuffer: 60      // px safety buffer required for reversing
@@ -6452,6 +6554,10 @@ class AutonomousVehicleController {
     this.isAutonomous = (forceState !== undefined) ? forceState : !this.isAutonomous;
     this.stuckTimer = 0;
     this.isStuck = false;
+    this.recoveryState = 'FOLLOW_ROUTE';
+    this.recoveryAttempts = 0;
+    this.lastProgressTime = Date.now();
+    this.lastMinDistRemaining = null;
     
     if (!this.isAutonomous) {
       this.controlState = 'MANUAL';
@@ -6497,9 +6603,43 @@ class AutonomousVehicleController {
     const egoHeading = egoVehicle.heading;
     const currentSpeed = egoVehicle.speed || 0;
 
-    // Track Stuck / Deadlock Status:
-    // 1. Ego commanded to move (targetSpeed > 15) but stationary (< 3.5px displacement)
-    // 2. Ego trapped in WAITING / STOPPED state for > 2.5s
+    // 2. Check Global Route Navigation & Dynamic Speed-Scheduled Lookahead
+    const destX = destination ? destination.x : 1650;
+    const destY = destination ? destination.y : 560;
+    const distToGoal = Math.hypot(destX - egoX, destY - egoY);
+
+    // Speed-Scheduled Lookahead Distance: 45px at low speed up to 90px at cruising speed
+    const dynamicLookahead = Math.max(45, Math.min(90, 0.65 * Math.abs(currentSpeed) + 45));
+    let nav = null;
+    if (typeof GlobalRouteSystem !== 'undefined') {
+      nav = GlobalRouteSystem.getNavigationTarget(egoVehicle, dynamicLookahead);
+    }
+
+    // Destination Arrival Check
+    if (distToGoal <= this.arrivalDistance || (nav && nav.navState === 'ARRIVED') || this.hasArrived) {
+      this.hasArrived = true;
+      this.controlState = 'ARRIVED';
+      this.recoveryState = 'FOLLOW_ROUTE';
+      this.targetSpeed = 0;
+      egoVehicle.inputs.throttle = 0;
+      egoVehicle.inputs.brake = 1.0;
+      egoVehicle.inputs.steer = 0;
+      egoVehicle.inputs.handbrake = (Math.abs(currentSpeed) < 1.0);
+      return;
+    }
+
+    // 3. Persistent Route Progress & Stuck Detection
+    if (nav && nav.distanceRemainingAlongRoute !== undefined) {
+      if (this.lastMinDistRemaining === null || nav.distanceRemainingAlongRoute < this.lastMinDistRemaining - 2.5) {
+        this.lastMinDistRemaining = nav.distanceRemainingAlongRoute;
+        this.lastProgressTime = Date.now();
+        this.stuckTimer = 0;
+        if (this.recoveryState === 'FOLLOW_ROUTE') {
+          this.recoveryAttempts = 0;
+        }
+      }
+    }
+
     const isTrapped = (this.controlState === 'WAITING' || this.controlState === 'STOPPED') && !this.hasArrived;
     const isCommandingMove = (this.targetSpeed > 15 && this.controlState !== 'ARRIVED');
     const isStationary = Math.abs(currentSpeed) < 8.0 && Math.hypot(egoX - this.lastStuckCheckPos.x, egoY - this.lastStuckCheckPos.y) < 3.5;
@@ -6510,37 +6650,93 @@ class AutonomousVehicleController {
       this.stuckTimer = 0;
       this.lastStuckCheckPos = { x: egoX, y: egoY };
     }
-    this.isStuck = (this.stuckTimer >= 2.5);
 
-    // 2. Check Global Route Navigation & Destination Arrival
-    const destX = destination ? destination.x : 1650;
-    const destY = destination ? destination.y : 560;
-    const distToGoal = Math.hypot(destX - egoX, destY - egoY);
+    const isTimedOut = (Date.now() - this.lastProgressTime > 2200);
+    this.isStuck = (this.stuckTimer >= 2.2 || (isTimedOut && isCommandingMove));
 
-    // Dynamic Lookahead Distance (scales smoothly with vehicle speed: 40px at standstill up to 85px at cruising speed)
-    const dynamicLookahead = Math.max(40, Math.min(85, 0.6 * Math.abs(currentSpeed) + 40));
-    let nav = null;
-    if (typeof GlobalRouteSystem !== 'undefined') {
-      nav = GlobalRouteSystem.getNavigationTarget(egoVehicle, dynamicLookahead);
+    // 4. Recovery State Machine Transitions
+    if (this.isStuck && this.recoveryState === 'FOLLOW_ROUTE') {
+      this.recoveryState = 'BLOCKED';
     }
 
-    if (distToGoal <= this.arrivalDistance || (nav && nav.navState === 'ARRIVED') || this.hasArrived) {
-      this.hasArrived = true;
-      this.controlState = 'ARRIVED';
-      this.targetSpeed = 0;
-      egoVehicle.inputs.throttle = 0;
-      egoVehicle.inputs.brake = 1.0;
-      egoVehicle.inputs.steer = 0;
-      egoVehicle.inputs.handbrake = (Math.abs(currentSpeed) < 1.0);
+    if (this.recoveryState === 'BLOCKED') {
+      // Record failed location
+      const failedSpot = { x: egoX, y: egoY, time: Date.now() };
+      this.lastFailedLocation = failedSpot;
+
+      // Count repeated failures at same location
+      let recentFails = 1;
+      for (const f of this.failedLocations) {
+        if (Math.hypot(egoX - f.x, egoY - f.y) < 40 && (Date.now() - f.time < 30000)) {
+          recentFails++;
+        }
+      }
+      this.failedLocations.push(failedSpot);
+
+      if (recentFails >= 2 && typeof GlobalRouteSystem !== 'undefined') {
+        // Mark location as blocked in GlobalRouteSystem to force alternate route
+        GlobalRouteSystem.markBlockedLocation(egoX, egoY, 45, 20000);
+      }
+
+      const rearSafe = this.checkRearSafety(egoVehicle, perceptionData, trafficManager);
+      if (rearSafe && this.recoveryAttempts < this.maxRecoveryAttempts) {
+        this.recoveryState = 'RECOVERY';
+        this.recoveryTimer = 0;
+        this.recoveryAttempts++;
+      } else {
+        // Rear blocked or exceeded max attempts -> safe wait
+        this.controlState = 'WAITING';
+        this.targetSpeed = 0;
+        egoVehicle.inputs.throttle = 0;
+        egoVehicle.inputs.brake = 1.0;
+        egoVehicle.inputs.steer = 0;
+        return;
+      }
+    }
+
+    if (this.recoveryState === 'RECOVERY') {
+      this.controlState = 'REVERSING';
+      this.targetSpeed = this.config.reverseSpeed; // -26 px/s
+      egoVehicle.inputs.throttle = -0.65;
+      egoVehicle.inputs.brake = 0;
+
+      // Active reverse steering with reverse kinematics
+      let revTargetHeading = (nav && nav.targetHeading !== undefined) ? nav.targetHeading : 0;
+      let revHeadingDiff = egoHeading - revTargetHeading;
+      while (revHeadingDiff > Math.PI) revHeadingDiff -= Math.PI * 2;
+      while (revHeadingDiff < -Math.PI) revHeadingDiff += Math.PI * 2;
+
+      const cte = (nav && nav.crossTrackError !== undefined) ? nav.crossTrackError : 0;
+      // In reverse: positive heading error (pointed right/down) -> steer right (+delta) to rotate CCW back to road
+      const revSteerCmd = Math.max(-0.85, Math.min(0.85, 1.35 * revHeadingDiff + 0.015 * cte));
+      egoVehicle.inputs.steer += (revSteerCmd - egoVehicle.inputs.steer) * 8.0 * dt;
+
+      this.recoveryTimer += dt;
+      const dRev = this.lastFailedLocation ? Math.hypot(egoX - this.lastFailedLocation.x, egoY - this.lastFailedLocation.y) : 50;
+
+      if (dRev >= 45 || this.recoveryTimer >= 2.0) {
+        this.recoveryState = 'REPLAN';
+      }
       return;
     }
 
-    // 3. Extract Decision and Trajectory
+    if (this.recoveryState === 'REPLAN') {
+      this.controlState = 'REPLANNING';
+      if (typeof GlobalRouteSystem !== 'undefined') {
+        GlobalRouteSystem.planRoute(egoVehicle, destination);
+      }
+      this.recoveryState = 'FOLLOW_ROUTE';
+      this.lastProgressTime = Date.now();
+      this.lastMinDistRemaining = null;
+      this.stuckTimer = 0;
+      this.isStuck = false;
+    }
+
+    // 5. Normal Safety Decision & Path Planning Integration
     const decision = decisionData ? decisionData.decision : 'GO';
     const selectedPath = pathPlannerData ? pathPlannerData.selectedPath : null;
     const plannerState = pathPlannerData ? pathPlannerData.plannerState : 'OPTIMAL';
 
-    // 4. Execute Safety Priority Mapping: Decision -> Target Speed & Control State
     switch (decision) {
       case 'STOP':
         this.controlState = 'STOPPED';
@@ -6566,36 +6762,23 @@ class AutonomousVehicleController {
         return;
 
       case 'REVERSE': {
-        // Verify rear safety buffer in real-time before reversing
         const rearSafe = this.checkRearSafety(egoVehicle, perceptionData, trafficManager);
         if (rearSafe) {
           this.controlState = 'REVERSING';
-          this.targetSpeed = this.config.reverseSpeed; // -26 px/s
+          this.targetSpeed = this.config.reverseSpeed;
           egoVehicle.inputs.throttle = -0.65;
           egoVehicle.inputs.brake = 0;
 
-          // Reverse steering: calculate steering to rotate heading back towards road and clear front obstacle
           let revTargetHeading = (nav && nav.targetHeading !== undefined) ? nav.targetHeading : 0;
           let revHeadingDiff = egoHeading - revTargetHeading;
           while (revHeadingDiff > Math.PI) revHeadingDiff -= Math.PI * 2;
           while (revHeadingDiff < -Math.PI) revHeadingDiff += Math.PI * 2;
 
-          // Cross-track error compensation in reverse
           const cte = (nav && nav.crossTrackError !== undefined) ? nav.crossTrackError : 0;
-          // In reverse: positive heading error (pointed right/down) -> steer right (+delta) to rotate CCW back to road
           const revSteerCmd = Math.max(-0.85, Math.min(0.85, 1.35 * revHeadingDiff + 0.015 * cte));
           egoVehicle.inputs.steer += (revSteerCmd - egoVehicle.inputs.steer) * 8.0 * dt;
-
-          this.reverseTimer = (this.reverseTimer || 0) + dt;
-          if (this.reverseTimer >= 1.5) {
-            this.reverseTimer = 0;
-            this.stuckTimer = 0;
-            this.isStuck = false;
-            this.controlState = 'REPLANNING';
-          }
           return;
         } else {
-          // If rear occupied, fallback to WAITING
           this.controlState = 'WAITING';
           this.targetSpeed = 0;
           egoVehicle.inputs.throttle = 0;
@@ -6616,9 +6799,8 @@ class AutonomousVehicleController {
           const lead = decisionData.leadVehicle;
           const leadSpeed = (lead.speed !== undefined) ? lead.speed : this.config.cautionSpeed;
           const leadDist = lead.distance || Math.hypot(lead.x - egoX, lead.y - egoY);
-          const desiredHeadway = Math.max(45, 1.8 * Math.abs(currentSpeed)); // 1.8s safe headway
+          const desiredHeadway = Math.max(45, 1.8 * Math.abs(currentSpeed));
           const gapError = leadDist - desiredHeadway;
-          // Smoothly regulate speed to match lead vehicle while maintaining desired gap
           this.targetSpeed = Math.max(0, Math.min(this.config.cruiseSpeed, leadSpeed + 0.65 * gapError));
         } else {
           this.targetSpeed = this.config.cautionSpeed;
@@ -6632,33 +6814,30 @@ class AutonomousVehicleController {
           const leadSpeed = (lead.speed !== undefined) ? lead.speed : 20;
           this.targetSpeed = Math.max(15, Math.min(this.config.cautionSpeed, leadSpeed - 5));
         } else {
-          this.targetSpeed = this.config.cautionSpeed; // 42 px/s
+          this.targetSpeed = this.config.cautionSpeed;
         }
         break;
 
       case 'GO':
       default:
         this.controlState = 'CRUISING';
-        this.targetSpeed = this.config.cruiseSpeed; // 95 px/s
+        this.targetSpeed = this.config.cruiseSpeed;
         break;
     }
 
     // Adaptive Speed Regulation for Curves, Turns, Intersections & Approaching Destination
     if (nav && nav.hasRoute) {
       if (nav.navState === 'ARRIVING') {
-        // Progressive smooth deceleration when approaching destination
         const arrivalRatio = Math.max(0.15, Math.min(1.0, nav.distanceToGoal / 140));
         this.targetSpeed = Math.min(this.targetSpeed, Math.max(22, this.config.cruiseSpeed * arrivalRatio));
       } else if (nav.isTurn) {
-        // Reduce speed on curves / T-junction turns to maintain stable tracking
         this.targetSpeed = Math.min(this.targetSpeed, 40);
       }
     }
 
-    // 5. Lateral Route Following & Path Tracking (Pure Pursuit + Alignment Damping + Straightening)
+    // 6. Lateral Route Following & Path Tracking (Pure Pursuit + Alignment Damping + Straightening)
     let desiredSteerAngle = 0;
 
-    // Prevent steering oscillation when waiting, stopped, or stuck
     if (this.controlState === 'WAITING' || this.controlState === 'STOPPED' || this.isStuck) {
       desiredSteerAngle = 0;
       egoVehicle.inputs.steer = 0;
@@ -6676,6 +6855,7 @@ class AutonomousVehicleController {
     } else if (nav && nav.hasRoute && nav.targetLookahead) {
       // Global Route Waypoint Pure Pursuit with Segment Alignment Damping
       const targetWp = nav.targetLookahead;
+      const targetDist = Math.hypot(targetWp.x - egoX, targetWp.y - egoY) || dynamicLookahead;
       const targetHeading = Math.atan2(targetWp.y - egoY, targetWp.x - egoX);
       let lookaheadHeadingError = targetHeading - egoHeading;
       while (lookaheadHeadingError > Math.PI) lookaheadHeadingError -= Math.PI * 2;
@@ -6686,14 +6866,14 @@ class AutonomousVehicleController {
       while (routeAlignError > Math.PI) routeAlignError -= Math.PI * 2;
       while (routeAlignError < -Math.PI) routeAlignError += Math.PI * 2;
 
-      // Pure pursuit delta = atan2(2 * L * sin(alpha), lookaheadDist)
+      // Geometric Curvature from Kinematic Bicycle Model: delta = atan2(2 * L * sin(alpha), targetDist)
       const L = egoVehicle.wheelbase || 26;
-      const delta = Math.atan2(2 * L * Math.sin(lookaheadHeadingError), dynamicLookahead);
+      const delta = Math.atan2(2 * L * Math.sin(lookaheadHeadingError), targetDist);
       let targetSteer = 0.85 * (delta / (egoVehicle.maxSteeringAngle || 0.55)) + 0.15 * (routeAlignError / (egoVehicle.maxSteeringAngle || 0.55));
 
-      // Straightening Deadband: when closely aligned to route, center the steering to eliminate snake-like micro-oscillations
+      // Straightening Deadband: when closely aligned to route, center steering to eliminate snake-like oscillations
       if (Math.abs(lookaheadHeadingError) < 0.035 && Math.abs(routeAlignError) < 0.035 && Math.abs(nav.crossTrackError) < 3.5) {
-        targetSteer = 0.25 * (routeAlignError / (egoVehicle.maxSteeringAngle || 0.55));
+        targetSteer = 0.20 * (routeAlignError / (egoVehicle.maxSteeringAngle || 0.55));
       }
 
       desiredSteerAngle = Math.max(-0.85, Math.min(0.85, targetSteer));
@@ -6703,7 +6883,6 @@ class AutonomousVehicleController {
         this.targetSpeed = Math.min(this.targetSpeed, this.config.cautionSpeed);
       }
     } else {
-      // Direct waypoint heading to destination fallback
       const directHeading = Math.atan2(destY - egoY, destX - egoX);
       let headingError = directHeading - egoHeading;
       while (headingError > Math.PI) headingError -= Math.PI * 2;
@@ -6711,45 +6890,14 @@ class AutonomousVehicleController {
       desiredSteerAngle = Math.max(-1.0, Math.min(1.0, headingError * 1.5));
     }
 
-    // Obstacle Clearance Lateral Guard: only active during local avoidance maneuvers
-    if (plannerState === 'AVOIDANCE' && perceptionData && Array.isArray(perceptionData.detectedObjects) && this.controlState !== 'WAITING' && this.controlState !== 'STOPPED') {
-      for (const obs of perceptionData.detectedObjects) {
-        if (obs.type === 'pothole') continue;
-        const dx = obs.x - egoX;
-        const dy = obs.y - egoY;
-        const longDist = dx * Math.cos(egoHeading) + dy * Math.sin(egoHeading);
-        const latDist = Math.abs(dy * Math.cos(egoHeading) - dx * Math.sin(egoHeading));
-
-        if (longDist > -25 && longDist < 140 && latDist < 80) {
-          const toObsY = obs.y - egoY;
-          if (toObsY < 0) {
-            // Obstacle is to the left: prevent steering left past parallel (0 rad)
-            if (egoHeading < 0) {
-              desiredSteerAngle = Math.max(-egoHeading * 1.5, desiredSteerAngle);
-            } else {
-              desiredSteerAngle = Math.max(-egoHeading * 1.2, desiredSteerAngle);
-            }
-          } else if (toObsY > 0) {
-            // Obstacle is to the right: prevent steering right past parallel (0 rad)
-            if (egoHeading > 0) {
-              desiredSteerAngle = Math.min(-egoHeading * 1.5, desiredSteerAngle);
-            } else {
-              desiredSteerAngle = Math.min(-egoHeading * 1.2, desiredSteerAngle);
-            }
-          }
-          break;
-        }
-      }
-    }
-
-    // Smooth steering rate transition (anti-oscillation low-pass filter)
+    // Smooth gradual steering rate transition (anti-oscillation low-pass filter)
     if (this.controlState !== 'WAITING' && this.controlState !== 'STOPPED' && !this.isStuck) {
-      const steerRate = 7.0;
+      const steerRate = this.config.steerRateLimit || 6.5;
       egoVehicle.inputs.steer += (desiredSteerAngle - egoVehicle.inputs.steer) * steerRate * dt;
       egoVehicle.inputs.steer = Math.max(-1.0, Math.min(1.0, egoVehicle.inputs.steer));
     }
 
-    // 6. Longitudinal Speed Control (Throttle & Progressive Braking)
+    // 7. Longitudinal Speed Control (Throttle & Progressive Braking)
     if (currentSpeed < this.targetSpeed) {
       const speedDiff = this.targetSpeed - currentSpeed;
       egoVehicle.inputs.throttle = Math.min(1.0, Math.max(0.15, speedDiff / this.config.speedAccelGain));
@@ -6761,7 +6909,6 @@ class AutonomousVehicleController {
       egoVehicle.inputs.brake = Math.min(1.0, excessSpeed / this.config.speedDecelGain);
       egoVehicle.inputs.handbrake = false;
     } else {
-      // Maintain speed / coast
       egoVehicle.inputs.throttle = 0.1;
       egoVehicle.inputs.brake = 0;
       egoVehicle.inputs.handbrake = false;
