@@ -1587,7 +1587,989 @@ class EgoVehicle {
 }
 
 /* ============================================================================
-   6. SIMULATION CORE APPLICATION CONTROLLER & GAME LOOP
+   6. MODULE 3: DYNAMIC OBJECT & TRAFFIC SYSTEM
+   ============================================================================ */
+
+/**
+ * Reusable Dynamic Entity Representation for simulation world
+ * Types: 'car', 'motorcycle', 'auto_rickshaw', 'pedestrian', 'animal'
+ */
+class DynamicObject {
+  constructor(config = {}) {
+    this.id = config.id || `dyn-${Math.random().toString(36).substr(2, 6)}`;
+    this.type = config.type || 'car';
+    this.subType = config.subType || 'default';
+    this.name = config.name || `${this.type}_${this.id}`;
+
+    // World Space Coordinates
+    this.x = config.x || 0;
+    this.y = config.y || 0;
+    this.heading = config.heading !== undefined ? config.heading : 0; // Radians
+    this.speed = config.speed !== undefined ? config.speed : 60;       // px/s
+    this.baseSpeed = this.speed;
+
+    // Dimensions
+    this.length = config.length || 44;
+    this.width = config.width || 22;
+    this.radius = config.radius || 8; // For circular / pedestrian bounds
+
+    // Visual Palette
+    this.color = config.color || '#dc2626';
+    this.accentColor = config.accentColor || '#1e293b';
+
+    // Route / Waypoint / Path config
+    this.route = config.route || {
+      road: 'main',
+      laneY: this.y,
+      minX: -80,
+      maxX: 1880,
+      minY: -80,
+      maxY: 1080
+    };
+
+    // State and Controlled Randomness
+    this.behavior = config.behavior || 'CRUISING'; // 'CRUISING', 'CROSSING', 'WANDERING', 'PAUSED'
+    this.stateTimer = Math.random() * 3 + 2;        // Countdown to next random behavior shift
+    this.pauseTimer = 0;
+    this.swayPhase = Math.random() * Math.PI * 2;
+    this.lateralOffset = 0;
+    this.targetLateralOffset = 0;
+    this.crossingDirection = config.crossingDirection || 1; // +1 down, -1 up
+    this.active = true;
+  }
+
+  /**
+   * Update kinematics and controlled randomness
+   * @param {number} dt - Delta time in seconds
+   */
+  update(dt) {
+    if (!this.active) return;
+    if (dt <= 0 || dt > 0.1) dt = 0.016;
+
+    this.swayPhase += 6.0 * dt;
+    if (this.swayPhase > Math.PI * 2) this.swayPhase -= Math.PI * 2;
+
+    this.stateTimer -= dt;
+
+    switch (this.type) {
+      case 'car':
+        this.updateCar(dt);
+        break;
+      case 'motorcycle':
+        this.updateMotorcycle(dt);
+        break;
+      case 'auto_rickshaw':
+        this.updateAutoRickshaw(dt);
+        break;
+      case 'pedestrian':
+        this.updatePedestrian(dt);
+        break;
+      case 'animal':
+        this.updateAnimal(dt);
+        break;
+      default:
+        this.updateGeneric(dt);
+        break;
+    }
+  }
+
+  // --- Dynamic Behaviors & Controlled Randomness ---
+
+  updateCar(dt) {
+    // Controlled randomness: subtle speed fluctuation and lateral drift
+    if (this.stateTimer <= 0) {
+      this.stateTimer = Math.random() * 4 + 3;
+      this.speed = this.baseSpeed + (Math.random() * 18 - 9);
+      this.targetLateralOffset = (Math.random() * 16 - 8);
+    }
+
+    // Smooth lateral ease
+    this.lateralOffset += (this.targetLateralOffset - this.lateralOffset) * 1.5 * dt;
+
+    if (this.route.road === 'main') {
+      this.x += this.speed * Math.cos(this.heading) * dt;
+      const nominalY = this.route.laneY || 560;
+      this.y = nominalY + this.lateralOffset;
+
+      // Wrap around world edges
+      if (this.heading === 0 && this.x > this.route.maxX) {
+        this.x = this.route.minX;
+        this.y = (this.route.laneY || 595) + (Math.random() * 14 - 7);
+      } else if (Math.abs(this.heading - Math.PI) < 0.1 && this.x < this.route.minX) {
+        this.x = this.route.maxX;
+        this.y = (this.route.laneY || 525) + (Math.random() * 14 - 7);
+      }
+    } else if (this.route.road === 'side') {
+      this.y += this.speed * Math.sin(this.heading) * dt;
+      const nominalX = this.route.laneX || 895;
+      this.x = nominalX + this.lateralOffset;
+
+      if (this.y > (this.route.maxY || 470)) {
+        this.y = this.route.minY || -60;
+      }
+    }
+  }
+
+  updateMotorcycle(dt) {
+    // Motorcycles: Fast, slight weaving/swerving between lanes
+    if (this.stateTimer <= 0) {
+      this.stateTimer = Math.random() * 2.5 + 1.5;
+      this.speed = this.baseSpeed + (Math.random() * 26 - 13);
+      this.targetLateralOffset = (Math.random() * 22 - 11);
+    }
+
+    this.lateralOffset += (this.targetLateralOffset - this.lateralOffset) * 2.5 * dt;
+
+    if (this.route.road === 'main') {
+      this.x += this.speed * Math.cos(this.heading) * dt;
+      const nominalY = this.route.laneY || 570;
+      this.y = nominalY + this.lateralOffset + Math.sin(this.swayPhase * 0.6) * 2.0;
+
+      if (this.heading === 0 && this.x > this.route.maxX) {
+        this.x = this.route.minX;
+      } else if (Math.abs(this.heading - Math.PI) < 0.1 && this.x < this.route.minX) {
+        this.x = this.route.maxX;
+      }
+    } else if (this.route.road === 'side') {
+      this.y += this.speed * Math.sin(this.heading) * dt;
+      const nominalX = this.route.laneX || 940;
+      this.x = nominalX + this.lateralOffset;
+
+      if (this.y > (this.route.maxY || 470)) {
+        this.y = this.route.minY || -60;
+      }
+    }
+  }
+
+  updateAutoRickshaw(dt) {
+    // Auto-rickshaws: Moderate speed, occasional drift towards shoulder
+    if (this.stateTimer <= 0) {
+      this.stateTimer = Math.random() * 3.5 + 2.5;
+      this.speed = this.baseSpeed + (Math.random() * 12 - 6);
+      this.targetLateralOffset = (Math.random() * 16 - 8);
+    }
+
+    this.lateralOffset += (this.targetLateralOffset - this.lateralOffset) * 1.8 * dt;
+
+    if (this.route.road === 'main') {
+      this.x += this.speed * Math.cos(this.heading) * dt;
+      const nominalY = this.route.laneY || 610;
+      this.y = nominalY + this.lateralOffset;
+
+      if (this.heading === 0 && this.x > this.route.maxX) {
+        this.x = this.route.minX;
+      } else if (Math.abs(this.heading - Math.PI) < 0.1 && this.x < this.route.minX) {
+        this.x = this.route.maxX;
+      }
+    } else if (this.route.road === 'side') {
+      this.y += this.speed * Math.sin(this.heading) * dt;
+      const nominalX = this.route.laneX || 955;
+      this.x = nominalX + this.lateralOffset;
+
+      if (this.y > (this.route.maxY || 470)) {
+        this.y = this.route.minY || -60;
+      }
+    }
+  }
+
+  updatePedestrian(dt) {
+    if (this.pauseTimer > 0) {
+      this.pauseTimer -= dt;
+      return;
+    }
+
+    if (this.behavior === 'CROSSING') {
+      // Crossing from one sidewalk to the other
+      this.y += this.speed * this.crossingDirection * dt;
+      this.heading = this.crossingDirection > 0 ? Math.PI / 2 : -Math.PI / 2;
+
+      // When crossed fully
+      if (this.crossingDirection > 0 && this.y >= 680) {
+        this.y = 680;
+        this.pauseTimer = Math.random() * 3 + 2;
+        this.crossingDirection = -1;
+        this.behavior = 'SIDEWALK';
+        this.heading = Math.PI; // Walk along sidewalk
+      } else if (this.crossingDirection < 0 && this.y <= 435) {
+        this.y = 435;
+        this.pauseTimer = Math.random() * 3 + 2;
+        this.crossingDirection = 1;
+        this.behavior = 'SIDEWALK';
+        this.heading = 0; // Walk along sidewalk
+      }
+    } else {
+      // Walking along sidewalk
+      this.x += this.speed * Math.cos(this.heading) * dt;
+
+      if (this.stateTimer <= 0) {
+        this.stateTimer = Math.random() * 6 + 4;
+        // Chance to start crossing when near middle zones
+        if (this.x > 300 && this.x < 1500 && Math.random() < 0.45) {
+          this.behavior = 'CROSSING';
+        }
+      }
+
+      // Wrap around sidewalk ends
+      if (this.x > 1780) {
+        this.heading = Math.PI;
+      } else if (this.x < 40) {
+        this.heading = 0;
+      }
+    }
+  }
+
+  updateAnimal(dt) {
+    if (this.subType === 'cow') {
+      if (this.pauseTimer > 0) {
+        this.pauseTimer -= dt;
+        this.behavior = 'PAUSED';
+        return;
+      }
+
+      this.behavior = 'WANDERING';
+      this.x += this.speed * Math.cos(this.heading) * dt;
+      this.y += this.speed * Math.sin(this.heading) * dt;
+
+      // Keep within road/shoulder boundaries (Y: 480 - 640)
+      if (this.y < 480 || this.y > 640) {
+        this.heading = -this.heading;
+      }
+
+      if (this.stateTimer <= 0) {
+        this.stateTimer = Math.random() * 5 + 3;
+        // Cows frequently stop on the road (classic Indian road simulation feature)
+        if (Math.random() < 0.4) {
+          this.pauseTimer = Math.random() * 4 + 2.5;
+        } else {
+          // Slow wandering turn
+          this.heading += (Math.random() * 0.8 - 0.4);
+        }
+      }
+
+      // Wrap on world edges
+      if (this.x > 1820) this.x = -20;
+      if (this.x < -20) this.x = 1820;
+
+    } else if (this.subType === 'dog') {
+      if (this.pauseTimer > 0) {
+        this.pauseTimer -= dt;
+        return;
+      }
+
+      this.x += this.speed * Math.cos(this.heading) * dt;
+      this.y += this.speed * Math.sin(this.heading) * dt;
+
+      if (this.y < 440 || this.y > 670) {
+        this.heading = -this.heading + (Math.random() * 0.4 - 0.2);
+      }
+
+      if (this.stateTimer <= 0) {
+        this.stateTimer = Math.random() * 3 + 2;
+        if (Math.random() < 0.3) {
+          this.pauseTimer = Math.random() * 2 + 1; // Sniff / pause
+        } else {
+          // Quick turn
+          this.heading += (Math.random() * 1.6 - 0.8);
+        }
+      }
+
+      if (this.x > 1820) this.x = -20;
+      if (this.x < -20) this.x = 1820;
+    }
+  }
+
+  updateGeneric(dt) {
+    this.x += this.speed * Math.cos(this.heading) * dt;
+    this.y += this.speed * Math.sin(this.heading) * dt;
+  }
+
+  // --- Visual Render Pipeline ---
+
+  render(ctx) {
+    ctx.save();
+    ctx.translate(this.x, this.y);
+    ctx.rotate(this.heading);
+
+    switch (this.type) {
+      case 'car':
+        this.renderCar(ctx);
+        break;
+      case 'motorcycle':
+        this.renderMotorcycle(ctx);
+        break;
+      case 'auto_rickshaw':
+        this.renderAutoRickshaw(ctx);
+        break;
+      case 'pedestrian':
+        this.renderPedestrian(ctx);
+        break;
+      case 'animal':
+        this.renderAnimal(ctx);
+        break;
+      default:
+        this.renderGeneric(ctx);
+        break;
+    }
+
+    ctx.restore();
+  }
+
+  /**
+   * Render dynamic traffic car
+   */
+  renderCar(ctx) {
+    const halfL = this.length / 2;
+    const halfW = this.width / 2;
+
+    // Drop Shadow
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.35)';
+    ctx.beginPath();
+    ctx.roundRect(-halfL + 2, -halfW + 2, this.length, this.width, 5);
+    ctx.fill();
+
+    // Wheels
+    ctx.fillStyle = '#0f172a';
+    ctx.fillRect(halfL - 10, -halfW - 1, 9, 3);
+    ctx.fillRect(halfL - 10, halfW - 2, 9, 3);
+    ctx.fillRect(-halfL + 3, -halfW - 1, 9, 3);
+    ctx.fillRect(-halfL + 3, halfW - 2, 9, 3);
+
+    // Car Body
+    ctx.fillStyle = this.color;
+    ctx.beginPath();
+    ctx.roundRect(-halfL, -halfW, this.length, this.width, 5);
+    ctx.fill();
+
+    // Chassis Stroke
+    ctx.strokeStyle = 'rgba(0,0,0,0.3)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    // Windshield Glass & Windows
+    ctx.fillStyle = '#0f172a';
+    // Front windshield
+    ctx.beginPath();
+    ctx.roundRect(halfL - 16, -halfW + 3, 6, this.width - 6, 2);
+    ctx.fill();
+
+    // Rear window
+    ctx.beginPath();
+    ctx.roundRect(-halfL + 7, -halfW + 3, 5, this.width - 6, 2);
+    ctx.fill();
+
+    // Roof Top Plate
+    ctx.fillStyle = this.accentColor || '#1e293b';
+    ctx.fillRect(-halfL + 13, -halfW + 3, this.length - 28, this.width - 6);
+
+    // Front Headlights
+    ctx.fillStyle = '#fef08a';
+    ctx.fillRect(halfL - 2, -halfW + 2, 2, 4);
+    ctx.fillRect(halfL - 2, halfW - 6, 2, 4);
+
+    // Rear Taillights
+    ctx.fillStyle = '#ef4444';
+    ctx.fillRect(-halfL, -halfW + 2, 2, 4);
+    ctx.fillRect(-halfL, halfW - 6, 2, 4);
+  }
+
+  /**
+   * Render dynamic motorcycle / scooter
+   */
+  renderMotorcycle(ctx) {
+    const halfL = this.length / 2;
+    const halfW = this.width / 2;
+
+    // Drop shadow
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.3)';
+    ctx.beginPath();
+    ctx.roundRect(-halfL + 1, -halfW + 1, this.length, this.width, 3);
+    ctx.fill();
+
+    // Front & Rear Rubber Wheels
+    ctx.fillStyle = '#0f172a';
+    ctx.fillRect(halfL - 6, -2, 6, 4);
+    ctx.fillRect(-halfL, -2, 6, 4);
+
+    // Bike Frame & Fuel Tank
+    ctx.fillStyle = this.color;
+    ctx.beginPath();
+    ctx.roundRect(-halfL + 5, -3, this.length - 10, 6, 2);
+    ctx.fill();
+
+    // Handlebars
+    ctx.strokeStyle = '#334155';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(halfL - 7, -halfW + 1);
+    ctx.lineTo(halfL - 7, halfW - 1);
+    ctx.stroke();
+
+    // Rider Body (Top-down view)
+    ctx.fillStyle = '#1e293b';
+    ctx.beginPath();
+    ctx.ellipse(-2, 0, 6.5, 5, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Rider Helmet
+    ctx.fillStyle = this.color;
+    ctx.beginPath();
+    ctx.arc(-2, 0, 4.2, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Helmet Visor
+    ctx.fillStyle = '#0f172a';
+    ctx.fillRect(0, -3, 2, 6);
+  }
+
+  /**
+   * Render dynamic Indian Auto-Rickshaw (3-Wheeler)
+   */
+  renderAutoRickshaw(ctx) {
+    const halfL = this.length / 2;
+    const halfW = this.width / 2;
+
+    // Drop shadow
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.35)';
+    ctx.fillRect(-halfL + 2, -halfW + 2, this.length, this.width);
+
+    // Green Lower Chassis
+    ctx.fillStyle = this.color || '#15803d';
+    ctx.fillRect(-halfL, -halfW, this.length, this.width);
+
+    // Tapered Front Nose
+    ctx.beginPath();
+    ctx.moveTo(halfL - 8, -halfW);
+    ctx.lineTo(halfL, -halfW / 3);
+    ctx.lineTo(halfL, halfW / 3);
+    ctx.lineTo(halfL - 8, halfW);
+    ctx.closePath();
+    ctx.fill();
+
+    // Wheels (1 front, 2 rear)
+    ctx.fillStyle = '#0f172a';
+    ctx.fillRect(halfL - 3, -2, 4, 4);
+    ctx.fillRect(-halfL + 5, -halfW - 2, 7, 3);
+    ctx.fillRect(-halfL + 5, halfW - 1, 7, 3);
+
+    // Iconic Yellow Canopy Roof
+    ctx.fillStyle = '#eab308';
+    ctx.beginPath();
+    ctx.roundRect(-halfL + 5, -halfW + 2, this.length - 14, this.width - 4, 3);
+    ctx.fill();
+
+    // Front Windshield
+    ctx.fillStyle = '#38bdf8';
+    ctx.fillRect(halfL - 10, -halfW + 3, 3, this.width - 6);
+
+    // Rear Black Bumper
+    ctx.fillStyle = '#1e293b';
+    ctx.fillRect(-halfL, -halfW + 2, 3, this.width - 4);
+  }
+
+  /**
+   * Render dynamic pedestrian (Top-down walking human)
+   */
+  renderPedestrian(ctx) {
+    // Drop shadow
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.25)';
+    ctx.beginPath();
+    ctx.ellipse(1, 1, 6, 5, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Animated swinging feet during walking
+    const footOffset = Math.sin(this.swayPhase) * 3.5;
+    ctx.fillStyle = '#1e293b';
+    ctx.fillRect(-3, -4 + footOffset, 3, 2.5);
+    ctx.fillRect(-3, 1.5 - footOffset, 3, 2.5);
+
+    // Shoulders & Colorful Indian Attire
+    ctx.fillStyle = this.color;
+    ctx.beginPath();
+    ctx.ellipse(0, 0, 6, 4.5, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Skin-tone Head
+    ctx.fillStyle = '#fed7aa';
+    ctx.beginPath();
+    ctx.arc(0, 0, 3.4, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Dark Hair
+    ctx.fillStyle = '#0f172a';
+    ctx.beginPath();
+    ctx.arc(-0.8, 0, 3.2, -Math.PI / 2, Math.PI / 2);
+    ctx.fill();
+  }
+
+  /**
+   * Render dynamic animals (Stray Cow & Dog)
+   */
+  renderAnimal(ctx) {
+    const halfL = this.length / 2;
+    const halfW = this.width / 2;
+
+    if (this.subType === 'cow') {
+      // --- Indian Zebu Cow ---
+      // Shadow
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.25)';
+      ctx.beginPath();
+      ctx.ellipse(2, 2, halfL, halfW * 0.9, 0, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Main Torso
+      ctx.fillStyle = this.color || '#f8fafc';
+      ctx.beginPath();
+      ctx.ellipse(0, 0, halfL - 4, halfW * 0.8, 0, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Zebu Shoulder Hump (Distinctive Indian cattle feature)
+      ctx.fillStyle = '#cbd5e1';
+      ctx.beginPath();
+      ctx.arc(halfL - 10, 0, 5, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Head
+      ctx.fillStyle = this.color || '#f8fafc';
+      ctx.beginPath();
+      ctx.ellipse(halfL - 2, 0, 6, 4.5, 0, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Horns
+      ctx.strokeStyle = '#475569';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(halfL - 4, -4);
+      ctx.lineTo(halfL - 2, -8);
+      ctx.moveTo(halfL - 4, 4);
+      ctx.lineTo(halfL - 2, 8);
+      ctx.stroke();
+
+      // Ears
+      ctx.fillStyle = '#cbd5e1';
+      ctx.beginPath();
+      ctx.ellipse(halfL - 4, -5, 3, 1.5, -0.4, 0, Math.PI * 2);
+      ctx.ellipse(halfL - 4, 5, 3, 1.5, 0.4, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Tail
+      ctx.strokeStyle = '#94a3b8';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(-halfL + 4, 0);
+      ctx.quadraticCurveTo(-halfL - 4, Math.sin(this.swayPhase) * 3, -halfL - 6, Math.sin(this.swayPhase) * 4);
+      ctx.stroke();
+
+    } else if (this.subType === 'dog') {
+      // --- Stray Dog ---
+      // Shadow
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.2)';
+      ctx.beginPath();
+      ctx.ellipse(1, 1, halfL, halfW * 0.8, 0, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Body
+      ctx.fillStyle = this.color || '#b45309';
+      ctx.beginPath();
+      ctx.ellipse(0, 0, halfL - 3, halfW * 0.7, 0, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Head & Snout
+      ctx.fillStyle = this.color || '#b45309';
+      ctx.beginPath();
+      ctx.ellipse(halfL - 2, 0, 4, 3, 0, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Ears
+      ctx.fillStyle = '#78350f';
+      ctx.fillRect(halfL - 4, -3.5, 2, 2);
+      ctx.fillRect(halfL - 4, 1.5, 2, 2);
+
+      // Wagging Tail
+      ctx.strokeStyle = this.color || '#b45309';
+      ctx.lineWidth = 1.8;
+      ctx.beginPath();
+      ctx.moveTo(-halfL + 3, 0);
+      ctx.lineTo(-halfL - 4, Math.sin(this.swayPhase * 1.5) * 4);
+      ctx.stroke();
+    }
+  }
+
+  renderGeneric(ctx) {
+    ctx.fillStyle = this.color;
+    ctx.fillRect(-this.length / 2, -this.width / 2, this.length, this.width);
+  }
+
+  // --- Collision Boundary Queries ---
+
+  /**
+   * Get 4 rotated corner coordinates in World space for collision detection
+   */
+  getCollisionCorners() {
+    const halfL = this.length / 2;
+    const halfW = this.width / 2;
+    const cosH = Math.cos(this.heading);
+    const sinH = Math.sin(this.heading);
+
+    const relativeCorners = [
+      { dx: halfL, dy: -halfW },
+      { dx: halfL, dy: halfW },
+      { dx: -halfL, dy: halfW },
+      { dx: -halfL, dy: -halfW }
+    ];
+
+    return relativeCorners.map(pt => ({
+      x: this.x + pt.dx * cosH - pt.dy * sinH,
+      y: this.y + pt.dx * sinH + pt.dy * cosH
+    }));
+  }
+
+  /**
+   * Get Axis-Aligned Bounding Box (AABB) in World Coordinates
+   */
+  getBoundingBox() {
+    const corners = this.getCollisionCorners();
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    corners.forEach(c => {
+      minX = Math.min(minX, c.x);
+      minY = Math.min(minY, c.y);
+      maxX = Math.max(maxX, c.x);
+      maxY = Math.max(maxY, c.y);
+    });
+    return { minX, minY, maxX, maxY, width: maxX - minX, height: maxY - minY };
+  }
+
+  /**
+   * Get Oriented Bounding Box (OBB) description
+   */
+  getOrientedBox() {
+    return {
+      x: this.x,
+      y: this.y,
+      length: this.length,
+      width: this.width,
+      heading: this.heading,
+      corners: this.getCollisionCorners()
+    };
+  }
+
+  /**
+   * Unified collision boundary interface for future modules
+   */
+  getCollisionBounds() {
+    return {
+      id: this.id,
+      type: this.type,
+      subType: this.subType,
+      x: this.x,
+      y: this.y,
+      radius: this.radius,
+      length: this.length,
+      width: this.width,
+      heading: this.heading,
+      speed: this.speed,
+      corners: this.getCollisionCorners(),
+      aabb: this.getBoundingBox(),
+      obb: this.getOrientedBox()
+    };
+  }
+}
+
+/**
+ * Traffic Manager: Coordinates dynamic traffic objects and lifecycle
+ */
+class TrafficManager {
+  constructor() {
+    this.entities = [];
+    this.isEnabled = true;
+    this.initDefaultEntities();
+  }
+
+  initDefaultEntities() {
+    this.entities = [
+      // --- 1. Dynamic Cars (4) ---
+      new DynamicObject({
+        id: 'car-1',
+        type: 'car',
+        subType: 'sedan',
+        x: 350,
+        y: 595,
+        length: 50,
+        width: 25,
+        heading: 0, // Eastbound
+        speed: 85,
+        color: '#dc2626',
+        route: { road: 'main', laneY: 595, minX: -80, maxX: 1880 }
+      }),
+      new DynamicObject({
+        id: 'car-2',
+        type: 'car',
+        subType: 'hatchback',
+        x: 1200,
+        y: 525,
+        length: 46,
+        width: 23,
+        heading: Math.PI, // Westbound
+        speed: 90,
+        color: '#2563eb',
+        route: { road: 'main', laneY: 525, minX: -80, maxX: 1880 }
+      }),
+      new DynamicObject({
+        id: 'car-3',
+        type: 'car',
+        subType: 'suv',
+        x: 750,
+        y: 615,
+        length: 52,
+        width: 26,
+        heading: 0, // Eastbound
+        speed: 75,
+        color: '#e2e8f0',
+        route: { road: 'main', laneY: 615, minX: -80, maxX: 1880 }
+      }),
+      new DynamicObject({
+        id: 'car-4',
+        type: 'car',
+        subType: 'taxi',
+        x: 895,
+        y: 100,
+        length: 46,
+        width: 23,
+        heading: Math.PI / 2, // Southbound on side road
+        speed: 65,
+        color: '#f59e0b',
+        route: { road: 'side', laneX: 895, minY: -60, maxY: 470 }
+      }),
+
+      // --- 2. Motorcycles & Bikes (4) ---
+      new DynamicObject({
+        id: 'bike-1',
+        type: 'motorcycle',
+        subType: 'sport_bike',
+        x: 520,
+        y: 580,
+        length: 28,
+        width: 12,
+        heading: 0, // Eastbound
+        speed: 120,
+        color: '#ea580c',
+        route: { road: 'main', laneY: 580, minX: -80, maxX: 1880 }
+      }),
+      new DynamicObject({
+        id: 'bike-2',
+        type: 'motorcycle',
+        subType: 'commuter',
+        x: 1450,
+        y: 515,
+        length: 27,
+        width: 11,
+        heading: Math.PI, // Westbound
+        speed: 105,
+        color: '#1e293b',
+        route: { road: 'main', laneY: 515, minX: -80, maxX: 1880 }
+      }),
+      new DynamicObject({
+        id: 'bike-3',
+        type: 'motorcycle',
+        subType: 'scooter',
+        x: 180,
+        y: 635,
+        length: 25,
+        width: 12,
+        heading: 0, // Eastbound
+        speed: 80,
+        color: '#06b6d4',
+        route: { road: 'main', laneY: 635, minX: -80, maxX: 1880 }
+      }),
+      new DynamicObject({
+        id: 'bike-4',
+        type: 'motorcycle',
+        subType: 'scooter',
+        x: 940,
+        y: 200,
+        length: 25,
+        width: 12,
+        heading: Math.PI / 2, // Southbound on side road
+        speed: 85,
+        color: '#ec4899',
+        route: { road: 'side', laneX: 940, minY: -60, maxY: 470 }
+      }),
+
+      // --- 3. Auto-Rickshaws (3) ---
+      new DynamicObject({
+        id: 'auto-1',
+        type: 'auto_rickshaw',
+        subType: 'cng_auto',
+        x: 980,
+        y: 625,
+        length: 44,
+        width: 26,
+        heading: 0, // Eastbound
+        speed: 70,
+        color: '#15803d',
+        route: { road: 'main', laneY: 625, minX: -80, maxX: 1880 }
+      }),
+      new DynamicObject({
+        id: 'auto-2',
+        type: 'auto_rickshaw',
+        subType: 'cng_auto',
+        x: 600,
+        y: 535,
+        length: 44,
+        width: 26,
+        heading: Math.PI, // Westbound
+        speed: 65,
+        color: '#15803d',
+        route: { road: 'main', laneY: 535, minX: -80, maxX: 1880 }
+      }),
+      new DynamicObject({
+        id: 'auto-3',
+        type: 'auto_rickshaw',
+        subType: 'cng_auto',
+        x: 955,
+        y: 60,
+        length: 44,
+        width: 26,
+        heading: Math.PI / 2, // Southbound on side road
+        speed: 60,
+        color: '#15803d',
+        route: { road: 'side', laneX: 955, minY: -60, maxY: 470 }
+      }),
+
+      // --- 4. Pedestrians (4) ---
+      new DynamicObject({
+        id: 'ped-1',
+        type: 'pedestrian',
+        subType: 'commuter',
+        x: 220,
+        y: 435,
+        length: 12,
+        width: 10,
+        radius: 6,
+        heading: 0,
+        speed: 25,
+        color: '#f97316',
+        behavior: 'SIDEWALK'
+      }),
+      new DynamicObject({
+        id: 'ped-2',
+        type: 'pedestrian',
+        subType: 'commuter',
+        x: 1420,
+        y: 680,
+        length: 12,
+        width: 10,
+        radius: 6,
+        heading: Math.PI,
+        speed: 28,
+        color: '#38bdf8',
+        behavior: 'SIDEWALK'
+      }),
+      new DynamicObject({
+        id: 'ped-3',
+        type: 'pedestrian',
+        subType: 'crosser',
+        x: 720,
+        y: 680,
+        length: 12,
+        width: 10,
+        radius: 6,
+        heading: -Math.PI / 2,
+        speed: 22,
+        color: '#ec4899',
+        crossingDirection: -1,
+        behavior: 'CROSSING'
+      }),
+      new DynamicObject({
+        id: 'ped-4',
+        type: 'pedestrian',
+        subType: 'crosser',
+        x: 1240,
+        y: 435,
+        length: 12,
+        width: 10,
+        radius: 6,
+        heading: Math.PI / 2,
+        speed: 24,
+        color: '#eab308',
+        crossingDirection: 1,
+        behavior: 'CROSSING'
+      }),
+
+      // --- 5. Animals (3) ---
+      new DynamicObject({
+        id: 'cow-1',
+        type: 'animal',
+        subType: 'cow',
+        x: 530,
+        y: 505,
+        length: 36,
+        width: 18,
+        radius: 12,
+        heading: 0.1,
+        speed: 10,
+        color: '#f8fafc',
+        behavior: 'WANDERING'
+      }),
+      new DynamicObject({
+        id: 'dog-1',
+        type: 'animal',
+        subType: 'dog',
+        x: 870,
+        y: 460,
+        length: 20,
+        width: 10,
+        radius: 7,
+        heading: -0.3,
+        speed: 40,
+        color: '#b45309',
+        behavior: 'WANDERING'
+      }),
+      new DynamicObject({
+        id: 'dog-2',
+        type: 'animal',
+        subType: 'dog',
+        x: 1350,
+        y: 660,
+        length: 20,
+        width: 10,
+        radius: 7,
+        heading: Math.PI,
+        speed: 35,
+        color: '#d97706',
+        behavior: 'WANDERING'
+      })
+    ];
+  }
+
+  update(dt) {
+    if (!this.isEnabled) return;
+    this.entities.forEach(entity => entity.update(dt));
+  }
+
+  render(ctx) {
+    this.entities.forEach(entity => entity.render(ctx));
+  }
+
+  getEntities() {
+    return this.entities;
+  }
+
+  getDynamicObjects() {
+    return this.entities;
+  }
+
+  toggle(state) {
+    this.isEnabled = state !== undefined ? state : !this.isEnabled;
+    return this.isEnabled;
+  }
+
+  reset() {
+    this.initDefaultEntities();
+  }
+}
+
+/* ============================================================================
+   7. SIMULATION CORE APPLICATION CONTROLLER & GAME LOOP
    ============================================================================ */
 class SimulationAppController {
   constructor() {
@@ -1603,6 +2585,9 @@ class SimulationAppController {
 
     // Module 2: Ego Vehicle Instance
     this.egoVehicle = new EgoVehicle(140, 580, 0);
+
+    // Module 3: Dynamic Traffic Manager
+    this.trafficManager = new TrafficManager();
 
     // Registered Submodules
     this.modules = {};
@@ -1630,7 +2615,7 @@ class SimulationAppController {
     this.lastTime = performance.now();
     requestAnimationFrame((time) => this.loop(time));
 
-    console.log('[SimulationEngine] Module 1 & 2 Active: Environment and Ego Vehicle loaded.');
+    console.log('[SimulationEngine] Module 1, 2 & 3 Active: Environment, Ego Vehicle, and Dynamic Traffic loaded.');
   }
 
   cacheDom() {
@@ -1646,8 +2631,11 @@ class SimulationAppController {
       egoSpeed: document.getElementById('ego-speed'),
       egoHeading: document.getElementById('ego-heading'),
       egoSteer: document.getElementById('ego-steer'),
+      trafficDot: document.getElementById('traffic-dot'),
+      trafficCount: document.getElementById('traffic-count'),
 
       // Controls
+      btnTraffic: document.getElementById('btn-traffic'),
       btnResetCar: document.getElementById('btn-reset-car'),
       btnGrid: document.getElementById('btn-grid'),
       btnLabels: document.getElementById('btn-labels'),
@@ -1730,6 +2718,17 @@ class SimulationAppController {
       this.camera.zoomAt(factor, screenX, screenY);
     }, { passive: false });
 
+    // Traffic Toggle Button
+    if (this.dom.btnTraffic) {
+      this.dom.btnTraffic.addEventListener('click', () => {
+        const active = this.trafficManager.toggle();
+        this.dom.btnTraffic.classList.toggle('active', active);
+        if (this.dom.trafficDot) {
+          this.dom.trafficDot.classList.toggle('paused', !active);
+        }
+      });
+    }
+
     // Reset Car Button
     if (this.dom.btnResetCar) {
       this.dom.btnResetCar.addEventListener('click', () => {
@@ -1786,7 +2785,7 @@ class SimulationAppController {
       });
     }
 
-    // Keyboard Shortcuts (G: Grid, L: Labels, R: Reset View)
+    // Keyboard Shortcuts (G: Grid, L: Labels, R: Reset View, T: Toggle Traffic)
     window.addEventListener('keydown', (e) => {
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
 
@@ -1797,23 +2796,30 @@ class SimulationAppController {
         this.dom.btnLabels.click();
       } else if (key === 'r' && this.dom.btnResetView) {
         this.dom.btnResetView.click();
+      } else if (key === 't' && this.dom.btnTraffic) {
+        this.dom.btnTraffic.click();
       }
     });
   }
 
   /**
-   * Main Simulation Loop (Updates Physics, Updates Telemetry, Renders Scene)
+   * Main Simulation Loop (Updates Physics, Traffic, Telemetry, Renders Scene)
    */
   loop(currentTime) {
     const dt = Math.min((currentTime - this.lastTime) / 1000, 0.1);
     this.lastTime = currentTime;
 
-    // 1. Update Ego Vehicle Physics
+    // 1. Update Ego Vehicle Physics (Module 2)
     if (this.egoVehicle) {
       this.egoVehicle.update(dt);
     }
 
-    // 2. Update Submodules
+    // 2. Update Dynamic Traffic & Entities (Module 3)
+    if (this.trafficManager) {
+      this.trafficManager.update(dt);
+    }
+
+    // 3. Update Submodules (Future Module 4+)
     Object.keys(this.modules).forEach((name) => {
       const mod = this.modules[name];
       if (typeof mod.update === 'function') {
@@ -1821,10 +2827,10 @@ class SimulationAppController {
       }
     });
 
-    // 3. Update Real-time HUD Telemetry
+    // 4. Update Real-time HUD Telemetry
     this.updateHUD();
 
-    // 4. Render Scene
+    // 5. Render Scene
     this.render();
 
     // Request next animation frame
@@ -1834,52 +2840,57 @@ class SimulationAppController {
   }
 
   /**
-   * Update HUD Telemetry elements with Ego Vehicle telemetry data
+   * Update HUD Telemetry elements with Ego Vehicle and Traffic telemetry data
    */
   updateHUD() {
-    if (!this.egoVehicle) return;
-
-    // Convert speed (px/s) to scaled km/h (1 px/s approx 0.25 km/h)
-    const speedKmH = (Math.abs(this.egoVehicle.speed) * 0.25).toFixed(1);
-    if (this.dom.egoSpeed) {
-      this.dom.egoSpeed.textContent = speedKmH;
-    }
-
-    // Convert heading from radians to degrees [0, 360)
-    let headingDeg = (this.egoVehicle.heading * (180 / Math.PI)) % 360;
-    if (headingDeg < 0) headingDeg += 360;
-    if (this.dom.egoHeading) {
-      this.dom.egoHeading.textContent = `${headingDeg.toFixed(1)}°`;
-    }
-
-    // Steer angle in degrees
-    const steerDeg = (this.egoVehicle.steeringAngle * (180 / Math.PI)).toFixed(1);
-    if (this.dom.egoSteer) {
-      this.dom.egoSteer.textContent = `${steerDeg > 0 ? '+' : ''}${steerDeg}°`;
-    }
-
-    // State text & indicator dot
-    if (this.dom.egoStateText && this.dom.egoStateDot) {
-      const state = this.egoVehicle.state;
-      this.dom.egoStateText.textContent = state;
-
-      this.dom.egoStateDot.className = 'pill-dot';
-      switch (state) {
-        case 'ACCELERATING':
-          this.dom.egoStateDot.classList.add('accelerating');
-          break;
-        case 'BRAKING':
-          this.dom.egoStateDot.classList.add('braking');
-          break;
-        case 'REVERSING':
-          this.dom.egoStateDot.classList.add('reversing');
-          break;
-        case 'STOPPED':
-          this.dom.egoStateDot.classList.add('stopped');
-          break;
-        default:
-          break;
+    if (this.egoVehicle) {
+      // Convert speed (px/s) to scaled km/h
+      const speedKmH = (Math.abs(this.egoVehicle.speed) * 0.25).toFixed(1);
+      if (this.dom.egoSpeed) {
+        this.dom.egoSpeed.textContent = speedKmH;
       }
+
+      // Convert heading from radians to degrees [0, 360)
+      let headingDeg = (this.egoVehicle.heading * (180 / Math.PI)) % 360;
+      if (headingDeg < 0) headingDeg += 360;
+      if (this.dom.egoHeading) {
+        this.dom.egoHeading.textContent = `${headingDeg.toFixed(1)}°`;
+      }
+
+      // Steer angle in degrees
+      const steerDeg = (this.egoVehicle.steeringAngle * (180 / Math.PI)).toFixed(1);
+      if (this.dom.egoSteer) {
+        this.dom.egoSteer.textContent = `${steerDeg > 0 ? '+' : ''}${steerDeg}°`;
+      }
+
+      // State text & indicator dot
+      if (this.dom.egoStateText && this.dom.egoStateDot) {
+        const state = this.egoVehicle.state;
+        this.dom.egoStateText.textContent = state;
+
+        this.dom.egoStateDot.className = 'pill-dot';
+        switch (state) {
+          case 'ACCELERATING':
+            this.dom.egoStateDot.classList.add('accelerating');
+            break;
+          case 'BRAKING':
+            this.dom.egoStateDot.classList.add('braking');
+            break;
+          case 'REVERSING':
+            this.dom.egoStateDot.classList.add('reversing');
+            break;
+          case 'STOPPED':
+            this.dom.egoStateDot.classList.add('stopped');
+            break;
+          default:
+            break;
+        }
+      }
+    }
+
+    // Traffic count readout
+    if (this.dom.trafficCount && this.trafficManager) {
+      this.dom.trafficCount.textContent = this.trafficManager.getEntities().length;
     }
   }
 
@@ -1899,12 +2910,17 @@ class SimulationAppController {
     // Render Static Environment (Roads, buildings, potholes, debris, destination, signals)
     EnvironmentRenderer.render(this.ctx, EnvironmentData, this.options);
 
+    // Render Dynamic Traffic Objects (Module 3)
+    if (this.trafficManager) {
+      this.trafficManager.render(this.ctx);
+    }
+
     // Render Ego Vehicle (Module 2)
     if (this.egoVehicle) {
       this.egoVehicle.render(this.ctx);
     }
 
-    // Render Future Submodules (Module 3+)
+    // Render Future Submodules (Module 4+)
     Object.keys(this.modules).forEach((name) => {
       const mod = this.modules[name];
       if (typeof mod.render === 'function') {
@@ -1925,13 +2941,24 @@ class SimulationAppController {
     return EnvironmentData.destination;
   }
 
+  /**
+   * Accessor for all active dynamic objects (Cars, bikes, autos, pedestrians, animals)
+   */
+  getDynamicObjects() {
+    return this.trafficManager ? this.trafficManager.getEntities() : [];
+  }
+
+  /**
+   * Combined Obstacles accessor (Static hazards + Dynamic traffic) for collision modules
+   */
   getObstacles() {
     return {
       potholes: EnvironmentData.potholes,
       debris: EnvironmentData.debris,
       parkedObjects: EnvironmentData.parkedObjects,
       buildings: EnvironmentData.buildings,
-      signal: EnvironmentData.trafficSignal
+      signal: EnvironmentData.trafficSignal,
+      dynamicObjects: this.getDynamicObjects()
     };
   }
 
@@ -1964,10 +2991,13 @@ window.SimulationEngine = SimulationEngine;
 window.EnvironmentData = EnvironmentData;
 window.WORLD_CONFIG = WORLD_CONFIG;
 window.EgoVehicle = EgoVehicle;
+window.DynamicObject = DynamicObject;
+window.TrafficManager = TrafficManager;
 
 // Boot on DOM Ready
 document.addEventListener('DOMContentLoaded', () => {
   SimulationEngine.init();
 });
+
 
 

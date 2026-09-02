@@ -13,7 +13,7 @@
       <div class="header-left">
         <div class="project-identity">
           <h1 class="sim-title">Adaptive Path Planning &amp; Collision Avoidance</h1>
-          <span class="sim-subtitle">Unstructured Indian Road Simulation &bull; Module 2: Ego Vehicle Teleop</span>
+          <span class="sim-subtitle">Unstructured Indian Road Simulation &bull; Module 3: Dynamic Traffic &amp; Objects</span>
         </div>
       </div>
 
@@ -40,6 +40,12 @@
           <span class="pill-value" id="ego-steer">0.0&deg;</span>
         </div>
 
+        <div class="telemetry-pill" title="Active Dynamic Traffic Objects">
+          <span class="pill-dot traffic-dot" id="traffic-dot"></span>
+          <span class="pill-label">TRAFFIC:</span>
+          <span class="pill-value accent-amber"><span id="traffic-count">0</span> <small>objs</small></span>
+        </div>
+
         <div class="coords-display" id="coords-display" title="World Coordinates under cursor">
           <span class="coord-tag">CURSOR:</span>
           <span class="coord-val">X:<span id="coord-x">0</span> Y:<span id="coord-y">0</span></span>
@@ -48,6 +54,9 @@
 
       <div class="header-right">
         <div class="control-group">
+          <button id="btn-traffic" class="tool-btn active" title="Toggle Dynamic Traffic Simulation (T)">
+            <span class="btn-icon">&#9658;</span> Traffic
+          </button>
           <button id="btn-reset-car" class="tool-btn" title="Reset Ego Vehicle to Start Position (P)">
             <span class="btn-icon">&#8635;</span> Reset Car
           </button>
@@ -94,6 +103,9 @@
           <div class="key-row">
             <span class="key-cap">P</span> <span>Reset Car Position</span>
           </div>
+          <div class="key-row">
+            <span class="key-cap">T</span> <span>Toggle Dynamic Traffic</span>
+          </div>
         </div>
       </aside>
 
@@ -111,6 +123,26 @@
           <div class="legend-item">
             <span class="legend-swatch destination-swatch"></span>
             <span><strong>Destination Waypoint</strong> (Target Goal)</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-swatch traffic-car-swatch"></span>
+            <span><strong>Dynamic Cars</strong> (East/West Traffic)</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-swatch traffic-bike-swatch"></span>
+            <span><strong>Motorcycles &amp; Scooters</strong> (Fast/Nimble)</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-swatch traffic-auto-swatch"></span>
+            <span><strong>Auto-Rickshaws</strong> (3-Wheelers)</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-swatch pedestrian-swatch"></span>
+            <span><strong>Pedestrians</strong> (Sidewalks &amp; Crossing)</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-swatch animal-swatch"></span>
+            <span><strong>Animals</strong> (Stray Cows &amp; Dogs)</span>
           </div>
           <div class="legend-item">
             <span class="legend-swatch road-swatch"></span>
@@ -134,7 +166,7 @@
           </div>
           <div class="legend-item">
             <span class="legend-swatch vehicle-swatch"></span>
-            <span>Parked Objects (Auto / Scooter / Thela)</span>
+            <span>Parked Static Objects (Auto / Thela)</span>
           </div>
           <div class="legend-item">
             <span class="legend-swatch building-swatch"></span>
@@ -142,13 +174,13 @@
           </div>
         </div>
         <div class="legend-footer">
-          <small>&bull; [W/A/S/D] Drive &bull; [Space] Stop &bull; Drag to Pan &bull; [R] Fit View</small>
+          <small>&bull; [W/A/S/D] Drive &bull; [T] Traffic &bull; Drag to Pan &bull; [R] Fit</small>
         </div>
       </aside>
 
       <!-- Mini Notification / Hint Banner -->
       <div class="hint-banner" id="hint-banner">
-        <span>Module 2 Active: Ego Vehicle spawned on Main Road. Drive with [W/A/S/D] or [Arrow Keys].</span>
+        <span>Module 3 Active: Dynamic Traffic &amp; Objects (Cars, Bikes, Autos, Pedestrians, Animals) Active. [T] Toggle Traffic.</span>
       </div>
     </main>
   </div>
@@ -156,5 +188,6 @@
   <script src="script.js"></script>
 </body>
 </html>
+
 
 

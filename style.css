@@ -168,6 +168,20 @@ html, body {
   color: var(--accent-cyan);
 }
 
+.pill-value.accent-amber {
+  color: var(--accent-amber);
+}
+
+.traffic-dot {
+  background-color: var(--accent-amber);
+  box-shadow: 0 0 6px var(--accent-amber);
+}
+
+.traffic-dot.paused {
+  background-color: var(--text-muted);
+  box-shadow: none;
+}
+
 .coords-display {
   display: inline-flex;
   align-items: center;
@@ -434,6 +448,11 @@ html, body {
 
 .ego-swatch { background: #38bdf8; border: 1px solid #ffffff; box-shadow: 0 0 6px rgba(56, 189, 248, 0.8); }
 .destination-swatch { background: #10b981; border: 1px solid #34d399; box-shadow: 0 0 6px rgba(16, 185, 129, 0.8); }
+.traffic-car-swatch { background: #dc2626; border: 1px solid #f87171; box-shadow: 0 0 4px rgba(220, 38, 38, 0.6); }
+.traffic-bike-swatch { background: #ea580c; border: 1px solid #fb923c; }
+.traffic-auto-swatch { background: #eab308; border: 1px solid #15803d; }
+.pedestrian-swatch { background: #ec4899; border: 1px solid #f472b6; }
+.animal-swatch { background: #f59e0b; border: 1px solid #d97706; }
 .road-swatch { background: #373c47; border: 1px solid #5a6273; }
 .curb-swatch { background: #eab308; border: 1px solid #0f172a; }
 .pothole-swatch { background: #18191d; border: 1px dashed #78716c; }
