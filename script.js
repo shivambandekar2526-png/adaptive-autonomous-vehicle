@@ -2973,6 +2973,9 @@ class EgoVehicle {
     this.isBraking = false;
     this.isReversing = false;
 
+    const throttleVal = this.inputs.throttle !== undefined ? this.inputs.throttle : 0;
+    const brakeVal = this.inputs.brake !== undefined ? this.inputs.brake : 0;
+
     if (this.inputs.handbrake) {
       // Emergency stop / handbrake
       this.isBraking = true;
@@ -2985,20 +2988,22 @@ class EgoVehicle {
       }
       this.state = 'STOPPED';
 
-    } else if (this.inputs.brake > 0) {
-      // Autonomous / Progressive Footbrake
+    } else if (brakeVal > 0.75 && throttleVal < 0.2) {
+      // Strong Footbrake Deceleration / Stop
       this.isBraking = true;
       if (Math.abs(this.speed) > 1.5) {
         const brakeDir = -Math.sign(this.speed);
-        this.speed += brakeDir * this.brakingDecel * this.inputs.brake * dt;
+        this.speed += brakeDir * this.brakingDecel * brakeVal * dt;
         if (Math.sign(this.speed) !== -brakeDir) this.speed = 0;
+        this.state = 'BRAKING';
       } else {
         this.speed = 0;
+        this.state = 'STOPPED';
       }
-      this.state = (this.speed === 0) ? 'STOPPED' : 'BRAKING';
 
-    } else if (this.inputs.throttle > 0) {
-      // Forward Acceleration
+    } else if (throttleVal > 0.05) {
+      // Forward Drive (attenuated by brake pedal if partially applied)
+      const effectiveThrottle = throttleVal * Math.max(0.1, 1.0 - brakeVal * 0.7);
       if (this.speed < 0) {
         // Braking while in reverse
         this.isBraking = true;
@@ -3006,29 +3011,27 @@ class EgoVehicle {
         if (this.speed > 0) this.speed = 0;
         this.state = 'BRAKING';
       } else {
-        this.speed += this.acceleration * dt;
+        this.speed += this.acceleration * effectiveThrottle * dt;
         this.speed = Math.min(this.maxForwardSpeed, this.speed);
         this.state = this.speed >= this.maxForwardSpeed * 0.95 ? 'CRUISING' : 'ACCELERATING';
       }
 
-    } else if (this.inputs.throttle < 0) {
-      // Braking / Reverse
+    } else if (throttleVal < -0.05) {
+      // Reverse Drive
       if (this.speed > 2) {
-        // Braking forward motion
         this.isBraking = true;
         this.speed -= this.brakingDecel * dt;
         if (this.speed < 0) this.speed = 0;
         this.state = 'BRAKING';
       } else {
-        // Reversing
         this.isReversing = true;
-        this.speed -= this.acceleration * 0.7 * dt;
+        this.speed -= this.acceleration * 0.7 * Math.abs(throttleVal) * dt;
         this.speed = Math.max(-this.maxReverseSpeed, this.speed);
         this.state = 'REVERSING';
       }
 
     } else {
-      // Coasting / Rolling Friction drag
+      // Rolling Friction Drag
       if (Math.abs(this.speed) > 1) {
         const frictionDir = -Math.sign(this.speed);
         this.speed += frictionDir * this.frictionDecel * dt;
@@ -3794,7 +3797,13 @@ class DynamicObject {
     this.crossingDirection = config.crossingDirection || 1; // +1 down, -1 up
     this.active = true;
 
-    // Shared PPO Policy Actuator States
+    // Shared PPO Policy Actuator & Kinematics States (Identical to EgoVehicle)
+    this.wheelbase = config.wheelbase || (this.length * 0.65);
+    this.maxForwardSpeed = this.type === 'motorcycle' ? 120 : (this.type === 'auto_rickshaw' ? 80 : 100);
+    this.maxReverseSpeed = 50;
+    this.acceleration = 150;
+    this.brakingDecel = 280;
+    this.frictionDecel = 45;
     this.maxSteeringAngle = 0.58;
     this.maxSteeringRate = 2.8; // First-order rate limiter (rad/s)
     this.steeringAngle = 0;
@@ -3803,6 +3812,13 @@ class DynamicObject {
     this.lastAction = [0, 0, 0];
     this.prevSteerAction = 0;
     this.prevCrossTrack = 0;
+
+    this.inputs = {
+      steer: 0,
+      throttle: 0,
+      brake: 0,
+      handbrake: false
+    };
 
     // Initialize dedicated TrafficAgentNavigator for road vehicles (cars, motorcycles, auto-rickshaws)
     if (this.type === 'car' || this.type === 'motorcycle' || this.type === 'auto_rickshaw') {
@@ -3815,50 +3831,101 @@ class DynamicObject {
   /**
    * Universal continuous RL action execution for any road vehicle via the shared PPO policy
    * Directly controls vehicle physics through continuous steering, throttle, and brake inputs.
+   * Uses identical vehicle kinematics, rate limiting, and reverse kinematics as EgoVehicle.
    */
   applyRLAction(action, dt) {
     if (!this.active || !Array.isArray(action)) return;
     if (dt <= 0 || dt > 0.1) dt = 0.016;
 
     const steerCmd = Math.max(-1.0, Math.min(1.0, action[0] || 0));
-    const throttleCmd = Math.max(0.0, Math.min(1.0, action[1] || 0));
+    const throttleCmd = action[1] !== undefined ? action[1] : 0;
     const brakeCmd = Math.max(0.0, Math.min(1.0, action[2] || 0));
 
-    // 1. Steering Actuator Dynamics (First-Order Rate Limiter)
-    const targetSteerAngle = steerCmd * this.maxSteeringAngle;
+    this.inputs.steer = steerCmd;
+    this.inputs.throttle = throttleCmd;
+    this.inputs.brake = brakeCmd;
+
+    // 1. Steering Actuator Dynamics with First-Order Rate Limiting (Identical to Ego)
+    const targetSteerAngle = Math.max(-this.maxSteeringAngle, Math.min(this.maxSteeringAngle, steerCmd * this.maxSteeringAngle));
     const maxDelta = this.maxSteeringRate * dt;
     const steerDiff = targetSteerAngle - this.steeringAngle;
     const clampedDelta = Math.max(-maxDelta, Math.min(maxDelta, steerDiff));
     this.steeringAngle += clampedDelta;
     this.steeringAngle = Math.max(-this.maxSteeringAngle, Math.min(this.maxSteeringAngle, this.steeringAngle));
 
-    // 2. Throttle, Brake & Friction Dynamics
-    const maxSpeed = this.type === 'motorcycle' ? 110 : (this.type === 'auto_rickshaw' ? 70 : 90);
-    const accelRate = 140;
-    const brakeRate = 260;
+    // 2. Longitudinal Acceleration, Footbrake & Reverse Dynamics (Identical to Ego)
+    this.isBraking = false;
+    this.isReversing = false;
+    const netDrive = throttleCmd - brakeCmd;
 
-    if (brakeCmd > 0.05) {
-      if (Math.abs(this.speed) > 1.5) {
-        this.speed -= brakeRate * brakeCmd * dt;
-        if (this.speed < 0) this.speed = 0;
+    if (this.inputs.handbrake) {
+      this.isBraking = true;
+      if (Math.abs(this.speed) > 2) {
+        const brakeDir = -Math.sign(this.speed);
+        this.speed += brakeDir * (this.brakingDecel * 1.5) * dt;
+        if (Math.sign(this.speed) !== -brakeDir) this.speed = 0;
       } else {
         this.speed = 0;
       }
-    } else if (throttleCmd > 0.05) {
-      this.speed += accelRate * throttleCmd * dt;
-      this.speed = Math.min(maxSpeed, this.speed);
-    } else {
-      // Rolling drag
-      if (Math.abs(this.speed) > 1) {
-        this.speed -= 40 * dt;
-        if (this.speed < 0) this.speed = 0;
+      this.state = 'STOPPED';
+
+    } else if (brakeCmd > 0.75 && throttleCmd < 0.2) {
+      // Strong Footbrake Deceleration / Stop
+      this.isBraking = true;
+      if (Math.abs(this.speed) > 1.5) {
+        const brakeDir = -Math.sign(this.speed);
+        this.speed += brakeDir * this.brakingDecel * brakeCmd * dt;
+        if (Math.sign(this.speed) !== -brakeDir) this.speed = 0;
+        this.state = 'BRAKING';
       } else {
         this.speed = 0;
+        this.state = 'STOPPED';
+      }
+
+    } else if (throttleCmd > 0.05) {
+      // Forward Drive (attenuated by brake pedal if partially applied)
+      const effectiveThrottle = throttleCmd * Math.max(0.1, 1.0 - brakeCmd * 0.7);
+      if (this.speed < 0) {
+        // Braking while in reverse
+        this.isBraking = true;
+        this.speed += this.brakingDecel * dt;
+        if (this.speed > 0) this.speed = 0;
+        this.state = 'BRAKING';
+      } else {
+        this.speed += this.acceleration * effectiveThrottle * dt;
+        this.speed = Math.min(this.maxForwardSpeed, this.speed);
+        this.state = this.speed >= this.maxForwardSpeed * 0.95 ? 'CRUISING' : 'ACCELERATING';
+      }
+
+    } else if (throttleCmd < -0.05) {
+      // Reverse Drive
+      if (this.speed > 2) {
+        this.isBraking = true;
+        this.speed -= this.brakingDecel * dt;
+        if (this.speed < 0) this.speed = 0;
+        this.state = 'BRAKING';
+      } else {
+        this.isReversing = true;
+        this.speed -= this.acceleration * 0.7 * Math.abs(throttleCmd) * dt;
+        this.speed = Math.max(-this.maxReverseSpeed, this.speed);
+        this.state = 'REVERSING';
+      }
+
+    } else {
+      // Rolling friction drag
+      if (Math.abs(this.speed) > 1) {
+        const frictionDir = -Math.sign(this.speed);
+        this.speed += frictionDir * this.frictionDecel * dt;
+        if (Math.sign(this.speed) !== -frictionDir) this.speed = 0;
+        this.state = 'CRUISING';
+      } else {
+        this.speed = 0;
+        this.state = 'STOPPED';
       }
     }
 
-    // 3. Kinematic Bicycle Yaw Rate & Heading Integration
-    const wheelbase = this.length * 0.65;
+    // 3. Kinematic Bicycle Yaw Rate & Heading Integration (Supports Reverse Steering Kinematics)
+    const wheelbase = this.wheelbase || (this.length * 0.65);
     if (Math.abs(this.speed) > 0.05) {
       this.angularVelocity = (this.speed / wheelbase) * Math.tan(this.steeringAngle);
       this.heading += this.angularVelocity * dt;
@@ -4751,26 +4818,26 @@ class TrafficManager {
         type: 'car',
         subType: 'sedan',
         x: 380,
-        y: 600,
+        y: 575,
         length: 50,
         width: 25,
         heading: 0, // Eastbound
         speed: 70,
         color: '#dc2626',
-        route: { road: 'main', laneY: 600 }
+        route: { road: 'main', laneY: 575 }
       }),
       new DynamicObject({
         id: 'car-2',
         type: 'car',
         subType: 'hatchback',
         x: 1350,
-        y: 520,
+        y: 525,
         length: 46,
         width: 23,
         heading: Math.PI, // Westbound
         speed: 75,
         color: '#2563eb',
-        route: { road: 'main', laneY: 520 }
+        route: { road: 'main', laneY: 525 }
       }),
       new DynamicObject({
         id: 'car-3',
@@ -4792,26 +4859,26 @@ class TrafficManager {
         type: 'motorcycle',
         subType: 'sport_bike',
         x: 220,
-        y: 600,
+        y: 575,
         length: 28,
         width: 12,
         heading: 0, // Eastbound
         speed: 85,
         color: '#ea580c',
-        route: { road: 'main', laneY: 600 }
+        route: { road: 'main', laneY: 575 }
       }),
       new DynamicObject({
         id: 'bike-2',
         type: 'motorcycle',
         subType: 'commuter',
         x: 1480,
-        y: 520,
+        y: 525,
         length: 27,
         width: 11,
         heading: Math.PI, // Westbound
         speed: 85,
         color: '#1e293b',
-        route: { road: 'main', laneY: 520 }
+        route: { road: 'main', laneY: 525 }
       }),
 
       // --- 3. Auto-Rickshaws (2) ---
@@ -4820,26 +4887,26 @@ class TrafficManager {
         type: 'auto_rickshaw',
         subType: 'cng_auto',
         x: 700,
-        y: 600,
-        length: 44,
-        width: 26,
+        y: 575,
+        length: 36,
+        width: 20,
         heading: 0, // Eastbound
-        speed: 60,
-        color: '#15803d',
-        route: { road: 'main', laneY: 600 }
+        speed: 55,
+        color: '#16a34a',
+        route: { road: 'main', laneY: 575 }
       }),
       new DynamicObject({
         id: 'auto-2',
         type: 'auto_rickshaw',
-        subType: 'cng_auto',
+        subType: 'electric_auto',
         x: 1050,
-        y: 520,
-        length: 44,
-        width: 26,
+        y: 525,
+        length: 36,
+        width: 20,
         heading: Math.PI, // Westbound
-        speed: 60,
-        color: '#15803d',
-        route: { road: 'main', laneY: 520 }
+        speed: 55,
+        color: '#0891b2',
+        route: { road: 'main', laneY: 525 }
       })
     ];
   }
@@ -7503,13 +7570,26 @@ class EgoPPOAgent {
     while (relAngle > Math.PI) relAngle -= Math.PI * 2;
     while (relAngle < -Math.PI) relAngle += Math.PI * 2;
 
+    // Body-frame relative destination vector (positive fwd = goal is in front)
+    const fwdGoalDist = (dx * Math.cos(vehicle.heading) + dy * Math.sin(vehicle.heading)) / 1600;
+    const latGoalDist = (-dx * Math.sin(vehicle.heading) + dy * Math.cos(vehicle.heading)) / 1600;
+
     // Desired road travel heading based on vehicle route phase / heading
     let desiredHeading = 0.0;
+    let targetY = 575;
+    let targetX = 880;
+
     if (vehicle.route && vehicle.route.road === 'side') {
-      desiredHeading = Math.PI / 2; // Northbound side road
-    } else if (Math.abs(vehicle.heading - Math.PI) < Math.PI / 2 || (vehicle.routePhase === 'WESTBOUND')) {
+      desiredHeading = Math.PI / 2; // Southbound side road
+      targetX = vehicle.route.laneX || 880;
+    } else if (Math.abs(vehicle.heading - Math.PI) < Math.PI / 2 || vehicle.routePhase === 'WESTBOUND' || (vehicle.destination && vehicle.destination.x < 500)) {
       desiredHeading = Math.PI; // Westbound main road
+      targetY = (vehicle.route && vehicle.route.laneY) ? vehicle.route.laneY : 525;
+    } else {
+      desiredHeading = 0.0; // Eastbound main road
+      targetY = (vehicle.route && vehicle.route.laneY) ? vehicle.route.laneY : 575;
     }
+
     let headingErr = vehicle.heading - desiredHeading;
     while (headingErr > Math.PI) headingErr -= Math.PI * 2;
     while (headingErr < -Math.PI) headingErr += Math.PI * 2;
@@ -7517,10 +7597,32 @@ class EgoPPOAgent {
     // Lateral velocity perpendicular to road heading
     const lateralVel = (vehicle.speed || 0) * Math.sin(headingErr);
 
-    const topEdgeDist = Math.max(0, Math.min(1.0, (vehicle.y - 465) / 190));
-    const bottomEdgeDist = Math.max(0, Math.min(1.0, (655 - vehicle.y) / 190));
-    const targetY = (vehicle.route && vehicle.route.laneY) ? vehicle.route.laneY : (vehicle.destination ? vehicle.destination.y : 560);
-    const crossTrack = Math.max(-1.0, Math.min(1.0, (vehicle.y - targetY) / 95));
+    // Body-frame cross-track error (positive = right of target lane, negative = left of target lane)
+    let crossTrack = 0;
+    if (desiredHeading === Math.PI / 2) {
+      crossTrack = Math.max(-1.0, Math.min(1.0, (vehicle.x - targetX) / 60));
+    } else if (desiredHeading === Math.PI) {
+      crossTrack = Math.max(-1.0, Math.min(1.0, (targetY - vehicle.y) / 50));
+    } else {
+      crossTrack = Math.max(-1.0, Math.min(1.0, (vehicle.y - targetY) / 50));
+    }
+
+    // Body-frame left and right road edge clearances
+    let leftEdgeClearance = 1.0;
+    let rightEdgeClearance = 1.0;
+    if (desiredHeading === 0.0) {
+      // Eastbound: left is North (y=468), right is South (y=652)
+      leftEdgeClearance = Math.max(0, Math.min(1.0, (vehicle.y - 468) / 100));
+      rightEdgeClearance = Math.max(0, Math.min(1.0, (652 - vehicle.y) / 100));
+    } else if (desiredHeading === Math.PI) {
+      // Westbound: left is South (y=652), right is North (y=468)
+      leftEdgeClearance = Math.max(0, Math.min(1.0, (652 - vehicle.y) / 100));
+      rightEdgeClearance = Math.max(0, Math.min(1.0, (vehicle.y - 468) / 100));
+    } else {
+      // Southbound side road: left is East (x=990), right is West (x=840)
+      leftEdgeClearance = Math.max(0, Math.min(1.0, (990 - vehicle.x) / 75));
+      rightEdgeClearance = Math.max(0, Math.min(1.0, (vehicle.x - 840) / 75));
+    }
 
     // 5 Raycast range sensors [-60°, -30°, 0°, +30°, +60°]
     const rayAngles = [-Math.PI / 3, -Math.PI / 6, 0, Math.PI / 6, Math.PI / 3];
@@ -7603,8 +7705,8 @@ class EgoPPOAgent {
       Math.max(0, Math.min(1.0, vehicle.x / 1800)),
       Math.max(0, Math.min(1.0, vehicle.y / 700)),
       Math.max(-0.5, Math.min(1.0, (vehicle.speed || 0) / 100)),
-      Math.cos(vehicle.heading),
-      Math.sin(vehicle.heading),
+      Math.cos(headingErr),
+      Math.sin(headingErr),
       Math.max(-1.0, Math.min(1.0, (vehicle.angularVelocity || 0) / 2.5)), // 1. Angular velocity / heading change rate
       Math.max(-1.0, Math.min(1.0, lateralVel / 80)),                      // 2. Lateral velocity
       Math.max(-1.0, Math.min(1.0, (vehicle.steeringAngle || 0) / (vehicle.maxSteeringAngle || 0.58))), // 3. Current steering angle
@@ -7612,12 +7714,12 @@ class EgoPPOAgent {
       crossTrack,                                                          // 5. Signed cross-track error
       Math.max(-1.0, Math.min(1.0, crossTrackRate / 3.0)),                 // 6. Rate of change of cross-track error
       headingErr / Math.PI,                                                // 7. Heading error relative to desired travel direction
-      Math.max(-1.0, Math.min(1.0, dx / 1600)),
-      Math.max(-1.0, Math.min(1.0, dy / 1600)),
+      Math.max(-1.0, Math.min(1.0, fwdGoalDist)),
+      Math.max(-1.0, Math.min(1.0, latGoalDist)),
       Math.min(1.0, distToGoal / 1600),
       relAngle / Math.PI,
-      topEdgeDist,
-      bottomEdgeDist,
+      leftEdgeClearance,
+      rightEdgeClearance,
       rayDistances[0],
       rayDistances[1],
       rayDistances[2],
@@ -7846,6 +7948,9 @@ class RLVehicleAgent {
 
   getObservation(sharedPolicy, env, allEntities, dt = 0.035) {
     if (!this.vehicle) return new Array(26).fill(0);
+    if (!this.vehicle.destination && this.destination) {
+      this.vehicle.destination = this.destination;
+    }
     const targetY = (this.vehicle.route && this.vehicle.route.laneY) ? this.vehicle.route.laneY : (this.destination ? this.destination.y : 560);
     const crossTrack = (this.vehicle.y - targetY) / 95;
     const crossTrackRate = (crossTrack - this.prevCrossTrack) / Math.max(0.001, dt);
@@ -9115,25 +9220,53 @@ class SimulationAppController {
     if (this.rlTrainingManager && this.rlTrainingManager.isActive()) {
       this.rlTrainingManager.renderHUD(this.ctx, this.camera);
     } else if (this.trafficManager) {
-      // Render Shared-Policy Traffic RL HUD Badge in Manual / Autonomous mode
+      // Render Shared-Policy Traffic RL Diagnostic HUD in Manual / Autonomous mode
       const roadVehicles = this.trafficManager.getEntities().filter(e => e.type === 'car' || e.type === 'motorcycle' || e.type === 'auto_rickshaw');
-      if (roadVehicles.length > 0 && this.ctx) {
+      const targetCar = roadVehicles[0];
+      if (targetCar && this.ctx) {
         this.ctx.save();
         this.ctx.setTransform(1, 0, 0, 1, 0, 0);
-        this.ctx.fillStyle = 'rgba(15, 23, 42, 0.90)';
-        this.ctx.strokeStyle = 'rgba(16, 185, 129, 0.6)';
+        this.ctx.fillStyle = 'rgba(15, 23, 42, 0.94)';
+        this.ctx.strokeStyle = 'rgba(16, 185, 129, 0.7)';
         this.ctx.lineWidth = 1.2;
         this.ctx.beginPath();
-        this.ctx.roundRect(20, 120, 240, 52, 8);
+        this.ctx.roundRect(20, 120, 275, 165, 8);
         this.ctx.fill();
         this.ctx.stroke();
 
         this.ctx.fillStyle = '#10b981';
         this.ctx.font = 'bold 12px "Segoe UI", sans-serif';
-        this.ctx.fillText('🤖 SHARED-POLICY TRAFFIC RL', 32, 140);
+        this.ctx.fillText(`🤖 TRAFFIC RL DIAGNOSTIC (${targetCar.id})`, 32, 140);
+
         this.ctx.fillStyle = '#94a3b8';
         this.ctx.font = '11px "Segoe UI", sans-serif';
-        this.ctx.fillText(`TRAFFIC RL: ON  |  RL VEHICLES: ${1 + roadVehicles.length}`, 32, 158);
+        const steer = targetCar.inputs ? targetCar.inputs.steer.toFixed(2) : '0.00';
+        const throttle = targetCar.inputs ? targetCar.inputs.throttle.toFixed(2) : '0.00';
+        const brake = targetCar.inputs ? targetCar.inputs.brake.toFixed(2) : '0.00';
+        const spd = targetCar.speed !== undefined ? targetCar.speed.toFixed(1) : '0.0';
+
+        let nearestDist = 180;
+        for (const other of this.trafficManager.getEntities()) {
+          if (other === targetCar || !other.active) continue;
+          const dist = Math.hypot(other.x - targetCar.x, other.y - targetCar.y);
+          if (dist < nearestDist) nearestDist = dist;
+        }
+        if (this.egoVehicle) {
+          const egoDist = Math.hypot(this.egoVehicle.x - targetCar.x, this.egoVehicle.y - targetCar.y);
+          if (egoDist < nearestDist) nearestDist = egoDist;
+        }
+
+        const fwdClearance = Math.max(0, nearestDist - (targetCar.length || 48) / 2).toFixed(1);
+        const colRisk = nearestDist < 50 ? 'DANGER' : (nearestDist < 100 ? 'CAUTION' : 'SAFE');
+
+        this.ctx.fillText(`RL STEERING: [ ${steer} ]`, 32, 160);
+        this.ctx.fillText(`RL THROTTLE: [ ${throttle} ]  BRAKE: [ ${brake} ]`, 32, 178);
+        this.ctx.fillText(`SPEED: ${spd} px/s  |  STATE: ${targetCar.state || 'CRUISING'}`, 32, 196);
+        this.ctx.fillText(`NEAREST OBJECT: ${nearestDist.toFixed(1)} px`, 32, 214);
+        this.ctx.fillText(`FORWARD CLEARANCE: ${fwdClearance} px  |  RISK: ${colRisk}`, 32, 232);
+        this.ctx.fillText(`TRAFFIC RL: ON  |  RL VEHICLES: ${1 + roadVehicles.length}`, 32, 250);
+        this.ctx.fillText(`SHARED POLICY: EgoPPOAgent (Single Model)`, 32, 268);
+
         this.ctx.restore();
       }
     }
