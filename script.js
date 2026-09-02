@@ -556,6 +556,466 @@ const StaticCollisionSystem = {
 };
 
 /* ============================================================================
+   3B. ROAD NETWORK GRAPH & TOPOLOGY SYSTEM (DETERMINISTIC ROAD NETWORK)
+   ============================================================================ */
+
+/**
+ * Road Network Node representation
+ * Represents a discrete, topologically connected spatial waypoint on the road network
+ */
+class RoadNode {
+  constructor(config = {}) {
+    this.id = config.id || `rn-${Math.random().toString(36).substr(2, 6)}`;
+    this.x = config.x || 0;
+    this.y = config.y || 0;
+    this.road = config.road || 'main'; // 'main', 'side', 'intersection'
+    this.lane = config.lane || 'center'; // 'eastbound', 'westbound', 'center', 'southbound', 'northbound', 'junction'
+    this.heading = config.heading !== undefined ? config.heading : 0; // Nominal road orientation in radians
+    this.speedLimit = config.speedLimit || 95;
+    this.edges = []; // Array of outgoing RoadSegment instances
+    this.tags = config.tags || [];
+  }
+
+  addEdge(edge) {
+    if (!this.edges.some(e => e.id === edge.id)) {
+      this.edges.push(edge);
+    }
+  }
+}
+
+/**
+ * Directed Road Segment (Edge) connecting two nodes
+ */
+class RoadSegment {
+  constructor(config = {}) {
+    this.id = config.id || `seg-${config.fromNode.id}->${config.toNode.id}`;
+    this.fromNode = config.fromNode;
+    this.toNode = config.toNode;
+    this.road = config.road || config.fromNode.road;
+    this.lane = config.lane || config.fromNode.lane;
+    this.isDrivable = config.isDrivable !== undefined ? config.isDrivable : true;
+    this.speedLimit = config.speedLimit || 95;
+    this.length = Math.hypot(this.toNode.x - this.fromNode.x, this.toNode.y - this.fromNode.y);
+    
+    // Direction vector & heading
+    const dx = this.toNode.x - this.fromNode.x;
+    const dy = this.toNode.y - this.fromNode.y;
+    this.heading = Math.atan2(dy, dx);
+    this.dirX = this.length > 0 ? dx / this.length : 1;
+    this.dirY = this.length > 0 ? dy / this.length : 0;
+
+    // Optional intermediate waypoints for smooth curve geometry
+    this.waypoints = config.waypoints || [
+      { x: this.fromNode.x, y: this.fromNode.y },
+      { x: this.toNode.x, y: this.toNode.y }
+    ];
+  }
+}
+
+/**
+ * Reusable Road Network Graph & Geometry System
+ */
+class RoadNetworkGraph {
+  constructor(environmentData) {
+    this.env = environmentData || (typeof EnvironmentData !== 'undefined' ? EnvironmentData : null);
+    this.nodes = new Map();
+    this.segments = new Map();
+    this.showDebug = false;
+
+    // Build the deterministic graph structure
+    this.buildGraph();
+  }
+
+  buildGraph() {
+    this.nodes.clear();
+    this.segments.clear();
+
+    // 1. Create Main Road Nodes:
+    // Eastbound Lane (y = 600, heading = 0)
+    const eastX = [50, 200, 350, 500, 650, 800, 920, 1050, 1200, 1350, 1500, 1650, 1750];
+    eastX.forEach((x, idx) => {
+      const isJunction = (x === 920);
+      this.addNode(new RoadNode({
+        id: `node-me-${idx}`,
+        x: x,
+        y: 600,
+        road: isJunction ? 'intersection' : 'main',
+        lane: 'eastbound',
+        heading: 0,
+        speedLimit: 95,
+        tags: ['main', 'eastbound', isJunction ? 'junction' : 'lane']
+      }));
+    });
+
+    // Westbound Lane (y = 520, heading = PI)
+    const westX = [1750, 1650, 1500, 1350, 1200, 1050, 920, 800, 650, 500, 350, 200, 50];
+    westX.forEach((x, idx) => {
+      const isJunction = (x === 920);
+      this.addNode(new RoadNode({
+        id: `node-mw-${idx}`,
+        x: x,
+        y: 520,
+        road: isJunction ? 'intersection' : 'main',
+        lane: 'westbound',
+        heading: Math.PI,
+        speedLimit: 95,
+        tags: ['main', 'westbound', isJunction ? 'junction' : 'lane']
+      }));
+    });
+
+    // Center / Median Corridor (y = 560, bidirectional)
+    const centerX = [50, 200, 350, 500, 650, 800, 920, 1050, 1200, 1350, 1500, 1650, 1750];
+    centerX.forEach((x, idx) => {
+      const isJunction = (x === 920);
+      const isGoal = (x === 1650);
+      this.addNode(new RoadNode({
+        id: `node-mc-${idx}`,
+        x: x,
+        y: 560,
+        road: isJunction ? 'intersection' : 'main',
+        lane: 'center',
+        heading: 0,
+        speedLimit: 95,
+        tags: ['main', 'center', isJunction ? 'junction' : 'median', isGoal ? 'destination' : 'corridor']
+      }));
+    });
+
+    // 2. Create Side Road (Vertical) Nodes:
+    // Southbound Lane (x = 880, heading = PI / 2, approaching T-junction from top)
+    const southY = [50, 150, 270, 380, 460];
+    southY.forEach((y, idx) => {
+      const isJunction = (y === 460);
+      this.addNode(new RoadNode({
+        id: `node-ss-${idx}`,
+        x: 880,
+        y: y,
+        road: isJunction ? 'intersection' : 'side',
+        lane: 'southbound',
+        heading: Math.PI / 2,
+        speedLimit: 60,
+        tags: ['side', 'southbound', isJunction ? 'junction_entry' : 'lane']
+      }));
+    });
+
+    // Northbound Lane (x = 950, heading = -PI / 2, departing T-junction to top)
+    const northY = [460, 380, 270, 150, 50];
+    northY.forEach((y, idx) => {
+      const isJunction = (y === 460);
+      this.addNode(new RoadNode({
+        id: `node-sn-${idx}`,
+        x: 950,
+        y: y,
+        road: isJunction ? 'intersection' : 'side',
+        lane: 'northbound',
+        heading: -Math.PI / 2,
+        speedLimit: 60,
+        tags: ['side', 'northbound', isJunction ? 'junction_exit' : 'lane']
+      }));
+    });
+
+    // 3. Connect Main Road Eastbound Segments:
+    for (let i = 0; i < eastX.length - 1; i++) {
+      this.connectNodes(`node-me-${i}`, `node-me-${i + 1}`, { road: 'main', lane: 'eastbound' });
+    }
+
+    // 4. Connect Main Road Westbound Segments:
+    for (let i = 0; i < westX.length - 1; i++) {
+      this.connectNodes(`node-mw-${i}`, `node-mw-${i + 1}`, { road: 'main', lane: 'westbound' });
+    }
+
+    // 5. Connect Main Center Segments (Bidirectional):
+    for (let i = 0; i < centerX.length - 1; i++) {
+      this.connectNodes(`node-mc-${i}`, `node-mc-${i + 1}`, { road: 'main', lane: 'center' });
+      this.connectNodes(`node-mc-${i + 1}`, `node-mc-${i}`, { road: 'main', lane: 'center' });
+    }
+
+    // 6. Connect Lateral Transitions between Main Lanes (Lane switching & Overtaking paths):
+    for (let i = 0; i < centerX.length; i++) {
+      // Eastbound <-> Center
+      this.connectNodes(`node-me-${i}`, `node-mc-${i}`, { road: 'main', lane: 'transition', speedLimit: 60 });
+      this.connectNodes(`node-mc-${i}`, `node-me-${i}`, { road: 'main', lane: 'transition', speedLimit: 60 });
+      // Center <-> Westbound (matched by coordinates)
+      const westIdx = westX.indexOf(centerX[i]);
+      if (westIdx !== -1) {
+        this.connectNodes(`node-mw-${westIdx}`, `node-mc-${i}`, { road: 'main', lane: 'transition', speedLimit: 60 });
+        this.connectNodes(`node-mc-${i}`, `node-mw-${westIdx}`, { road: 'main', lane: 'transition', speedLimit: 60 });
+      }
+    }
+
+    // 7. Connect Side Road Southbound & Northbound:
+    for (let i = 0; i < southY.length - 1; i++) {
+      this.connectNodes(`node-ss-${i}`, `node-ss-${i + 1}`, { road: 'side', lane: 'southbound', speedLimit: 60 });
+    }
+    for (let i = 0; i < northY.length - 1; i++) {
+      this.connectNodes(`node-sn-${i}`, `node-sn-${i + 1}`, { road: 'side', lane: 'northbound', speedLimit: 60 });
+    }
+
+    // 8. Connect T-Junction Intersecting Segments (Deterministic Turn Arcs):
+    // A. Southbound Side Road (node-ss-4: 880, 460) -> Turn Left onto Eastbound Main (node-me-7: 1050, 600) via junction center (node-mc-6: 920, 560)
+    this.connectNodes('node-ss-4', 'node-mc-6', { road: 'intersection', lane: 'turn_left', speedLimit: 45 });
+    this.connectNodes('node-mc-6', 'node-me-7', { road: 'intersection', lane: 'turn_left', speedLimit: 45 });
+
+    // B. Southbound Side Road (node-ss-4: 880, 460) -> Turn Right onto Westbound Main (node-mw-7: 800, 520)
+    const mw800Idx = westX.indexOf(800);
+    this.connectNodes('node-ss-4', `node-mw-${mw800Idx}`, { road: 'intersection', lane: 'turn_right', speedLimit: 45 });
+
+    // C. Eastbound Main (node-me-5: 800, 600) -> Turn Left onto Northbound Side Road (node-sn-0: 950, 460) via junction center
+    this.connectNodes('node-me-5', 'node-mc-6', { road: 'intersection', lane: 'turn_left', speedLimit: 45 });
+    this.connectNodes('node-mc-6', 'node-sn-0', { road: 'intersection', lane: 'turn_left', speedLimit: 45 });
+
+    // D. Westbound Main (node-mw-5: 1050, 520) -> Turn Right onto Northbound Side Road (node-sn-0: 950, 460)
+    const mw1050Idx = westX.indexOf(1050);
+    this.connectNodes(`node-mw-${mw1050Idx}`, 'node-sn-0', { road: 'intersection', lane: 'turn_right', speedLimit: 45 });
+  }
+
+  addNode(node) {
+    this.nodes.set(node.id, node);
+    return node;
+  }
+
+  connectNodes(fromId, toId, options = {}) {
+    const fromNode = this.nodes.get(fromId);
+    const toNode = this.nodes.get(toId);
+    if (!fromNode || !toNode) return null;
+
+    const segment = new RoadSegment({
+      id: options.id || `seg-${fromId}->${toId}`,
+      fromNode,
+      toNode,
+      road: options.road || fromNode.road,
+      lane: options.lane || fromNode.lane,
+      speedLimit: options.speedLimit || fromNode.speedLimit,
+      isDrivable: options.isDrivable !== undefined ? options.isDrivable : true,
+      waypoints: options.waypoints
+    });
+
+    this.segments.set(segment.id, segment);
+    fromNode.addEdge(segment);
+    return segment;
+  }
+
+  getGraph() {
+    return {
+      nodes: Array.from(this.nodes.values()),
+      segments: Array.from(this.segments.values()),
+      nodeCount: this.nodes.size,
+      segmentCount: this.segments.size
+    };
+  }
+
+  getNearestNode(pos, filter = null) {
+    if (!pos || typeof pos.x !== 'number' || typeof pos.y !== 'number') return null;
+    let closestNode = null;
+    let minDistance = Infinity;
+
+    for (const node of this.nodes.values()) {
+      if (filter && typeof filter === 'function' && !filter(node)) continue;
+      if (filter && typeof filter === 'object') {
+        if (filter.road && node.road !== filter.road) continue;
+        if (filter.lane && node.lane !== filter.lane) continue;
+      }
+
+      const dist = Math.hypot(node.x - pos.x, node.y - pos.y);
+      if (dist < minDistance) {
+        minDistance = dist;
+        closestNode = node;
+      }
+    }
+
+    return closestNode ? { node: closestNode, distance: minDistance } : null;
+  }
+
+  getNearestSegment(pos, filter = null) {
+    if (!pos || typeof pos.x !== 'number' || typeof pos.y !== 'number') return null;
+    let closestSeg = null;
+    let minDistance = Infinity;
+    let bestProj = null;
+    let bestT = 0;
+
+    for (const seg of this.segments.values()) {
+      if (filter && typeof filter === 'function' && !filter(seg)) continue;
+      if (filter && typeof filter === 'object') {
+        if (filter.road && seg.road !== filter.road) continue;
+        if (filter.lane && seg.lane !== filter.lane) continue;
+      }
+
+      const ax = seg.fromNode.x;
+      const ay = seg.fromNode.y;
+      const bx = seg.toNode.x;
+      const by = seg.toNode.y;
+
+      const segLenSq = (bx - ax) * (bx - ax) + (by - ay) * (by - ay);
+      if (segLenSq === 0) continue;
+
+      // Project point P onto segment AB: t = ((P - A) . (B - A)) / |AB|^2
+      let t = ((pos.x - ax) * (bx - ax) + (pos.y - ay) * (by - ay)) / segLenSq;
+      t = Math.max(0, Math.min(1, t));
+
+      const projX = ax + t * (bx - ax);
+      const projY = ay + t * (by - ay);
+      const dist = Math.hypot(pos.x - projX, pos.y - projY);
+
+      if (dist < minDistance) {
+        minDistance = dist;
+        closestSeg = seg;
+        bestProj = { x: projX, y: projY };
+        bestT = t;
+      }
+    }
+
+    return closestSeg ? {
+      segment: closestSeg,
+      distance: minDistance,
+      projectedPoint: bestProj,
+      t: bestT
+    } : null;
+  }
+
+  getConnectedNodes(nodeOrId) {
+    const node = typeof nodeOrId === 'string' ? this.nodes.get(nodeOrId) : nodeOrId;
+    if (!node || !Array.isArray(node.edges)) return [];
+    return node.edges.map(edge => edge.toNode);
+  }
+
+  isOnRoad(pos) {
+    if (!pos || typeof pos.x !== 'number' || typeof pos.y !== 'number') return false;
+    const x = pos.x;
+    const y = pos.y;
+
+    // Check main road corridor (including irregular shoulders)
+    const onMain = (y >= 460 && y <= 665) && (x >= 0 && x <= 1800);
+    // Check side road corridor
+    const onSide = (x >= 835 && x <= 1005) && (y >= 0 && y <= 465);
+
+    if (!onMain && !onSide) return false;
+
+    // Reject sidewalk areas
+    if (window.StaticCollisionSystem && window.StaticCollisionSystem.isSidewalk(x, y)) {
+      return false;
+    }
+
+    // Reject buildings and solid obstacles
+    if (window.StaticCollisionSystem) {
+      const col = window.StaticCollisionSystem.checkSolidCollision(x, y, 6);
+      if (col.collided && col.type === 'building') {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  toggleDebug(forceState) {
+    this.showDebug = forceState !== undefined ? forceState : !this.showDebug;
+    return this.showDebug;
+  }
+
+  renderDebug(ctx, camera) {
+    if (!this.showDebug || !ctx) return;
+
+    ctx.save();
+
+    // 1. Draw Drivable Road Boundary Overlay (Subtle emerald outline)
+    ctx.strokeStyle = 'rgba(16, 185, 129, 0.55)';
+    ctx.lineWidth = 2.5;
+    ctx.setLineDash([8, 6]);
+
+    // Main Road boundary
+    ctx.beginPath();
+    ctx.rect(0, 460, 1800, 205);
+    ctx.stroke();
+
+    // Side Road boundary
+    ctx.beginPath();
+    ctx.rect(835, 0, 170, 465);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // 2. Draw Directed Segments and Direction Arrows
+    for (const seg of this.segments.values()) {
+      const from = seg.fromNode;
+      const to = seg.toNode;
+
+      let strokeColor = 'rgba(56, 189, 248, 0.65)'; // Default cyan for main road
+      if (seg.lane === 'eastbound') strokeColor = 'rgba(16, 185, 129, 0.7)'; // Emerald
+      else if (seg.lane === 'westbound') strokeColor = 'rgba(56, 189, 248, 0.7)'; // Cyan
+      else if (seg.lane === 'center') strokeColor = 'rgba(234, 179, 8, 0.5)'; // Amber
+      else if (seg.lane === 'southbound' || seg.lane === 'northbound') strokeColor = 'rgba(249, 115, 22, 0.75)'; // Orange
+      else if (seg.road === 'intersection') strokeColor = 'rgba(168, 85, 247, 0.85)'; // Purple for junction turns
+
+      ctx.strokeStyle = strokeColor;
+      ctx.lineWidth = seg.road === 'intersection' ? 2.5 : 1.8;
+
+      ctx.beginPath();
+      ctx.moveTo(from.x, from.y);
+      ctx.lineTo(to.x, to.y);
+      ctx.stroke();
+
+      // Draw direction arrowhead at mid-point
+      const midX = (from.x + to.x) / 2;
+      const midY = (from.y + to.y) / 2;
+      const arrowLen = 9;
+      const arrowAngle = 0.45;
+
+      ctx.fillStyle = strokeColor;
+      ctx.beginPath();
+      ctx.moveTo(midX, midY);
+      ctx.lineTo(
+        midX - arrowLen * Math.cos(seg.heading - arrowAngle),
+        midY - arrowLen * Math.sin(seg.heading - arrowAngle)
+      );
+      ctx.lineTo(
+        midX - arrowLen * Math.cos(seg.heading + arrowAngle),
+        midY - arrowLen * Math.sin(seg.heading + arrowAngle)
+      );
+      ctx.closePath();
+      ctx.fill();
+    }
+
+    // 3. Draw Road Nodes
+    for (const node of this.nodes.values()) {
+      let nodeColor = '#38bdf8';
+      if (node.lane === 'eastbound') nodeColor = '#10b981';
+      else if (node.lane === 'westbound') nodeColor = '#06b6d4';
+      else if (node.lane === 'center') nodeColor = '#eab308';
+      else if (node.lane === 'southbound' || node.lane === 'northbound') nodeColor = '#f97316';
+      if (node.tags.includes('destination')) nodeColor = '#ec4899'; // Pink for destination node
+
+      // Outer glow circle
+      ctx.fillStyle = nodeColor;
+      ctx.beginPath();
+      ctx.arc(node.x, node.y, 4.5, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.strokeStyle = '#0f172a';
+      ctx.lineWidth = 1.2;
+      ctx.stroke();
+
+      // Small node label
+      ctx.fillStyle = '#f8fafc';
+      ctx.font = '9px monospace';
+      ctx.fillText(node.id.replace('node-', ''), node.x + 6, node.y - 4);
+    }
+
+    ctx.restore();
+  }
+}
+
+// Global Singleton Road Network Instance
+const RoadNetworkSystem = new RoadNetworkGraph(EnvironmentData);
+window.RoadNetworkSystem = RoadNetworkSystem;
+window.RoadNode = RoadNode;
+window.RoadSegment = RoadSegment;
+window.RoadNetworkGraph = RoadNetworkGraph;
+
+// Global Accessor Functions
+window.getRoadGraph = () => RoadNetworkSystem.getGraph();
+window.getNearestRoadNode = (pos, filter) => RoadNetworkSystem.getNearestNode(pos, filter);
+window.getNearestRoadSegment = (pos, filter) => RoadNetworkSystem.getNearestSegment(pos, filter);
+window.getConnectedRoadNodes = (node) => RoadNetworkSystem.getConnectedNodes(node);
+window.isOnRoad = (pos) => RoadNetworkSystem.isOnRoad(pos);
+
+/* ============================================================================
    4. CAMERA & VIEWPORT CONTROLLER
    ============================================================================ */
 class SimulationCamera {
@@ -5109,6 +5569,7 @@ class SimulationAppController {
       pathCost: document.getElementById('path-cost'),
 
       // Controls
+      btnNetwork: document.getElementById('btn-network'),
       btnPaths: document.getElementById('btn-paths'),
       btnSensors: document.getElementById('btn-sensors'),
       btnTraffic: document.getElementById('btn-traffic'),
@@ -5123,6 +5584,7 @@ class SimulationAppController {
       legendCloseBtn: document.getElementById('legend-close-btn')
     };
 
+    this.roadNetwork = RoadNetworkSystem;
     this.canvas = this.dom.canvas;
     this.ctx = this.canvas.getContext('2d');
   }
@@ -5198,6 +5660,13 @@ class SimulationAppController {
     if (this.dom.btnMode) {
       this.dom.btnMode.addEventListener('click', () => {
         this.toggleAutonomousMode();
+      });
+    }
+
+    // Road Network Graph Debug Toggle Button
+    if (this.dom.btnNetwork) {
+      this.dom.btnNetwork.addEventListener('click', () => {
+        this.toggleRoadNetwork();
       });
     }
 
@@ -5287,13 +5756,15 @@ class SimulationAppController {
       });
     }
 
-    // Keyboard Shortcuts (M: Mode, Space: Stop/Manual, G: Grid, L: Labels, R: Reset View, T: Toggle Traffic, V: Toggle Radar, C: Toggle Paths)
+    // Keyboard Shortcuts (M: Mode, N: Road Network, Space: Stop/Manual, G: Grid, L: Labels, R: Reset View, T: Toggle Traffic, V: Toggle Radar, C: Toggle Paths)
     window.addEventListener('keydown', (e) => {
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
 
       const key = e.key.toLowerCase();
       if (key === 'm') {
         this.toggleAutonomousMode();
+      } else if (key === 'n') {
+        this.toggleRoadNetwork();
       } else if (e.code === 'Space') {
         // Emergency Stop & Return to Manual Teleoperation
         if (this.autonomousController && this.autonomousController.isAutonomous) {
@@ -5314,6 +5785,20 @@ class SimulationAppController {
         this.dom.btnPaths.click();
       }
     });
+  }
+
+  /**
+   * Toggle Road Network Graph debug visualization
+   * @param {boolean} [forceState]
+   * @returns {boolean}
+   */
+  toggleRoadNetwork(forceState) {
+    if (!this.roadNetwork) return false;
+    const state = this.roadNetwork.toggleDebug(forceState);
+    if (this.dom.btnNetwork) {
+      this.dom.btnNetwork.classList.toggle('active', state);
+    }
+    return state;
   }
 
   /**
@@ -5593,6 +6078,11 @@ class SimulationAppController {
     // Render Static Environment (Roads, buildings, potholes, debris, destination, signals)
     EnvironmentRenderer.render(this.ctx, EnvironmentData, this.options);
 
+    // Render Road Network Graph Overlay (Module Navigation Foundation - debug toggled with N)
+    if (this.roadNetwork) {
+      this.roadNetwork.renderDebug(this.ctx, this.camera);
+    }
+
     // Render Dynamic Traffic Objects (Module 3)
     if (this.trafficManager) {
       this.trafficManager.render(this.ctx);
@@ -5728,6 +6218,29 @@ class SimulationAppController {
     return EnvironmentData.roads;
   }
 
+  /**
+   * Road Network System Accessors (Deterministic Road Network Foundation)
+   */
+  getRoadGraph() {
+    return this.roadNetwork ? this.roadNetwork.getGraph() : null;
+  }
+
+  getNearestRoadNode(pos, filter) {
+    return this.roadNetwork ? this.roadNetwork.getNearestNode(pos, filter) : null;
+  }
+
+  getNearestRoadSegment(pos, filter) {
+    return this.roadNetwork ? this.roadNetwork.getNearestSegment(pos, filter) : null;
+  }
+
+  getConnectedRoadNodes(node) {
+    return this.roadNetwork ? this.roadNetwork.getConnectedNodes(node) : [];
+  }
+
+  isOnRoad(pos) {
+    return this.roadNetwork ? this.roadNetwork.isOnRoad(pos) : false;
+  }
+
   registerModule(name, moduleInstance) {
     this.modules[name] = moduleInstance;
     console.log(`[Module Registered] "${name}" connected to simulation engine.`);
@@ -5760,6 +6273,17 @@ window.PathPlanner = PathPlanner;
 window.StaticCollisionSystem = StaticCollisionSystem;
 window.DecisionManager = DecisionManager;
 window.AutonomousVehicleController = AutonomousVehicleController;
+window.RoadNetworkSystem = RoadNetworkSystem;
+window.RoadNetworkGraph = RoadNetworkGraph;
+window.RoadNode = RoadNode;
+window.RoadSegment = RoadSegment;
+
+// Global Direct Accessors
+window.getRoadGraph = () => RoadNetworkSystem.getGraph();
+window.getNearestRoadNode = (pos, filter) => RoadNetworkSystem.getNearestNode(pos, filter);
+window.getNearestRoadSegment = (pos, filter) => RoadNetworkSystem.getNearestSegment(pos, filter);
+window.getConnectedRoadNodes = (node) => RoadNetworkSystem.getConnectedNodes(node);
+window.isOnRoad = (pos) => RoadNetworkSystem.isOnRoad(pos);
 
 // Boot on DOM Ready
 document.addEventListener('DOMContentLoaded', () => {
