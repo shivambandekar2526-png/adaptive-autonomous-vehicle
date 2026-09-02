@@ -1016,6 +1016,403 @@ window.getConnectedRoadNodes = (node) => RoadNetworkSystem.getConnectedNodes(nod
 window.isOnRoad = (pos) => RoadNetworkSystem.isOnRoad(pos);
 
 /* ============================================================================
+   3C. GLOBAL ROUTE PLANNER (A* SEARCH OVER ROAD NETWORK)
+   ============================================================================ */
+
+/**
+ * Global Route Planner Class
+ * Computes deterministic, topologically valid global routes from ego vehicle to destination
+ * using A* Search across the RoadNetworkGraph.
+ */
+class GlobalRoutePlanner {
+  constructor(roadNetwork) {
+    this.network = roadNetwork || (typeof RoadNetworkSystem !== 'undefined' ? RoadNetworkSystem : null);
+    this.currentRoute = null;
+    this.showDebug = true; // Enabled by default to visibly lead to destination
+    this.replanThreshold = 50; // Replan if ego drifts > 50px from route polyline
+    this.lastEgoPos = { x: 0, y: 0 };
+    this.activeWaypointIndex = 0;
+
+    // Immediately compute initial route from default start (140, 580, 0) to default destination (1650, 560)
+    if (this.network && typeof EnvironmentData !== 'undefined' && EnvironmentData.destination) {
+      this.planRoute({ x: 140, y: 580, heading: 0 }, EnvironmentData.destination);
+    }
+  }
+
+  /**
+   * Plan an optimal global route from start to destination using A* Search
+   * @param {Object} startPos - { x, y, heading }
+   * @param {Object} destPos - { x, y }
+   * @param {Object} [options] - Additional routing constraints
+   * @returns {Object|null} Planned route object
+   */
+  planRoute(startPos, destPos, options = {}) {
+    if (!this.network || !startPos || !destPos) return null;
+
+    // 1. Find nearest valid road nodes for start and destination
+    let startNode = null;
+    if (startPos.heading !== undefined) {
+      // Find candidate nodes that align with vehicle heading
+      const candidates = Array.from(this.network.nodes.values()).map(node => {
+        const dist = Math.hypot(node.x - startPos.x, node.y - startPos.y);
+        const angleToNode = Math.atan2(node.y - startPos.y, node.x - startPos.x);
+        let headingDiff = Math.abs(angleToNode - startPos.heading);
+        while (headingDiff > Math.PI) headingDiff -= Math.PI * 2;
+        headingDiff = Math.abs(headingDiff);
+
+        // Moderate penalty for nodes behind vehicle
+        const forwardPenalty = headingDiff > (Math.PI / 2 + 0.2) ? 120 : 0;
+        return { node, score: dist + forwardPenalty, distance: dist };
+      }).sort((a, b) => a.score - b.score);
+
+      startNode = candidates.length > 0 ? candidates[0].node : null;
+    }
+
+    if (!startNode) {
+      const nearestStart = this.network.getNearestNode(startPos);
+      startNode = nearestStart ? nearestStart.node : null;
+    }
+
+    const nearestGoal = this.network.getNearestNode(destPos);
+    const goalNode = nearestGoal ? nearestGoal.node : null;
+
+    if (!startNode || !goalNode) {
+      console.warn('[GlobalRoutePlanner] Could not find start or goal road nodes.');
+      return null;
+    }
+
+    // 2. Execute A* Search on the directed Road Network graph
+    const openSet = new Set([startNode.id]);
+    const closedSet = new Set();
+    const cameFrom = new Map(); // node.id -> { fromNode, edge }
+
+    const gScore = new Map(); // node.id -> cost from start
+    const fScore = new Map(); // node.id -> estimated total cost
+
+    this.network.nodes.forEach(node => {
+      gScore.set(node.id, Infinity);
+      fScore.set(node.id, Infinity);
+    });
+
+    gScore.set(startNode.id, 0);
+    fScore.set(startNode.id, this.heuristic(startNode, goalNode));
+
+    let foundGoal = false;
+
+    while (openSet.size > 0) {
+      // Find node in openSet with lowest fScore
+      let currentId = null;
+      let lowestF = Infinity;
+
+      for (const id of openSet) {
+        const f = fScore.get(id);
+        if (f < lowestF) {
+          lowestF = f;
+          currentId = id;
+        }
+      }
+
+      if (currentId === goalNode.id) {
+        foundGoal = true;
+        break;
+      }
+
+      openSet.delete(currentId);
+      closedSet.add(currentId);
+
+      const currentNode = this.network.nodes.get(currentId);
+      if (!currentNode || !Array.isArray(currentNode.edges)) continue;
+
+      // Expand outgoing directed edges
+      for (const edge of currentNode.edges) {
+        if (!edge.isDrivable) continue;
+        const neighbor = edge.toNode;
+        if (!neighbor || closedSet.has(neighbor.id)) continue;
+
+        // Base edge cost = edge length
+        let edgeCost = edge.length;
+
+        // Preference weighting:
+        // - Main flow lanes preferred over lateral transitions
+        if (edge.lane === 'transition') {
+          edgeCost *= 1.25;
+        }
+        // - Junction turns speed adjusted
+        if (edge.road === 'intersection') {
+          edgeCost *= 1.1;
+        }
+
+        const tentativeG = gScore.get(currentId) + edgeCost;
+
+        if (!openSet.has(neighbor.id)) {
+          openSet.add(neighbor.id);
+        } else if (tentativeG >= gScore.get(neighbor.id)) {
+          continue; // Not a better path
+        }
+
+        cameFrom.set(neighbor.id, { fromNode: currentNode, edge: edge });
+        gScore.set(neighbor.id, tentativeG);
+        fScore.set(neighbor.id, tentativeG + this.heuristic(neighbor, goalNode));
+      }
+    }
+
+    if (!foundGoal && startNode.id !== goalNode.id) {
+      console.warn('[GlobalRoutePlanner] No connected path found between', startNode.id, 'and', goalNode.id);
+      return null;
+    }
+
+    // 3. Reconstruct Route Path
+    const pathNodes = [];
+    const pathEdges = [];
+    let curr = goalNode.id;
+
+    pathNodes.unshift(goalNode);
+
+    while (cameFrom.has(curr)) {
+      const step = cameFrom.get(curr);
+      pathEdges.unshift(step.edge);
+      pathNodes.unshift(step.fromNode);
+      curr = step.fromNode.id;
+    }
+
+    // 4. Generate Ordered Waypoint Sequence
+    const waypoints = [];
+    let totalDist = 0;
+
+    // Add start position as initial waypoint
+    waypoints.push({
+      x: startPos.x,
+      y: startPos.y,
+      road: startNode.road,
+      lane: startNode.lane,
+      heading: startNode.heading,
+      speedLimit: startNode.speedLimit,
+      nodeId: startNode.id
+    });
+
+    for (let i = 0; i < pathNodes.length; i++) {
+      const node = pathNodes[i];
+      waypoints.push({
+        x: node.x,
+        y: node.y,
+        road: node.road,
+        lane: node.lane,
+        heading: node.heading,
+        speedLimit: node.speedLimit,
+        nodeId: node.id
+      });
+
+      if (i > 0) {
+        totalDist += Math.hypot(node.x - pathNodes[i - 1].x, node.y - pathNodes[i - 1].y);
+      }
+    }
+
+    // Add final destination marker waypoint
+    waypoints.push({
+      x: destPos.x,
+      y: destPos.y,
+      road: goalNode.road,
+      lane: goalNode.lane,
+      heading: goalNode.heading,
+      speedLimit: 0,
+      nodeId: 'destination-goal'
+    });
+    totalDist += Math.hypot(destPos.x - goalNode.x, destPos.y - goalNode.y);
+
+    const route = {
+      startNode,
+      goalNode,
+      nodes: pathNodes,
+      segments: pathEdges,
+      waypoints,
+      totalDistance: totalDist,
+      estimatedTime: totalDist / 85, // Estimated seconds at average cruising speed
+      status: 'FOUND',
+      timestamp: Date.now()
+    };
+
+    this.currentRoute = route;
+    this.activeWaypointIndex = 0;
+    return route;
+  }
+
+  /**
+   * Euclidean distance heuristic for A*
+   */
+  heuristic(nodeA, nodeB) {
+    return Math.hypot(nodeB.x - nodeA.x, nodeB.y - nodeA.y);
+  }
+
+  /**
+   * Continuous update / Re-routing / Recovery check
+   */
+  update(ego, destination) {
+    if (!ego || !destination) return this.currentRoute;
+
+    // Check if initial route exists
+    if (!this.currentRoute || this.currentRoute.status !== 'FOUND') {
+      return this.planRoute(ego, destination);
+    }
+
+    // Check distance to current route polyline
+    const distToRoute = this.getDistanceToRoute(ego);
+
+    // If vehicle has drifted off-route or is too far (> replanThreshold), recover by replanning
+    if (distToRoute > this.replanThreshold) {
+      return this.planRoute(ego, destination);
+    }
+
+    // Advance active waypoint index
+    if (this.currentRoute.waypoints && this.currentRoute.waypoints.length > 0) {
+      while (this.activeWaypointIndex < this.currentRoute.waypoints.length - 1) {
+        const wpCurr = this.currentRoute.waypoints[this.activeWaypointIndex];
+        const wpNext = this.currentRoute.waypoints[this.activeWaypointIndex + 1];
+
+        const distToWp = Math.hypot(wpCurr.x - ego.x, wpCurr.y - ego.y);
+
+        // Vector from curr to next waypoint
+        const segDx = wpNext.x - wpCurr.x;
+        const segDy = wpNext.y - wpCurr.y;
+        const segLenSq = segDx * segDx + segDy * segDy;
+
+        let passed = false;
+        if (segLenSq > 0) {
+          const t = ((ego.x - wpCurr.x) * segDx + (ego.y - wpCurr.y) * segDy) / segLenSq;
+          if (t > 0.4) passed = true; // Passed towards next waypoint
+        }
+
+        if (distToWp < 45 || passed) {
+          this.activeWaypointIndex++;
+        } else {
+          break;
+        }
+      }
+    }
+
+    return this.currentRoute;
+  }
+
+  /**
+   * Calculate minimum distance from vehicle position to current route polyline
+   */
+  getDistanceToRoute(pos) {
+    if (!this.currentRoute || !this.currentRoute.waypoints || this.currentRoute.waypoints.length < 2) {
+      return Infinity;
+    }
+
+    let minDistance = Infinity;
+    const wps = this.currentRoute.waypoints;
+
+    for (let i = 0; i < wps.length - 1; i++) {
+      const p1 = wps[i];
+      const p2 = wps[i + 1];
+
+      const dx = p2.x - p1.x;
+      const dy = p2.y - p1.y;
+      const lenSq = dx * dx + dy * dy;
+
+      if (lenSq === 0) {
+        const d = Math.hypot(pos.x - p1.x, pos.y - p1.y);
+        if (d < minDistance) minDistance = d;
+        continue;
+      }
+
+      let t = ((pos.x - p1.x) * dx + (pos.y - p1.y) * dy) / lenSq;
+      t = Math.max(0, Math.min(1, t));
+
+      const projX = p1.x + t * dx;
+      const projY = p1.y + t * dy;
+      const d = Math.hypot(pos.x - projX, pos.y - projY);
+
+      if (d < minDistance) {
+        minDistance = d;
+      }
+    }
+
+    return minDistance;
+  }
+
+  getRoute() {
+    return this.currentRoute;
+  }
+
+  toggleDebug(forceState) {
+    this.showDebug = forceState !== undefined ? forceState : !this.showDebug;
+    return this.showDebug;
+  }
+
+  renderDebug(ctx, camera) {
+    if (!this.showDebug || !this.currentRoute || !this.currentRoute.waypoints || this.currentRoute.waypoints.length < 2 || !ctx) {
+      return;
+    }
+
+    ctx.save();
+
+    const wps = this.currentRoute.waypoints;
+
+    // 1. Draw glowing background corridor for the route
+    ctx.strokeStyle = 'rgba(234, 179, 8, 0.28)'; // Amber glow
+    ctx.lineWidth = 14;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+
+    ctx.beginPath();
+    ctx.moveTo(wps[0].x, wps[0].y);
+    for (let i = 1; i < wps.length; i++) {
+      ctx.lineTo(wps[i].x, wps[i].y);
+    }
+    ctx.stroke();
+
+    // 2. Draw solid sharp golden route line
+    ctx.strokeStyle = '#eab308'; // Bright Gold
+    ctx.lineWidth = 3.5;
+    ctx.setLineDash([12, 6]);
+
+    ctx.beginPath();
+    ctx.moveTo(wps[0].x, wps[0].y);
+    for (let i = 1; i < wps.length; i++) {
+      ctx.lineTo(wps[i].x, wps[i].y);
+    }
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // 3. Draw route waypoint nodes
+    for (let i = 0; i < wps.length; i++) {
+      const wp = wps[i];
+      const isStart = (i === 0);
+      const isGoal = (i === wps.length - 1);
+      const isActive = (i === this.activeWaypointIndex);
+
+      ctx.beginPath();
+      ctx.arc(wp.x, wp.y, isStart || isGoal ? 6 : (isActive ? 5 : 3.5), 0, Math.PI * 2);
+
+      if (isStart) {
+        ctx.fillStyle = '#10b981'; // Green for route start
+      } else if (isGoal) {
+        ctx.fillStyle = '#ec4899'; // Pink for route goal
+      } else if (isActive) {
+        ctx.fillStyle = '#38bdf8'; // Cyan for current target
+      } else {
+        ctx.fillStyle = '#fbbf24'; // Amber for route waypoints
+      }
+      ctx.fill();
+
+      ctx.strokeStyle = '#0f172a';
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+    }
+
+    ctx.restore();
+  }
+}
+
+// Global Singleton Global Route Planner Instance
+const GlobalRouteSystem = new GlobalRoutePlanner(RoadNetworkSystem);
+window.GlobalRoutePlanner = GlobalRoutePlanner;
+window.GlobalRouteSystem = GlobalRouteSystem;
+window.getGlobalRoute = () => GlobalRouteSystem.getRoute();
+
+/* ============================================================================
    4. CAMERA & VIEWPORT CONTROLLER
    ============================================================================ */
 class SimulationCamera {
@@ -5501,6 +5898,10 @@ class SimulationAppController {
     // Module 6B: Autonomous Vehicle Controller
     this.autonomousController = new AutonomousVehicleController();
 
+    // Road Network & Global Route Planner Systems
+    this.roadNetwork = RoadNetworkSystem;
+    this.routePlanner = GlobalRouteSystem;
+
     // Registered Submodules
     this.modules = {};
 
@@ -5522,6 +5923,11 @@ class SimulationAppController {
     this.setupCanvas();
     this.bindEvents();
     this.camera.fitToWorld();
+
+    // Compute initial Global Route to Destination
+    if (this.routePlanner && this.egoVehicle) {
+      this.routePlanner.planRoute(this.egoVehicle, EnvironmentData.destination);
+    }
 
     // Start 60 FPS Continuous Simulation Loop
     this.lastTime = performance.now();
@@ -5569,6 +5975,7 @@ class SimulationAppController {
       pathCost: document.getElementById('path-cost'),
 
       // Controls
+      btnRoute: document.getElementById('btn-route'),
       btnNetwork: document.getElementById('btn-network'),
       btnPaths: document.getElementById('btn-paths'),
       btnSensors: document.getElementById('btn-sensors'),
@@ -5584,7 +5991,6 @@ class SimulationAppController {
       legendCloseBtn: document.getElementById('legend-close-btn')
     };
 
-    this.roadNetwork = RoadNetworkSystem;
     this.canvas = this.dom.canvas;
     this.ctx = this.canvas.getContext('2d');
   }
@@ -5663,6 +6069,13 @@ class SimulationAppController {
       });
     }
 
+    // Global Route Plan Debug Toggle Button
+    if (this.dom.btnRoute) {
+      this.dom.btnRoute.addEventListener('click', () => {
+        this.toggleRoute();
+      });
+    }
+
     // Road Network Graph Debug Toggle Button
     if (this.dom.btnNetwork) {
       this.dom.btnNetwork.addEventListener('click', () => {
@@ -5703,6 +6116,9 @@ class SimulationAppController {
         this.egoVehicle.reset();
         if (this.autonomousController) {
           this.autonomousController.hasArrived = false;
+        }
+        if (this.routePlanner) {
+          this.routePlanner.planRoute(this.egoVehicle, EnvironmentData.destination);
         }
       });
     }
@@ -5756,13 +6172,15 @@ class SimulationAppController {
       });
     }
 
-    // Keyboard Shortcuts (M: Mode, N: Road Network, Space: Stop/Manual, G: Grid, L: Labels, R: Reset View, T: Toggle Traffic, V: Toggle Radar, C: Toggle Paths)
+    // Keyboard Shortcuts (M: Mode, O: Route, N: Road Network, Space: Stop/Manual, G: Grid, L: Labels, R: Reset View, T: Toggle Traffic, V: Toggle Radar, C: Toggle Paths)
     window.addEventListener('keydown', (e) => {
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
 
       const key = e.key.toLowerCase();
       if (key === 'm') {
         this.toggleAutonomousMode();
+      } else if (key === 'o') {
+        this.toggleRoute();
       } else if (key === 'n') {
         this.toggleRoadNetwork();
       } else if (e.code === 'Space') {
@@ -5785,6 +6203,20 @@ class SimulationAppController {
         this.dom.btnPaths.click();
       }
     });
+  }
+
+  /**
+   * Toggle Global Route debug visualization
+   * @param {boolean} [forceState]
+   * @returns {boolean}
+   */
+  toggleRoute(forceState) {
+    if (!this.routePlanner) return false;
+    const state = this.routePlanner.toggleDebug(forceState);
+    if (this.dom.btnRoute) {
+      this.dom.btnRoute.classList.toggle('active', state);
+    }
+    return state;
   }
 
   /**
@@ -5842,6 +6274,11 @@ class SimulationAppController {
   loop(currentTime) {
     const dt = Math.min((currentTime - this.lastTime) / 1000, 0.1);
     this.lastTime = currentTime;
+
+    // 0. Update Global Route Plan (A* Route over Road Network)
+    if (this.routePlanner) {
+      this.routePlanner.update(this.egoVehicle, EnvironmentData.destination);
+    }
 
     // 1. Update Perception & Risk Assessment (Module 4)
     if (this.detectionManager) {
@@ -6083,6 +6520,11 @@ class SimulationAppController {
       this.roadNetwork.renderDebug(this.ctx, this.camera);
     }
 
+    // Render Global Planned Route Overlay (A* Route Path - debug toggled with O)
+    if (this.routePlanner) {
+      this.routePlanner.renderDebug(this.ctx, this.camera);
+    }
+
     // Render Dynamic Traffic Objects (Module 3)
     if (this.trafficManager) {
       this.trafficManager.render(this.ctx);
@@ -6241,6 +6683,17 @@ class SimulationAppController {
     return this.roadNetwork ? this.roadNetwork.isOnRoad(pos) : false;
   }
 
+  /**
+   * Global Route Planner Accessors (A* Route over Road Network)
+   */
+  getGlobalRoute() {
+    return this.routePlanner ? this.routePlanner.getRoute() : null;
+  }
+
+  getRoutePlanner() {
+    return this.routePlanner;
+  }
+
   registerModule(name, moduleInstance) {
     this.modules[name] = moduleInstance;
     console.log(`[Module Registered] "${name}" connected to simulation engine.`);
@@ -6277,6 +6730,8 @@ window.RoadNetworkSystem = RoadNetworkSystem;
 window.RoadNetworkGraph = RoadNetworkGraph;
 window.RoadNode = RoadNode;
 window.RoadSegment = RoadSegment;
+window.GlobalRoutePlanner = GlobalRoutePlanner;
+window.GlobalRouteSystem = GlobalRouteSystem;
 
 // Global Direct Accessors
 window.getRoadGraph = () => RoadNetworkSystem.getGraph();
@@ -6284,6 +6739,7 @@ window.getNearestRoadNode = (pos, filter) => RoadNetworkSystem.getNearestNode(po
 window.getNearestRoadSegment = (pos, filter) => RoadNetworkSystem.getNearestSegment(pos, filter);
 window.getConnectedRoadNodes = (node) => RoadNetworkSystem.getConnectedNodes(node);
 window.isOnRoad = (pos) => RoadNetworkSystem.isOnRoad(pos);
+window.getGlobalRoute = () => SimulationEngine.getGlobalRoute();
 
 // Boot on DOM Ready
 document.addEventListener('DOMContentLoaded', () => {
