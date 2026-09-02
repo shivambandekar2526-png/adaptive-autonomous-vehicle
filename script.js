@@ -6970,7 +6970,704 @@ class AutonomousVehicleController {
 }
 
 /* ============================================================================
-   11. SIMULATION CORE APPLICATION CONTROLLER & GAME LOOP
+   11. MODULE 7: REINFORCEMENT LEARNING EGO AGENT & TRAINING MANAGER
+   ============================================================================ */
+
+/**
+ * Multi-Layer Perceptron (MLP) Neural Network with Adam Optimizer
+ * Supports continuous forward and backward propagation in pure vanilla JavaScript.
+ */
+class MLPNet {
+  constructor(inputDim, hiddenDims, outputDim, outputActivations = ['tanh', 'sigmoid', 'sigmoid']) {
+    this.inputDim = inputDim;
+    this.hiddenDims = hiddenDims;
+    this.outputDim = outputDim;
+    this.outputActivations = outputActivations;
+
+    this.weights = [];
+    this.biases = [];
+    this.m_w = [];
+    this.v_w = [];
+    this.m_b = [];
+    this.v_b = [];
+
+    const dims = [inputDim, ...hiddenDims, outputDim];
+    for (let i = 0; i < dims.length - 1; i++) {
+      const fanIn = dims[i];
+      const fanOut = dims[i + 1];
+      const scale = Math.sqrt(2.0 / fanIn);
+
+      const w = new Float32Array(fanIn * fanOut);
+      for (let j = 0; j < w.length; j++) {
+        w[j] = (Math.random() * 2 - 1) * scale;
+      }
+      const b = new Float32Array(fanOut).fill(0.01);
+
+      this.weights.push(w);
+      this.biases.push(b);
+      this.m_w.push(new Float32Array(w.length));
+      this.v_w.push(new Float32Array(w.length));
+      this.m_b.push(new Float32Array(b.length));
+      this.v_b.push(new Float32Array(b.length));
+    }
+  }
+
+  forward(input) {
+    let curr = new Float32Array(input);
+    const activations = [curr];
+    const numLayers = this.weights.length;
+
+    for (let l = 0; l < numLayers; l++) {
+      const fanIn = l === 0 ? this.inputDim : this.hiddenDims[l - 1];
+      const fanOut = l === numLayers - 1 ? this.outputDim : this.hiddenDims[l];
+      const w = this.weights[l];
+      const b = this.biases[l];
+
+      const next = new Float32Array(fanOut);
+      for (let j = 0; j < fanOut; j++) {
+        let sum = b[j];
+        for (let i = 0; i < fanIn; i++) {
+          sum += curr[i] * w[i * fanOut + j];
+        }
+
+        if (l < numLayers - 1) {
+          next[j] = Math.tanh(sum);
+        } else {
+          const act = this.outputActivations[j] || this.outputActivations[0] || 'linear';
+          if (act === 'tanh') {
+            next[j] = Math.tanh(sum);
+          } else if (act === 'sigmoid') {
+            next[j] = 1 / (1 + Math.exp(-Math.max(-10, Math.min(10, sum))));
+          } else {
+            next[j] = sum;
+          }
+        }
+      }
+      curr = next;
+      activations.push(curr);
+    }
+    return { output: Array.from(curr), activations };
+  }
+
+  backward(activations, gradOutput) {
+    const numLayers = this.weights.length;
+    let gradCurrent = new Float32Array(gradOutput);
+
+    const gradWeights = [];
+    const gradBiases = [];
+
+    for (let l = numLayers - 1; l >= 0; l--) {
+      const input = activations[l];
+      const output = activations[l + 1];
+      const fanIn = l === 0 ? this.inputDim : this.hiddenDims[l - 1];
+      const fanOut = l === numLayers - 1 ? this.outputDim : this.hiddenDims[l];
+      const w = this.weights[l];
+
+      const gradZ = new Float32Array(fanOut);
+      for (let j = 0; j < fanOut; j++) {
+        if (l < numLayers - 1) {
+          gradZ[j] = gradCurrent[j] * (1 - output[j] * output[j]);
+        } else {
+          const act = this.outputActivations[j] || this.outputActivations[0] || 'linear';
+          if (act === 'tanh') {
+            gradZ[j] = gradCurrent[j] * (1 - output[j] * output[j]);
+          } else if (act === 'sigmoid') {
+            gradZ[j] = gradCurrent[j] * (output[j] * (1 - output[j]));
+          } else {
+            gradZ[j] = gradCurrent[j];
+          }
+        }
+      }
+
+      const gw = new Float32Array(fanIn * fanOut);
+      const gb = new Float32Array(fanOut);
+
+      for (let j = 0; j < fanOut; j++) {
+        gb[j] = gradZ[j];
+        for (let i = 0; i < fanIn; i++) {
+          gw[i * fanOut + j] = input[i] * gradZ[j];
+        }
+      }
+
+      gradWeights.unshift(gw);
+      gradBiases.unshift(gb);
+
+      if (l > 0) {
+        const gradPrev = new Float32Array(fanIn);
+        for (let i = 0; i < fanIn; i++) {
+          let sum = 0;
+          for (let j = 0; j < fanOut; j++) {
+            sum += w[i * fanOut + j] * gradZ[j];
+          }
+          gradPrev[i] = sum;
+        }
+        gradCurrent = gradPrev;
+      }
+    }
+
+    return { gradWeights, gradBiases };
+  }
+
+  applyGradients(gradWeights, gradBiases, lr = 0.001, beta1 = 0.9, beta2 = 0.999, eps = 1e-8) {
+    for (let l = 0; l < this.weights.length; l++) {
+      const w = this.weights[l];
+      const b = this.biases[l];
+      const gw = gradWeights[l];
+      const gb = gradBiases[l];
+      const mw = this.m_w[l];
+      const vw = this.v_w[l];
+      const mb = this.m_b[l];
+      const vb = this.v_b[l];
+
+      for (let i = 0; i < w.length; i++) {
+        mw[i] = beta1 * mw[i] + (1 - beta1) * gw[i];
+        vw[i] = beta2 * vw[i] + (1 - beta2) * (gw[i] * gw[i]);
+        const mHat = mw[i] / (1 - beta1);
+        const vHat = vw[i] / (1 - beta2);
+        w[i] -= (lr * mHat) / (Math.sqrt(vHat) + eps);
+      }
+
+      for (let j = 0; j < b.length; j++) {
+        mb[j] = beta1 * mb[j] + (1 - beta1) * gb[j];
+        vb[j] = beta2 * vb[j] + (1 - beta2) * (gb[j] * gb[j]);
+        const mHat = mb[j] / (1 - beta1);
+        const vHat = vb[j] / (1 - beta2);
+        b[j] -= (lr * mHat) / (Math.sqrt(vHat) + eps);
+      }
+    }
+  }
+
+  serialize() {
+    return {
+      inputDim: this.inputDim,
+      hiddenDims: this.hiddenDims,
+      outputDim: this.outputDim,
+      outputActivations: this.outputActivations,
+      weights: this.weights.map(w => Array.from(w)),
+      biases: this.biases.map(b => Array.from(b))
+    };
+  }
+
+  deserialize(data) {
+    this.inputDim = data.inputDim;
+    this.hiddenDims = data.hiddenDims;
+    this.outputDim = data.outputDim;
+    this.outputActivations = data.outputActivations;
+    this.weights = data.weights.map(w => new Float32Array(w));
+    this.biases = data.biases.map(b => new Float32Array(b));
+  }
+}
+
+/**
+ * Continuous Actor-Critic Reinforcement Learning Agent for Ego Vehicle
+ * Directly maps continuous 20-dimensional simulation state observations to continuous
+ * physical vehicle driving inputs: Steering [-1, 1], Throttle [0, 1], and Brake [0, 1].
+ */
+class EgoRLAgent {
+  constructor(options = {}) {
+    this.obsDim = options.obsDim || 20;
+    this.actionDim = options.actionDim || 3;
+    this.hiddenDims = options.hiddenDims || [64, 64];
+
+    this.actor = new MLPNet(this.obsDim, this.hiddenDims, this.actionDim, ['tanh', 'sigmoid', 'sigmoid']);
+    this.critic = new MLPNet(this.obsDim, this.hiddenDims, 1, ['linear']);
+
+    this.explorationNoise = 0.25;
+    this.minNoise = 0.05;
+    this.noiseDecay = 0.995;
+    this.gamma = 0.99;
+    this.actorLr = 0.0008;
+    this.criticLr = 0.0015;
+
+    this.episodesTrained = 0;
+    this.bestReward = -Infinity;
+    this.trajectory = [];
+  }
+
+  /**
+   * Extract comprehensive, normalized 20-D observation vector from simulation environment
+   */
+  getObservation(ego, env, routePlanner) {
+    if (!ego || !env) return new Array(this.obsDim).fill(0);
+
+    const dest = env.destination || { x: 1650, y: 560 };
+    const dx = dest.x - ego.x;
+    const dy = dest.y - ego.y;
+    const distToGoal = Math.hypot(dx, dy);
+    const destAngle = Math.atan2(dy, dx);
+    let relAngle = destAngle - ego.heading;
+    while (relAngle > Math.PI) relAngle -= Math.PI * 2;
+    while (relAngle < -Math.PI) relAngle += Math.PI * 2;
+
+    const topEdgeDist = Math.max(0, Math.min(1.0, (ego.y - 465) / 190));
+    const bottomEdgeDist = Math.max(0, Math.min(1.0, (655 - ego.y) / 190));
+    const crossTrack = Math.max(-1.0, Math.min(1.0, (ego.y - 560) / 95));
+
+    let routeAngleErr = 0;
+    let lookaheadAngle = relAngle;
+    let progressRatio = 0;
+
+    if (routePlanner && typeof routePlanner.getNavigationTarget === 'function') {
+      const nav = routePlanner.getNavigationTarget(ego, 60);
+      if (nav && nav.hasRoute) {
+        let diff = (nav.targetHeading || 0) - ego.heading;
+        while (diff > Math.PI) diff -= Math.PI * 2;
+        while (diff < -Math.PI) diff += Math.PI * 2;
+        routeAngleErr = diff / Math.PI;
+
+        if (nav.targetLookahead) {
+          const laAngle = Math.atan2(nav.targetLookahead.y - ego.y, nav.targetLookahead.x - ego.x);
+          let laDiff = laAngle - ego.heading;
+          while (laDiff > Math.PI) laDiff -= Math.PI * 2;
+          while (laDiff < -Math.PI) laDiff += Math.PI * 2;
+          lookaheadAngle = laDiff / Math.PI;
+        }
+        progressRatio = (nav.progressPercent || 0) / 100;
+      }
+    }
+
+    // 5 Raycast range sensors [-60°, -30°, 0°, +30°, +60°]
+    const rayAngles = [-Math.PI / 3, -Math.PI / 6, 0, Math.PI / 6, Math.PI / 3];
+    const rayDistances = [];
+    const maxRayLen = 140;
+
+    for (const offset of rayAngles) {
+      const rayAngle = ego.heading + offset;
+      const cosA = Math.cos(rayAngle);
+      const sinA = Math.sin(rayAngle);
+      let hitDist = maxRayLen;
+
+      if (typeof window !== 'undefined' && window.StaticCollisionSystem) {
+        for (let d = 10; d <= maxRayLen; d += 15) {
+          const px = ego.x + d * cosA;
+          const py = ego.y + d * sinA;
+          if (!window.StaticCollisionSystem.isDrivableRoad(px, py)) {
+            hitDist = d;
+            break;
+          }
+        }
+      }
+      rayDistances.push(hitDist / maxRayLen);
+    }
+
+    return [
+      Math.max(-0.5, Math.min(1.0, (ego.speed || 0) / 100)),
+      Math.cos(ego.heading),
+      Math.sin(ego.heading),
+      Math.min(1.0, distToGoal / 1600),
+      relAngle / Math.PI,
+      topEdgeDist,
+      bottomEdgeDist,
+      crossTrack,
+      routeAngleErr,
+      lookaheadAngle,
+      rayDistances[0],
+      rayDistances[1],
+      rayDistances[2],
+      rayDistances[3],
+      rayDistances[4],
+      1.0, // nearest obstacle distance
+      0.0, // nearest obstacle angle
+      0.0, // pothole hazard
+      0.0, // turn ahead
+      progressRatio
+    ];
+  }
+
+  /**
+   * Sample action from policy
+   * @param {Array<number>} obs
+   * @param {boolean} isTraining
+   */
+  selectAction(obs, isTraining = true) {
+    const actRes = this.actor.forward(obs);
+    const meanAction = actRes.output; // [steer, throttle, brake]
+    const criticRes = this.critic.forward(obs);
+    const value = criticRes.output[0];
+
+    const action = [...meanAction];
+    if (isTraining) {
+      // Gaussian exploration noise
+      action[0] = Math.max(-1.0, Math.min(1.0, action[0] + (Math.random() * 2 - 1) * this.explorationNoise));
+      action[1] = Math.max(0.0, Math.min(1.0, action[1] + (Math.random() * 2 - 1) * this.explorationNoise * 0.5));
+      action[2] = Math.max(0.0, Math.min(1.0, action[2] + (Math.random() * 2 - 1) * this.explorationNoise * 0.5));
+    }
+
+    return {
+      action,
+      meanAction,
+      value,
+      actorActivations: actRes.activations,
+      criticActivations: criticRes.activations
+    };
+  }
+
+  recordStep(obs, actionData, reward, done) {
+    this.trajectory.push({
+      obs,
+      action: actionData.action,
+      meanAction: actionData.meanAction,
+      value: actionData.value,
+      actorActivations: actionData.actorActivations,
+      criticActivations: actionData.criticActivations,
+      reward,
+      done
+    });
+  }
+
+  trainOnEpisode() {
+    const N = this.trajectory.length;
+    if (N === 0) return 0;
+
+    // 1. Compute discounted returns & advantages
+    const returns = new Float32Array(N);
+    const advantages = new Float32Array(N);
+    let runningReturn = 0;
+
+    for (let t = N - 1; t >= 0; t--) {
+      const step = this.trajectory[t];
+      runningReturn = step.reward + (step.done ? 0 : this.gamma * runningReturn);
+      returns[t] = runningReturn;
+      advantages[t] = returns[t] - step.value;
+    }
+
+    // Normalize advantages for gradient stability
+    let meanAdv = 0;
+    for (let t = 0; t < N; t++) meanAdv += advantages[t];
+    meanAdv /= N;
+    let varAdv = 0;
+    for (let t = 0; t < N; t++) varAdv += (advantages[t] - meanAdv) ** 2;
+    const stdAdv = Math.sqrt(varAdv / N) + 1e-8;
+
+    for (let t = 0; t < N; t++) {
+      advantages[t] = (advantages[t] - meanAdv) / stdAdv;
+    }
+
+    // 2. Compute and apply Actor & Critic gradients
+    for (let t = 0; t < N; t++) {
+      const step = this.trajectory[t];
+      const adv = advantages[t];
+
+      // Policy Gradient: - (a - mu) * adv
+      const gradActorOutput = [
+        -(step.action[0] - step.meanAction[0]) * adv,
+        -(step.action[1] - step.meanAction[1]) * adv,
+        -(step.action[2] - step.meanAction[2]) * adv
+      ];
+
+      const actorGrads = this.actor.backward(step.actorActivations, gradActorOutput);
+      this.actor.applyGradients(actorGrads.gradWeights, actorGrads.gradBiases, this.actorLr);
+
+      // Critic MSE gradient: 2 * (V(s) - Return)
+      const gradCriticOutput = [2.0 * (step.value - returns[t])];
+      const criticGrads = this.critic.backward(step.criticActivations, gradCriticOutput);
+      this.critic.applyGradients(criticGrads.gradWeights, criticGrads.gradBiases, this.criticLr);
+    }
+
+    this.episodesTrained++;
+    this.explorationNoise = Math.max(this.minNoise, this.explorationNoise * this.noiseDecay);
+    this.trajectory = [];
+    return N;
+  }
+
+  save(key = 'ego_rl_model') {
+    const data = {
+      episodesTrained: this.episodesTrained,
+      bestReward: this.bestReward,
+      explorationNoise: this.explorationNoise,
+      actor: this.actor.serialize(),
+      critic: this.critic.serialize()
+    };
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem(key, JSON.stringify(data));
+      console.log(`[EgoRLAgent] Model saved successfully to localStorage key "${key}".`);
+    }
+    return data;
+  }
+
+  load(key = 'ego_rl_model') {
+    if (typeof localStorage === 'undefined') return false;
+    const raw = localStorage.getItem(key);
+    if (!raw) return false;
+    try {
+      const data = JSON.parse(raw);
+      this.episodesTrained = data.episodesTrained || 0;
+      this.bestReward = data.bestReward || -Infinity;
+      this.explorationNoise = data.explorationNoise || 0.15;
+      if (data.actor) this.actor.deserialize(data.actor);
+      if (data.critic) this.critic.deserialize(data.critic);
+      console.log(`[EgoRLAgent] Model loaded successfully (episodes: ${this.episodesTrained}).`);
+      return true;
+    } catch (e) {
+      console.error('[EgoRLAgent] Failed to load model:', e);
+      return false;
+    }
+  }
+}
+
+/**
+ * Reinforcement Learning Training & Evaluation Manager
+ * Controls the episode training loop, reward computation, stats tracking, and visual rendering.
+ */
+class RLTrainingManager {
+  constructor(simulationEngine, rlAgent) {
+    this.engine = simulationEngine;
+    this.agent = rlAgent || new EgoRLAgent();
+    this.mode = 'OFF'; // 'OFF', 'TRAINING', 'EVALUATION'
+    
+    this.disableDynamicTraffic = true;
+    this.maxEpisodeSteps = 1200;
+    this.currentStep = 0;
+    this.currentEpisode = 0;
+    this.currentEpisodeReward = 0;
+    this.prevDistanceToGoal = 0;
+
+    // Running metrics
+    this.episodeRewards = [];
+    this.successCount = 0;
+    this.crashCount = 0;
+    this.offRoadCount = 0;
+    this.timeoutCount = 0;
+    this.lastTerminationReason = 'NONE';
+    this.turboMultiplier = 1; // 1x visual, can be set to 5x or 10x for fast training
+
+    this.lastAction = [0, 0, 0];
+  }
+
+  isActive() {
+    return this.mode === 'TRAINING' || this.mode === 'EVALUATION';
+  }
+
+  isTraining() {
+    return this.mode === 'TRAINING';
+  }
+
+  isEvaluation() {
+    return this.mode === 'EVALUATION';
+  }
+
+  setMode(mode) {
+    this.mode = mode; // 'OFF', 'TRAINING', 'EVALUATION'
+    if (this.isActive()) {
+      this.resetEpisode();
+      if (this.isTraining() && this.agent.episodesTrained === 0) {
+        // Attempt loading existing model
+        this.agent.load();
+      }
+    }
+    console.log(`[RLTrainingManager] Mode set to ${this.mode}`);
+  }
+
+  resetEpisode() {
+    const ego = this.engine.getEgoVehicle();
+    const env = window.EnvironmentData;
+    if (!ego) return;
+
+    ego.reset(140, 580, 0);
+    this.currentStep = 0;
+    this.currentEpisode++;
+    this.currentEpisodeReward = 0;
+    this.lastTerminationReason = 'RUNNING';
+
+    const dest = env.destination || { x: 1650, y: 560 };
+    this.prevDistanceToGoal = Math.hypot(dest.x - ego.x, dest.y - ego.y);
+  }
+
+  update(dt) {
+    if (!this.isActive()) return;
+
+    const ego = this.engine.getEgoVehicle();
+    const env = window.EnvironmentData;
+    const routePlanner = this.engine.getRoutePlanner();
+    if (!ego || !env) return;
+
+    const obs = this.agent.getObservation(ego, env, routePlanner);
+    const isTraining = this.isTraining();
+    const actData = this.agent.selectAction(obs, isTraining);
+    this.lastAction = actData.action;
+
+    // Apply continuous RL actions directly to EgoVehicle inputs
+    ego.inputs.steer = actData.action[0];
+    ego.inputs.throttle = actData.action[1];
+    ego.inputs.brake = actData.action[2];
+    ego.inputs.handbrake = false;
+
+    // Advance physics
+    ego.update(dt);
+    this.currentStep++;
+
+    // Compute Step Reward
+    const dest = env.destination || { x: 1650, y: 560 };
+    const currDist = Math.hypot(dest.x - ego.x, dest.y - ego.y);
+    let reward = (this.prevDistanceToGoal - currDist) * 1.5;
+    this.prevDistanceToGoal = currDist;
+
+    // Centerline / Road corridor bonus
+    reward += 0.25 * (1 - Math.min(1, Math.abs(ego.y - 560) / 45));
+    // Forward velocity bonus
+    reward += 0.20 * Math.max(0, (ego.speed || 0) / 80);
+    // Smoothness penalty
+    reward -= 0.03 * (actData.action[0] * actData.action[0]);
+    // Step cost
+    reward -= 0.04;
+
+    // Stationary penalty
+    if (Math.abs(ego.speed) < 2.0 && currDist > 60) {
+      reward -= 0.25;
+    }
+
+    // Check Termination Conditions
+    let done = false;
+    let reason = 'RUNNING';
+
+    const isOffRoad = typeof window !== 'undefined' && window.StaticCollisionSystem
+      ? !window.StaticCollisionSystem.isDrivableRoad(ego.x, ego.y)
+      : false;
+    const isArrived = currDist <= 45;
+    const isCollided = ego.isCollided;
+
+    if (isArrived) {
+      reward += 500.0;
+      done = true;
+      reason = 'ARRIVED';
+      this.successCount++;
+    } else if (isCollided) {
+      reward -= 200.0;
+      done = true;
+      reason = 'COLLISION';
+      this.crashCount++;
+    } else if (isOffRoad) {
+      reward -= 200.0;
+      done = true;
+      reason = 'OFF_ROAD';
+      this.offRoadCount++;
+    } else if (this.currentStep >= this.maxEpisodeSteps) {
+      reward -= 50.0;
+      done = true;
+      reason = 'TIMEOUT';
+      this.timeoutCount++;
+    }
+
+    this.currentEpisodeReward += reward;
+
+    if (isTraining) {
+      this.agent.recordStep(obs, actData, reward, done);
+    }
+
+    if (done) {
+      this.lastTerminationReason = reason;
+      this.episodeRewards.push(this.currentEpisodeReward);
+      if (this.episodeRewards.length > 20) this.episodeRewards.shift();
+
+      if (this.currentEpisodeReward > this.agent.bestReward) {
+        this.agent.bestReward = this.currentEpisodeReward;
+        if (isTraining) this.agent.save();
+      }
+
+      if (isTraining) {
+        this.agent.trainOnEpisode();
+      }
+
+      // Automatically reset for next episode
+      this.resetEpisode();
+    }
+  }
+
+  getMetrics() {
+    let meanReward = 0;
+    if (this.episodeRewards.length > 0) {
+      meanReward = this.episodeRewards.reduce((a, b) => a + b, 0) / this.episodeRewards.length;
+    }
+    const totalEpisodes = this.currentEpisode || 1;
+    const successRate = ((this.successCount / totalEpisodes) * 100).toFixed(1);
+
+    return {
+      mode: this.mode,
+      episode: this.currentEpisode,
+      step: this.currentStep,
+      currentReward: this.currentEpisodeReward.toFixed(1),
+      meanReward: meanReward.toFixed(1),
+      bestReward: this.agent.bestReward === -Infinity ? '0.0' : this.agent.bestReward.toFixed(1),
+      successRate: `${successRate}%`,
+      explorationNoise: this.agent.explorationNoise.toFixed(3),
+      lastReason: this.lastTerminationReason,
+      steer: this.lastAction[0].toFixed(2),
+      throttle: this.lastAction[1].toFixed(2),
+      brake: this.lastAction[2].toFixed(2)
+    };
+  }
+
+  /**
+   * Render real-time RL HUD Overlay on simulation canvas
+   */
+  renderHUD(ctx, camera) {
+    if (!this.isActive() || !ctx) return;
+
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0); // Screen coordinates
+
+    const m = this.getMetrics();
+    const cardX = 20;
+    const cardY = 120;
+    const cardW = 260;
+    const cardH = 200;
+
+    // Glassmorphic Card Background
+    ctx.fillStyle = 'rgba(15, 23, 42, 0.92)';
+    ctx.strokeStyle = this.isTraining() ? 'rgba(6, 182, 212, 0.6)' : 'rgba(16, 185, 129, 0.6)';
+    ctx.lineWidth = 1.5;
+
+    ctx.beginPath();
+    ctx.roundRect(cardX, cardY, cardW, cardH, 10);
+    ctx.fill();
+    ctx.stroke();
+
+    // Card Header Badge
+    ctx.fillStyle = this.isTraining() ? '#06b6d4' : '#10b981';
+    ctx.font = 'bold 12px "Segoe UI", sans-serif';
+    ctx.fillText(`🧠 RL ${this.mode} MODE`, cardX + 14, cardY + 22);
+
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '11px "Segoe UI", sans-serif';
+    ctx.fillText(`Episode: ${m.episode}  (Step: ${m.step})`, cardX + 14, cardY + 42);
+    ctx.fillText(`Reward: ${m.currentReward}  |  Mean: ${m.meanReward}`, cardX + 14, cardY + 62);
+    ctx.fillText(`Best: ${m.bestReward}  |  Success: ${m.successRate}`, cardX + 14, cardY + 82);
+    ctx.fillText(`Exploration Noise (σ): ${m.explorationNoise}`, cardX + 14, cardY + 102);
+    ctx.fillText(`Last End: ${m.lastReason}`, cardX + 14, cardY + 122);
+
+    // Action Meters
+    ctx.fillText(`Steering: [ ${m.steer} ]`, cardX + 14, cardY + 146);
+    ctx.fillText(`Throttle: [ ${m.throttle} ]  Brake: [ ${m.brake} ]`, cardX + 14, cardY + 168);
+
+    // Mini Steering Bar
+    const barX = cardX + 140;
+    const barY = cardY + 138;
+    const barW = 90;
+    const barH = 10;
+    ctx.fillStyle = 'rgba(30, 41, 59, 0.9)';
+    ctx.fillRect(barX, barY, barW, barH);
+    ctx.strokeStyle = '#475569';
+    ctx.strokeRect(barX, barY, barW, barH);
+
+    // Center tick
+    ctx.fillStyle = '#94a3b8';
+    ctx.fillRect(barX + barW / 2 - 1, barY - 2, 2, barH + 4);
+
+    // Steer fill
+    const steerVal = parseFloat(m.steer);
+    ctx.fillStyle = '#06b6d4';
+    if (steerVal >= 0) {
+      ctx.fillRect(barX + barW / 2, barY + 1, (steerVal * barW) / 2, barH - 2);
+    } else {
+      ctx.fillRect(barX + barW / 2 + (steerVal * barW) / 2, barY + 1, (-steerVal * barW) / 2, barH - 2);
+    }
+
+    ctx.restore();
+  }
+}
+
+/* ============================================================================
+   12. SIMULATION CORE APPLICATION CONTROLLER & GAME LOOP
    ============================================================================ */
 class SimulationAppController {
   constructor() {
@@ -7002,6 +7699,10 @@ class SimulationAppController {
     // Module 6B: Autonomous Vehicle Controller
     this.autonomousController = new AutonomousVehicleController();
 
+    // Module 7: Reinforcement Learning Ego Agent & Training Manager
+    this.rlAgent = new EgoRLAgent();
+    this.rlTrainingManager = new RLTrainingManager(this, this.rlAgent);
+
     // Road Network & Global Route Planner Systems
     this.roadNetwork = RoadNetworkSystem;
     this.routePlanner = GlobalRouteSystem;
@@ -7028,6 +7729,11 @@ class SimulationAppController {
     this.bindEvents();
     this.camera.fitToWorld();
 
+    // Auto-load existing RL policy model from localStorage if available
+    if (this.rlAgent) {
+      this.rlAgent.load();
+    }
+
     // Compute initial Global Route to Destination
     if (this.routePlanner && this.egoVehicle) {
       this.routePlanner.planRoute(this.egoVehicle, EnvironmentData.destination);
@@ -7037,7 +7743,7 @@ class SimulationAppController {
     this.lastTime = performance.now();
     requestAnimationFrame((time) => this.loop(time));
 
-    console.log('[SimulationEngine] Modules 1-6B Active: Environment, Ego Vehicle, Traffic Intelligence, Perception Risk, Path Planner, Decision Maker & Autonomous Control loaded.');
+    console.log('[SimulationEngine] Modules 1-7 Active: Environment, Ego Vehicle, Traffic, Perception, Path Planner, Decision Maker, Autonomous Control & Reinforcement Learning loaded.');
   }
 
   cacheDom() {
@@ -7060,6 +7766,12 @@ class SimulationAppController {
       controlStateValue: document.getElementById('control-state-value'),
       badgeMode: document.getElementById('badge-mode'),
       hintBanner: document.getElementById('hint-banner'),
+
+      // Module 7 RL Mode Elements
+      btnRlTrain: document.getElementById('btn-rl-train'),
+      btnRlEval: document.getElementById('btn-rl-eval'),
+      btnRlSave: document.getElementById('btn-rl-save'),
+      btnRlLoad: document.getElementById('btn-rl-load'),
 
       // Module 6A Decision Telemetry Elements
       decisionDot: document.getElementById('decision-dot'),
@@ -7175,7 +7887,38 @@ class SimulationAppController {
     // Mode Toggle Button (Manual / Autonomous)
     if (this.dom.btnMode) {
       this.dom.btnMode.addEventListener('click', () => {
+        if (this.rlTrainingManager && this.rlTrainingManager.isActive()) {
+          this.rlTrainingManager.setMode('OFF');
+        }
         this.toggleAutonomousMode();
+      });
+    }
+
+    // RL Training Button
+    if (this.dom.btnRlTrain) {
+      this.dom.btnRlTrain.addEventListener('click', () => {
+        this.toggleRLTraining();
+      });
+    }
+
+    // RL Evaluation Button
+    if (this.dom.btnRlEval) {
+      this.dom.btnRlEval.addEventListener('click', () => {
+        this.toggleRLEvaluation();
+      });
+    }
+
+    // RL Save Model Button
+    if (this.dom.btnRlSave) {
+      this.dom.btnRlSave.addEventListener('click', () => {
+        this.saveRLModel();
+      });
+    }
+
+    // RL Load Model Button
+    if (this.dom.btnRlLoad) {
+      this.dom.btnRlLoad.addEventListener('click', () => {
+        this.loadRLModel();
       });
     }
 
@@ -7226,6 +7969,9 @@ class SimulationAppController {
         this.egoVehicle.reset();
         if (this.autonomousController) {
           this.autonomousController.hasArrived = false;
+        }
+        if (this.rlTrainingManager && this.rlTrainingManager.isActive()) {
+          this.rlTrainingManager.resetEpisode();
         }
         if (this.routePlanner) {
           this.routePlanner.planRoute(this.egoVehicle, EnvironmentData.destination);
@@ -7282,22 +8028,33 @@ class SimulationAppController {
       });
     }
 
-    // Keyboard Shortcuts (M: Mode, O: Route, N: Road Network, Space: Stop/Manual, G: Grid, L: Labels, R: Reset View, T: Toggle Traffic, V: Toggle Radar, C: Toggle Paths)
+    // Keyboard Shortcuts (M: Mode, K: RL Train, E: RL Eval, O: Route, N: Network, Space: Stop/Manual, G: Grid, L: Labels, R: Reset View, T: Toggle Traffic, V: Radar, C: Paths)
     window.addEventListener('keydown', (e) => {
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
 
       const key = e.key.toLowerCase();
       if (key === 'm') {
+        if (this.rlTrainingManager && this.rlTrainingManager.isActive()) {
+          this.rlTrainingManager.setMode('OFF');
+        }
         this.toggleAutonomousMode();
+      } else if (key === 'k') {
+        this.toggleRLTraining();
+      } else if (key === 'e') {
+        this.toggleRLEvaluation();
       } else if (key === 'o') {
         this.toggleRoute();
       } else if (key === 'n') {
         this.toggleRoadNetwork();
       } else if (e.code === 'Space') {
         // Emergency Stop & Return to Manual Teleoperation
+        if (this.rlTrainingManager && this.rlTrainingManager.isActive()) {
+          this.rlTrainingManager.setMode('OFF');
+          this.updateModeUI(false, 'MANUAL');
+        }
         if (this.autonomousController && this.autonomousController.isAutonomous) {
           this.autonomousController.toggleMode(false, this.egoVehicle);
-          this.updateModeUI(false);
+          this.updateModeUI(false, 'MANUAL');
         }
       } else if (key === 'g' && this.dom.btnGrid) {
         this.dom.btnGrid.click();
@@ -7317,8 +8074,6 @@ class SimulationAppController {
 
   /**
    * Toggle Global Route debug visualization
-   * @param {boolean} [forceState]
-   * @returns {boolean}
    */
   toggleRoute(forceState) {
     if (!this.routePlanner) return false;
@@ -7331,8 +8086,6 @@ class SimulationAppController {
 
   /**
    * Toggle Road Network Graph debug visualization
-   * @param {boolean} [forceState]
-   * @returns {boolean}
    */
   toggleRoadNetwork(forceState) {
     if (!this.roadNetwork) return false;
@@ -7345,41 +8098,103 @@ class SimulationAppController {
 
   /**
    * Toggle between Manual and Autonomous driving mode
-   * @param {boolean} [forceState]
-   * @returns {boolean}
    */
   toggleAutonomousMode(forceState) {
     if (!this.autonomousController) return false;
     const isAuto = this.autonomousController.toggleMode(forceState, this.egoVehicle);
-    this.updateModeUI(isAuto);
+    this.updateModeUI(isAuto, isAuto ? 'AUTONOMOUS' : 'MANUAL');
     return isAuto;
   }
 
-  updateModeUI(isAuto) {
+  /**
+   * Toggle RL Training Mode
+   */
+  toggleRLTraining(forceState) {
+    if (!this.rlTrainingManager) return false;
+    const isTrain = (forceState !== undefined) ? forceState : (this.rlTrainingManager.mode !== 'TRAINING');
+    if (isTrain) {
+      if (this.autonomousController) this.autonomousController.toggleMode(false, this.egoVehicle);
+      this.rlTrainingManager.setMode('TRAINING');
+      this.updateModeUI(false, 'RL_TRAINING');
+    } else {
+      this.rlTrainingManager.setMode('OFF');
+      this.updateModeUI(false, 'MANUAL');
+    }
+    return isTrain;
+  }
+
+  /**
+   * Toggle RL Evaluation Mode
+   */
+  toggleRLEvaluation(forceState) {
+    if (!this.rlTrainingManager) return false;
+    const isEval = (forceState !== undefined) ? forceState : (this.rlTrainingManager.mode !== 'EVALUATION');
+    if (isEval) {
+      if (this.autonomousController) this.autonomousController.toggleMode(false, this.egoVehicle);
+      this.rlTrainingManager.setMode('EVALUATION');
+      this.updateModeUI(false, 'RL_EVALUATION');
+    } else {
+      this.rlTrainingManager.setMode('OFF');
+      this.updateModeUI(false, 'MANUAL');
+    }
+    return isEval;
+  }
+
+  saveRLModel() {
+    if (this.rlAgent) {
+      this.rlAgent.save();
+      console.log('[SimulationEngine] RL Policy Model saved to localStorage.');
+    }
+  }
+
+  loadRLModel() {
+    if (this.rlAgent) {
+      const ok = this.rlAgent.load();
+      if (ok) {
+        console.log(`[SimulationEngine] RL Policy Model loaded. (Episodes: ${this.rlAgent.episodesTrained})`);
+      }
+    }
+  }
+
+  updateModeUI(isAuto, customLabel) {
+    const label = customLabel || (isAuto ? 'AUTONOMOUS' : 'MANUAL');
+
     if (this.dom.btnMode) {
       this.dom.btnMode.classList.toggle('autonomous', isAuto);
       if (this.dom.btnModeText) {
         this.dom.btnModeText.textContent = isAuto ? 'Manual Mode' : 'Autonomous';
       }
     }
+
+    if (this.dom.btnRlTrain) {
+      this.dom.btnRlTrain.classList.toggle('active', label === 'RL_TRAINING');
+    }
+
+    if (this.dom.btnRlEval) {
+      this.dom.btnRlEval.classList.toggle('active', label === 'RL_EVALUATION');
+    }
+
     if (this.dom.badgeMode) {
-      this.dom.badgeMode.textContent = isAuto ? 'Autonomous AI' : 'Manual Teleop';
-      this.dom.badgeMode.classList.toggle('autonomous', isAuto);
+      this.dom.badgeMode.textContent = label === 'RL_TRAINING' ? 'RL Training' : (label === 'RL_EVALUATION' ? 'RL Evaluation' : (isAuto ? 'Autonomous AI' : 'Manual Teleop'));
+      this.dom.badgeMode.className = 'badge-mode ' + (label === 'RL_TRAINING' ? 'rl-train' : (label === 'RL_EVALUATION' ? 'rl-eval' : (isAuto ? 'autonomous' : 'manual')));
     }
+
     if (this.dom.modePill) {
-      this.dom.modePill.classList.toggle('autonomous', isAuto);
+      this.dom.modePill.className = 'telemetry-pill mode-pill ' + (label === 'RL_TRAINING' ? 'rl-train' : (label === 'RL_EVALUATION' ? 'rl-eval' : (isAuto ? 'autonomous' : 'manual')));
     }
+
     if (this.dom.modeDot) {
-      this.dom.modeDot.className = 'pill-dot mode-dot ' + (isAuto ? 'autonomous' : 'manual');
+      this.dom.modeDot.className = 'pill-dot mode-dot ' + (label === 'RL_TRAINING' ? 'rl-train' : (label === 'RL_EVALUATION' ? 'rl-eval' : (isAuto ? 'autonomous' : 'manual')));
     }
+
     if (this.dom.modeValue) {
-      this.dom.modeValue.textContent = isAuto ? 'AUTONOMOUS' : 'MANUAL';
-      this.dom.modeValue.className = 'pill-value ' + (isAuto ? 'accent-emerald' : 'accent-cyan');
+      this.dom.modeValue.textContent = label;
+      this.dom.modeValue.className = 'pill-value ' + (label === 'RL_TRAINING' ? 'accent-cyan' : (label === 'RL_EVALUATION' ? 'accent-emerald' : (isAuto ? 'accent-emerald' : 'accent-cyan')));
     }
   }
 
   /**
-   * Main Simulation Loop (Updates Physics, Traffic, Perception, Path Planner, Decision, Controller, Telemetry, Renders Scene)
+   * Main Simulation Loop
    */
   loop(currentTime) {
     const dt = Math.min((currentTime - this.lastTime) / 1000, 0.1);
@@ -7390,74 +8205,69 @@ class SimulationAppController {
       this.routePlanner.update(this.egoVehicle, EnvironmentData.destination);
     }
 
-    // 1. Update Perception & Risk Assessment (Module 4)
-    if (this.detectionManager) {
-      this.detectionManager.update(
-        this.egoVehicle,
-        EnvironmentData,
-        this.trafficManager ? this.trafficManager.getEntities() : [],
-        dt
-      );
+    // 1. RL Agent Control OR Rule-based Autonomous / Manual Driving
+    if (this.rlTrainingManager && this.rlTrainingManager.isActive()) {
+      // RL Agent directly chooses continuous steering/throttle/braking actions
+      this.rlTrainingManager.update(dt);
+    } else {
+      // Standard Autonomous / Manual Driving
+      if (this.detectionManager) {
+        this.detectionManager.update(
+          this.egoVehicle,
+          EnvironmentData,
+          this.trafficManager ? this.trafficManager.getEntities() : [],
+          dt
+        );
+      }
+
+      if (this.pathPlanner) {
+        this.pathPlanner.update(
+          this.egoVehicle,
+          EnvironmentData,
+          this.getPerceptionData(),
+          dt
+        );
+      }
+
+      if (this.decisionManager) {
+        this.decisionManager.update(
+          this.egoVehicle,
+          EnvironmentData,
+          this.getPerceptionData(),
+          this.getPathPlannerData(),
+          this.trafficManager,
+          dt,
+          this.autonomousController ? this.autonomousController.isStuck : false
+        );
+      }
+
+      if (this.autonomousController) {
+        this.autonomousController.update(
+          this.egoVehicle,
+          EnvironmentData.destination,
+          this.getDecisionData(),
+          this.getPathPlannerData(),
+          this.getPerceptionData(),
+          this.trafficManager,
+          dt
+        );
+      }
+
+      if (this.egoVehicle) {
+        this.egoVehicle.update(dt);
+      }
     }
 
-    // 2. Update Adaptive Path Planner (Module 5)
-    if (this.pathPlanner) {
-      this.pathPlanner.update(
-        this.egoVehicle,
-        EnvironmentData,
-        this.getPerceptionData(),
-        dt
-      );
-    }
-
-    // 3. Update Context-Aware Decision Manager (Module 6A)
-    if (this.decisionManager) {
-      this.decisionManager.update(
-        this.egoVehicle,
-        EnvironmentData,
-        this.getPerceptionData(),
-        this.getPathPlannerData(),
-        this.trafficManager,
-        dt,
-        this.autonomousController ? this.autonomousController.isStuck : false
-      );
-    }
-
-    // 4. Update Autonomous Vehicle Controller (Module 6B)
-    if (this.autonomousController) {
-      this.autonomousController.update(
-        this.egoVehicle,
-        EnvironmentData.destination,
-        this.getDecisionData(),
-        this.getPathPlannerData(),
-        this.getPerceptionData(),
-        this.trafficManager,
-        dt
-      );
-    }
-
-    // 5. Update Ego Vehicle Physics (Module 2)
-    if (this.egoVehicle) {
-      this.egoVehicle.update(dt);
-    }
-
-    // 6. Update Dynamic Traffic & Intelligent Non-Ego Vehicles (Module 3 + Local Traffic Planner)
-    if (this.trafficManager) {
+    // 2. Dynamic Traffic update (disabled during RL training for pure ego learning)
+    const isTrafficDisabled = (this.rlTrainingManager && this.rlTrainingManager.isActive() && this.rlTrainingManager.disableDynamicTraffic);
+    if (this.trafficManager && !isTrafficDisabled) {
       this.trafficManager.update(dt, this.egoVehicle, EnvironmentData);
     }
 
-    // 7. Update Submodules (Future Extensions)
-    Object.keys(this.modules).forEach((name) => {
-      const mod = this.modules[name];
-      if (typeof mod.update === 'function') {
-        mod.update(dt);
-      }
-    });
-
-    // 8. Update Real-time HUD Telemetry
+    // 3. Update Real-time HUD Telemetry
     this.updateHUD();
 
-    // 9. Render Scene
+    // 4. Render Scene
     this.render();
 
     // Request next animation frame
@@ -7670,6 +8480,11 @@ class SimulationAppController {
       this.egoVehicle.render(this.ctx);
     }
 
+    // Render Real-time Reinforcement Learning HUD Overlay (Module 7)
+    if (this.rlTrainingManager) {
+      this.rlTrainingManager.renderHUD(this.ctx, this.camera);
+    }
+
     // Render Future Submodules
     Object.keys(this.modules).forEach((name) => {
       const mod = this.modules[name];
@@ -7689,6 +8504,14 @@ class SimulationAppController {
 
   getAutonomousController() {
     return this.autonomousController;
+  }
+
+  getRLAgent() {
+    return this.rlAgent;
+  }
+
+  getRLTrainingManager() {
+    return this.rlTrainingManager;
   }
 
   isAutonomous() {
@@ -7731,14 +8554,13 @@ class SimulationAppController {
   }
 
   /**
-   * Accessor for Adaptive Path Planner Data (Module 5 -> Module 6 Vehicle Control)
+   * Accessor for Adaptive Path Planner Data (Module 5)
    */
   getPathPlannerData() {
     return {
-      candidatePaths: this.pathPlanner ? this.pathPlanner.candidatePaths : [],
-      selectedPath: this.pathPlanner ? this.pathPlanner.selectedPath : null,
       plannerState: this.pathPlanner ? this.pathPlanner.plannerState : 'OPTIMAL',
-      totalCandidates: this.pathPlanner ? this.pathPlanner.candidatePaths.length : 0,
+      selectedPath: this.pathPlanner ? this.pathPlanner.selectedPath : null,
+      candidatePaths: this.pathPlanner ? this.pathPlanner.candidatePaths : [],
       feasibleCount: this.pathPlanner ? this.pathPlanner.candidatePaths.filter(p => p.status === 'FEASIBLE').length : 0
     };
   }
@@ -7857,6 +8679,9 @@ window.RoadNode = RoadNode;
 window.RoadSegment = RoadSegment;
 window.GlobalRoutePlanner = GlobalRoutePlanner;
 window.GlobalRouteSystem = GlobalRouteSystem;
+window.MLPNet = MLPNet;
+window.EgoRLAgent = EgoRLAgent;
+window.RLTrainingManager = RLTrainingManager;
 
 // Global Direct Accessors
 window.getRoadGraph = () => RoadNetworkSystem.getGraph();
@@ -7870,8 +8695,3 @@ window.getGlobalRoute = () => SimulationEngine.getGlobalRoute();
 document.addEventListener('DOMContentLoaded', () => {
   SimulationEngine.init();
 });
-
-
-
-
-

@@ -99,6 +99,18 @@
           <button id="btn-mode" class="tool-btn btn-mode" title="Toggle Manual / Autonomous Driving Mode (M)">
             <span class="btn-icon">&#9889;</span> <span id="btn-mode-text">Autonomous</span>
           </button>
+          <button id="btn-rl-train" class="tool-btn btn-rl-train" title="Toggle RL Training Mode (K)">
+            <span class="btn-icon">&#129504;</span> RL Train
+          </button>
+          <button id="btn-rl-eval" class="tool-btn btn-rl-eval" title="Toggle RL Evaluation Mode (E)">
+            <span class="btn-icon">&#127919;</span> RL Eval
+          </button>
+          <button id="btn-rl-save" class="tool-btn" title="Save RL Policy to LocalStorage">
+            <span class="btn-icon">&#128190;</span> Save
+          </button>
+          <button id="btn-rl-load" class="tool-btn" title="Load RL Policy from LocalStorage">
+            <span class="btn-icon">&#128194;</span> Load
+          </button>
           <button id="btn-route" class="tool-btn active" title="Toggle Global Route Plan (O)">
             <span class="btn-icon">&#10140;</span> Route
           </button>
@@ -144,6 +156,12 @@
         <div class="key-guide">
           <div class="key-row">
             <span class="key-cap">M</span> <span>Toggle Auto / Manual</span>
+          </div>
+          <div class="key-row">
+            <span class="key-cap">K</span> <span>Toggle RL Training</span>
+          </div>
+          <div class="key-row">
+            <span class="key-cap">E</span> <span>Toggle RL Evaluation</span>
           </div>
           <div class="key-row">
             <span class="key-cap">O</span> <span>Toggle Global Route</span>
