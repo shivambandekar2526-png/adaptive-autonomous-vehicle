@@ -3697,10 +3697,10 @@ class DynamicObject {
         this.navigateTrafficVehicle(dt, egoVehicle, allEntities, environmentData);
         break;
       case 'pedestrian':
-        this.updatePedestrian(dt);
+        this.updatePedestrian(dt, egoVehicle);
         break;
       case 'animal':
-        this.updateAnimal(dt);
+        this.updateAnimal(dt, egoVehicle);
         break;
       default:
         this.updateGeneric(dt);
@@ -3914,27 +3914,27 @@ class DynamicObject {
     this.navigator.update(dt, egoVehicle, allEntities, environmentData);
   }
 
-  updatePedestrian(dt) {
+  updatePedestrian(dt, egoVehicle) {
     if (this.pauseTimer > 0) {
       this.pauseTimer -= dt;
       return;
     }
 
     if (this.behavior === 'CROSSING') {
-      // Crossing from one sidewalk to the other
+      // Crossing from one sidewalk to the other steadily
       this.y += this.speed * this.crossingDirection * dt;
       this.heading = this.crossingDirection > 0 ? Math.PI / 2 : -Math.PI / 2;
 
       // When crossed fully
       if (this.crossingDirection > 0 && this.y >= 680) {
         this.y = 680;
-        this.pauseTimer = Math.random() * 3 + 2;
+        this.pauseTimer = Math.random() * 2.5 + 1.5;
         this.crossingDirection = -1;
         this.behavior = 'SIDEWALK';
         this.heading = Math.PI; // Walk along sidewalk
       } else if (this.crossingDirection < 0 && this.y <= 435) {
         this.y = 435;
-        this.pauseTimer = Math.random() * 3 + 2;
+        this.pauseTimer = Math.random() * 2.5 + 1.5;
         this.crossingDirection = 1;
         this.behavior = 'SIDEWALK';
         this.heading = 0; // Walk along sidewalk
@@ -3960,8 +3960,22 @@ class DynamicObject {
     }
   }
 
-  updateAnimal(dt) {
+  updateAnimal(dt, egoVehicle) {
     if (this.subType === 'cow') {
+      // Solvability Guarantee: If ego vehicle is stopped or waiting nearby on the same road, the cow gives way
+      if (egoVehicle) {
+        const dx = this.x - egoVehicle.x;
+        const dy = this.y - egoVehicle.y;
+        const distToEgo = Math.hypot(dx, dy);
+        // If cow is ahead in drivable corridor and ego is approaching/close
+        if (distToEgo < 90 && dx > -10 && dx < 80 && Math.abs(dy) < 35) {
+          this.pauseTimer = 0;
+          this.behavior = 'WANDERING';
+          const targetY = (this.y < 560) ? 490 : 630;
+          this.heading = Math.atan2(targetY - this.y, 10);
+        }
+      }
+
       if (this.pauseTimer > 0) {
         this.pauseTimer -= dt;
         this.behavior = 'PAUSED';
@@ -3979,9 +3993,9 @@ class DynamicObject {
 
       if (this.stateTimer <= 0) {
         this.stateTimer = Math.random() * 5 + 3;
-        // Cows frequently stop on the road (classic Indian road simulation feature)
-        if (Math.random() < 0.4) {
-          this.pauseTimer = Math.random() * 4 + 2.5;
+        // Cows stop occasionally on shoulder/roadside
+        if (Math.random() < 0.35) {
+          this.pauseTimer = Math.random() * 3 + 1.5;
         } else {
           // Slow wandering turn
           this.heading += (Math.random() * 0.8 - 0.4);
@@ -4007,8 +4021,8 @@ class DynamicObject {
 
       if (this.stateTimer <= 0) {
         this.stateTimer = Math.random() * 3 + 2;
-        if (Math.random() < 0.3) {
-          this.pauseTimer = Math.random() * 2 + 1; // Sniff / pause
+        if (Math.random() < 0.25) {
+          this.pauseTimer = Math.random() * 1.5 + 0.5; // Sniff / pause
         } else {
           // Quick turn
           this.heading += (Math.random() * 1.6 - 0.8);
@@ -4450,16 +4464,24 @@ class DynamicObject {
 
 /**
  * Traffic Manager: Coordinates dynamic traffic objects and lifecycle
+ * In the current RL training environment, cars, bikes, and autos are disabled while
+ * pedestrians and animals (cows, dogs) are kept active. All vehicle code is preserved
+ * in createRoadVehicles() so they can be reintroduced seamlessly.
  */
 class TrafficManager {
   constructor() {
     this.entities = [];
     this.isEnabled = true;
+    this.includeVehicles = false; // Road vehicles (cars, bikes, autos) disabled for current RL training
     this.initDefaultEntities();
   }
 
-  initDefaultEntities() {
-    this.entities = [
+  /**
+   * Road vehicle definitions (Cars, Motorcycles, Auto-Rickshaws)
+   * Preserved for seamless re-enabling when needed.
+   */
+  createRoadVehicles() {
+    return [
       // --- 1. Dynamic Cars (4) ---
       new DynamicObject({
         id: 'car-1',
@@ -4607,9 +4629,16 @@ class TrafficManager {
         speed: 60,
         color: '#15803d',
         route: { road: 'side', laneX: 880 }
-      }),
+      })
+    ];
+  }
 
-      // --- 4. Pedestrians (4) ---
+  /**
+   * Active Dynamic Pedestrians and Animals for RL training environment
+   */
+  createPedestriansAndAnimals() {
+    return [
+      // --- Pedestrians (4) ---
       new DynamicObject({
         id: 'ped-1',
         type: 'pedestrian',
@@ -4669,7 +4698,7 @@ class TrafficManager {
         behavior: 'CROSSING'
       }),
 
-      // --- 5. Animals (3) ---
+      // --- Animals (3: 1 Cow, 2 Dogs) ---
       new DynamicObject({
         id: 'cow-1',
         type: 'animal',
@@ -4713,6 +4742,18 @@ class TrafficManager {
         behavior: 'WANDERING'
       })
     ];
+  }
+
+  initDefaultEntities() {
+    this.entities = this.createPedestriansAndAnimals();
+    if (this.includeVehicles) {
+      this.entities.push(...this.createRoadVehicles());
+    }
+  }
+
+  setIncludeVehicles(enabled) {
+    this.includeVehicles = !!enabled;
+    this.reset();
   }
 
   update(dt, egoVehicle, environmentData) {
@@ -7187,7 +7228,7 @@ class EgoRLAgent {
   /**
    * Extract comprehensive, normalized 20-D observation vector from simulation environment
    */
-  getObservation(ego, env, routePlanner) {
+  getObservation(ego, env, routePlanner, dynamicEntities) {
     if (!ego || !env) return new Array(this.obsDim).fill(0);
 
     const dest = env.destination || { x: 1650, y: 560 };
@@ -7250,6 +7291,47 @@ class EgoRLAgent {
       rayDistances.push(hitDist / maxRayLen);
     }
 
+    // Nearest Dynamic Agent (Pedestrians, Dogs, Cows)
+    let nearestDynDist = 1.0;
+    let nearestDynAngle = 0.0;
+    const dyns = dynamicEntities || (typeof window !== 'undefined' && window.SimulationEngine && window.SimulationEngine.getDynamicObjects ? window.SimulationEngine.getDynamicObjects() : []);
+    
+    if (Array.isArray(dyns)) {
+      let minDist = 180;
+      for (const d of dyns) {
+        if (!d.active) continue;
+        const dX = d.x - ego.x;
+        const dY = d.y - ego.y;
+        const forwardD = dX * Math.cos(ego.heading) + dY * Math.sin(ego.heading);
+        if (forwardD > -10 && forwardD < 180) {
+          const euclidean = Math.hypot(dX, dY);
+          if (euclidean < minDist) {
+            minDist = euclidean;
+            nearestDynDist = Math.max(0, Math.min(1.0, euclidean / 180));
+            let ang = Math.atan2(dY, dX) - ego.heading;
+            while (ang > Math.PI) ang -= Math.PI * 2;
+            while (ang < -Math.PI) ang += Math.PI * 2;
+            nearestDynAngle = ang / Math.PI;
+          }
+        }
+      }
+    }
+
+    // Static Pothole Proximity
+    let potholeAhead = 0.0;
+    if (env && Array.isArray(env.potholes)) {
+      for (const p of env.potholes) {
+        const dx = p.x - ego.x;
+        const dy = p.y - ego.y;
+        const fwd = dx * Math.cos(ego.heading) + dy * Math.sin(ego.heading);
+        const lat = Math.abs(dy * Math.cos(ego.heading) - dx * Math.sin(ego.heading));
+        if (fwd > 5 && fwd < 75 && lat < (p.radius + 18)) {
+          potholeAhead = 1.0;
+          break;
+        }
+      }
+    }
+
     return [
       Math.max(-0.5, Math.min(1.0, (ego.speed || 0) / 100)),
       Math.cos(ego.heading),
@@ -7266,9 +7348,9 @@ class EgoRLAgent {
       rayDistances[2],
       rayDistances[3],
       rayDistances[4],
-      1.0, // nearest obstacle distance
-      0.0, // nearest obstacle angle
-      0.0, // pothole hazard
+      nearestDynDist,
+      nearestDynAngle,
+      potholeAhead,
       0.0, // turn ahead
       progressRatio
     ];
@@ -7415,7 +7497,7 @@ class RLTrainingManager {
     this.agent = rlAgent || new EgoRLAgent();
     this.mode = 'OFF'; // 'OFF', 'TRAINING', 'EVALUATION'
     
-    this.disableDynamicTraffic = true;
+    this.disableDynamicTraffic = false; // Pedestrians & animals are active in the RL training environment
     this.maxEpisodeSteps = 1200;
     this.currentStep = 0;
     this.currentEpisode = 0;
@@ -7463,7 +7545,19 @@ class RLTrainingManager {
     const env = window.EnvironmentData;
     if (!ego) return;
 
+    // 1. Reset Ego Vehicle to start position
     ego.reset(140, 580, 0);
+
+    // 2. Reset dynamic pedestrians and animals to valid initial positions
+    if (this.engine.trafficManager) {
+      this.engine.trafficManager.reset();
+    }
+
+    // 3. Reset destination route planner
+    if (this.engine.routePlanner && env && env.destination) {
+      this.engine.routePlanner.planRoute(ego, env.destination);
+    }
+
     this.currentStep = 0;
     this.currentEpisode++;
     this.currentEpisodeReward = 0;
@@ -7481,7 +7575,23 @@ class RLTrainingManager {
     const routePlanner = this.engine.getRoutePlanner();
     if (!ego || !env) return;
 
-    const obs = this.agent.getObservation(ego, env, routePlanner);
+    // 1. Advance dynamic pedestrians and animals
+    if (this.engine.trafficManager) {
+      this.engine.trafficManager.update(dt, ego, env);
+    }
+
+    // 2. Update perception system
+    if (this.engine.detectionManager) {
+      this.engine.detectionManager.update(
+        ego,
+        env,
+        this.engine.trafficManager ? this.engine.trafficManager.getEntities() : [],
+        dt
+      );
+    }
+
+    const dynEntities = this.engine.trafficManager ? this.engine.trafficManager.getEntities() : [];
+    const obs = this.agent.getObservation(ego, env, routePlanner, dynEntities);
     const isTraining = this.isTraining();
     const actData = this.agent.selectAction(obs, isTraining);
     this.lastAction = actData.action;
@@ -7492,7 +7602,7 @@ class RLTrainingManager {
     ego.inputs.brake = actData.action[2];
     ego.inputs.handbrake = false;
 
-    // Advance physics
+    // Advance vehicle physics
     ego.update(dt);
     this.currentStep++;
 
@@ -7514,6 +7624,11 @@ class RLTrainingManager {
     // Stationary penalty
     if (Math.abs(ego.speed) < 2.0 && currDist > 60) {
       reward -= 0.25;
+    }
+
+    // Dynamic Pedestrian / Animal / Static Hazard proximity safety penalty
+    if (obs[15] < 0.35) {
+      reward -= 0.20 * (1.0 - obs[15] / 0.35);
     }
 
     // Check Termination Conditions
