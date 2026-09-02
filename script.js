@@ -746,6 +746,261 @@ const VehicleCollisionSystem = {
 };
 
 /* ============================================================================
+   3AA. SHARED VEHICLE SAFETY & SHORT-HORIZON FOOTPRINT COLLISION SHIELD
+   ============================================================================ */
+
+/**
+ * Shared Autonomous Vehicle Safety & Physics Layer (Safety Shield / Dynamic Collision Filter)
+ * Sits between the Shared PPO Policy (Action Proposal) and Vehicle Physics Actuation.
+ * Applies identically to Ego Vehicle and all Traffic Road Vehicles (Cars, Bikes, Autos).
+ *
+ * Architecture:
+ *   OBSERVATION
+ *        ↓
+ *   SHARED PPO POLICY
+ *        ↓
+ *   PROPOSED ACTION [steer, throttle, brake]
+ *        ↓
+ *   SHARED SAFETY/PHYSICS LAYER (VehicleSafetyPhysicsLayer)
+ *        ↓
+ *   VEHICLE PHYSICS (Kinematics & Actuator Dynamics)
+ */
+class VehicleSafetyPhysicsLayer {
+  /**
+   * Filter proposed continuous RL action [steer, throttle, brake] against short-horizon
+   * footprint trajectory collisions with pedestrians, animals, vehicles, potholes, debris, and road boundaries.
+   *
+   * @param {Object} vehicle - EgoVehicle or DynamicObject instance
+   * @param {Array<number>} proposedAction - [steerCmd, throttleCmd, brakeCmd]
+   * @param {Object} env - EnvironmentData (potholes, debris, parkedObjects, destination)
+   * @param {Array<Object>} allEntities - All active dynamic objects (vehicles, peds, animals)
+   * @param {number} dt - Delta time
+   * @returns {Array<number>} - Safe action [safeSteer, safeThrottle, safeBrake]
+   */
+  static filterAction(vehicle, proposedAction, env, allEntities, dt = 0.035) {
+    if (!vehicle || !Array.isArray(proposedAction)) return proposedAction;
+
+    const steerCmd = Math.max(-1.0, Math.min(1.0, proposedAction[0] || 0));
+    let throttleCmd = proposedAction[1] !== undefined ? proposedAction[1] : 0;
+    let brakeCmd = Math.max(0.0, Math.min(1.0, proposedAction[2] || 0));
+
+    // Vehicle physical dimensions
+    const length = vehicle.length || (vehicle.radius ? vehicle.radius * 2 : 44);
+    const width = vehicle.width || (vehicle.radius ? vehicle.radius * 1.4 : 22);
+    const halfL = length / 2;
+    const halfW = width / 2;
+    const wheelbase = vehicle.wheelbase || (length * 0.65);
+    const currentSpeed = vehicle.speed || 0;
+    const currentHeading = vehicle.heading || 0;
+    const currentSteeringAngle = vehicle.steeringAngle || 0;
+    const maxSteerAngle = vehicle.maxSteeringAngle || 0.58;
+
+    // Collect all dynamic entities in the world
+    const candidateEntities = [];
+    if (Array.isArray(allEntities)) {
+      for (const e of allEntities) {
+        if (e && e !== vehicle && e.active !== false) {
+          candidateEntities.push(e);
+        }
+      }
+    } else if (typeof window !== 'undefined' && window.SimulationEngine) {
+      const dyns = window.SimulationEngine.getDynamicObjects ? window.SimulationEngine.getDynamicObjects() : [];
+      if (Array.isArray(dyns)) {
+        for (const d of dyns) {
+          if (d && d !== vehicle && d.active !== false) {
+            candidateEntities.push(d);
+          }
+        }
+      }
+      const ego = window.SimulationEngine.getEgoVehicle();
+      if (ego && ego !== vehicle && !candidateEntities.includes(ego)) {
+        candidateEntities.push(ego);
+      }
+    }
+
+    // Static obstacles: potholes, debris, parked objects, static barriers
+    const staticObstacles = [];
+    if (env) {
+      if (Array.isArray(env.potholes)) {
+        for (const p of env.potholes) staticObstacles.push({ x: p.x, y: p.y, radius: p.radius || 14, isSolid: false, type: 'pothole' });
+      }
+      if (Array.isArray(env.debris)) {
+        for (const d of env.debris) staticObstacles.push({ x: d.x, y: d.y, radius: Math.max(d.width || 20, d.height || 20) / 2, isSolid: true, type: 'debris' });
+      }
+      if (Array.isArray(env.parkedObjects)) {
+        for (const p of env.parkedObjects) staticObstacles.push({ x: p.x, y: p.y, length: p.width || 44, width: p.height || 22, isSolid: true, type: 'parked_vehicle' });
+      }
+      if (Array.isArray(env.staticObstacles)) {
+        for (const s of env.staticObstacles) staticObstacles.push(s);
+      }
+    }
+
+    // Determine movement direction intent
+    const isReverseIntent = (throttleCmd < -0.05) || (currentSpeed < -1.0 && throttleCmd <= 0.05);
+    const isForwardIntent = (throttleCmd > 0.05) || (currentSpeed > 1.0);
+
+    // 1. Simulate short-horizon kinematic footprint projection under proposed action
+    const numHorizonSteps = 8;
+    const horizonDt = 0.15; // 8 * 0.15s = 1.2s lookahead
+
+    let simSpeed = currentSpeed;
+    if (throttleCmd > 0.05) {
+      simSpeed = Math.min(vehicle.maxForwardSpeed || 100, Math.max(simSpeed, simSpeed + 150 * throttleCmd * horizonDt));
+    } else if (throttleCmd < -0.05) {
+      simSpeed = Math.max(-(vehicle.maxReverseSpeed || 50), Math.min(simSpeed, simSpeed - 150 * 0.7 * Math.abs(throttleCmd) * horizonDt));
+    } else if (brakeCmd > 0.7) {
+      simSpeed = 0;
+    }
+
+    let simHeading = currentHeading;
+    let simX = vehicle.x;
+    let simY = vehicle.y;
+    let targetSteer = steerCmd * maxSteerAngle;
+    let simSteer = currentSteeringAngle + Math.max(-2.8 * dt, Math.min(2.8 * dt, targetSteer - currentSteeringAngle));
+
+    let forwardHazardDetected = false;
+    let reverseHazardDetected = false;
+    let minForwardTTC = Infinity;
+    let minForwardClearance = Infinity;
+    let forwardHazardType = null;
+
+    for (let step = 1; step <= numHorizonSteps; step++) {
+      const tau = step * horizonDt;
+
+      // Integrate kinematic vehicle trajectory
+      if (Math.abs(simSpeed) > 0.05) {
+        const simYawRate = (simSpeed / wheelbase) * Math.tan(simSteer);
+        simHeading += simYawRate * horizonDt;
+      }
+      simX += simSpeed * Math.cos(simHeading) * horizonDt;
+      simY += simSpeed * Math.sin(simHeading) * horizonDt;
+
+      const cosH = Math.cos(simHeading);
+      const sinH = Math.sin(simHeading);
+      const forwardVec = { x: cosH, y: sinH };
+      const rightVec = { x: -sinH, y: cosH };
+
+      // A. Check against Dynamic Entities (Pedestrians, Animals, Other Vehicles)
+      for (const ent of candidateEntities) {
+        const entType = ent.type || 'car';
+        const isPedOrAnimal = (entType === 'pedestrian' || entType === 'animal' || entType === 'dog' || entType === 'cow');
+
+        // Predicted position of dynamic entity at time tau
+        const entVx = (ent.speed || 0) * Math.cos(ent.heading || 0);
+        const entVy = (ent.speed || 0) * Math.sin(ent.heading || 0);
+        const entPredX = ent.x + entVx * tau;
+        const entPredY = ent.y + entVy * tau;
+
+        const relX = entPredX - simX;
+        const relY = entPredY - simY;
+        const fwdDist = relX * forwardVec.x + relY * forwardVec.y;
+        const latDist = Math.abs(relX * rightVec.x + relY * rightVec.y);
+
+        if (isPedOrAnimal) {
+          const entRadius = ent.radius || (entType === 'cow' ? 22 : (entType === 'pedestrian' ? 14 : 12));
+          // Check intersection with swept bounding corridor (footprint + buffer)
+          const safetyBuffer = 12;
+          const isIntersectingFootprint = (Math.abs(fwdDist) < (halfL + entRadius + safetyBuffer)) && (latDist < (halfW + entRadius + safetyBuffer));
+
+          if (isIntersectingFootprint) {
+            if (fwdDist >= -halfL && isForwardIntent) {
+              forwardHazardDetected = true;
+              if (tau < minForwardTTC) {
+                minForwardTTC = tau;
+                minForwardClearance = Math.max(0, Math.hypot(relX, relY) - (halfL + entRadius));
+                forwardHazardType = entType;
+              }
+            } else if (fwdDist < -halfL && isReverseIntent) {
+              reverseHazardDetected = true;
+            }
+          }
+        } else {
+          // Vehicle-to-vehicle footprint collision
+          const otherHalfL = (ent.length || 44) / 2;
+          const otherHalfW = (ent.width || 22) / 2;
+          const isIntersectingVeh = (Math.abs(fwdDist) < (halfL + otherHalfL + 8)) && (latDist < (halfW + otherHalfW + 6));
+
+          if (isIntersectingVeh) {
+            if (fwdDist >= -halfL && isForwardIntent) {
+              forwardHazardDetected = true;
+              if (tau < minForwardTTC) {
+                minForwardTTC = tau;
+                minForwardClearance = Math.max(0, Math.hypot(relX, relY) - (halfL + otherHalfL));
+                forwardHazardType = 'vehicle';
+              }
+            } else if (fwdDist < -halfL && isReverseIntent) {
+              reverseHazardDetected = true;
+            }
+          }
+        }
+      }
+
+      // B. Check against Static Obstacles (Potholes, Debris, Parked Vehicles, Barricades)
+      for (const stat of staticObstacles) {
+        const statRad = stat.radius || (stat.length ? stat.length / 2 : 16);
+        const relX = stat.x - simX;
+        const relY = stat.y - simY;
+        const fwdDist = relX * forwardVec.x + relY * forwardVec.y;
+        const latDist = Math.abs(relX * rightVec.x + relY * rightVec.y);
+
+        if (Math.abs(fwdDist) < (halfL + statRad + 8) && latDist < (halfW + statRad + 8)) {
+          if (fwdDist >= -halfL && isForwardIntent) {
+            forwardHazardDetected = true;
+            if (tau < minForwardTTC) {
+              minForwardTTC = tau;
+              minForwardClearance = Math.max(0, Math.hypot(relX, relY) - (halfL + statRad));
+              forwardHazardType = stat.type;
+            }
+          } else if (fwdDist < -halfL && isReverseIntent) {
+            reverseHazardDetected = true;
+          }
+        }
+      }
+
+      // C. Check Road Boundary Off-Road Departure
+      if (typeof window !== 'undefined' && window.StaticCollisionSystem) {
+        if (!window.StaticCollisionSystem.isDrivableRoad(simX, simY)) {
+          if (isForwardIntent) {
+            forwardHazardDetected = true;
+            if (tau < minForwardTTC) {
+              minForwardTTC = tau;
+              forwardHazardType = 'road_boundary';
+            }
+          }
+        }
+      }
+
+      if (forwardHazardDetected && minForwardTTC <= horizonDt * 2) {
+        break; // Immediate hazard
+      }
+    }
+
+    // 2. Safety Layer Intervention (Overrides only dangerous actions)
+    if (forwardHazardDetected && isForwardIntent) {
+      // Forward path is blocked by pedestrian, animal, obstacle, or vehicle
+      throttleCmd = 0.0; // Cut throttle
+
+      // Apply progressive / emergency braking
+      if (minForwardTTC < 0.45 || minForwardClearance < 20) {
+        brakeCmd = 1.0; // Immediate emergency stop
+      } else if (minForwardTTC < 0.85) {
+        brakeCmd = Math.max(brakeCmd, 0.80);
+      } else {
+        brakeCmd = Math.max(brakeCmd, 0.55);
+      }
+    }
+
+    if (reverseHazardDetected && isReverseIntent) {
+      // Reverse path is blocked behind
+      throttleCmd = 0.0;
+      brakeCmd = 1.0;
+    }
+
+    return [steerCmd, throttleCmd, brakeCmd];
+  }
+}
+
+/* ============================================================================
    3B. ROAD NETWORK GRAPH & TOPOLOGY SYSTEM (DETERMINISTIC ROAD NETWORK)
    ============================================================================ */
 
@@ -7976,24 +8231,29 @@ class RLVehicleAgent {
     // 2. Query single shared policy for continuous action [steer, throttle, brake]
     const actData = sharedPolicy.selectAction(obs, isTraining);
 
+    // 3. Shared Safety & Physics Layer Filter (applies identically to Ego & Traffic vehicles)
+    const safeAction = (typeof VehicleSafetyPhysicsLayer !== 'undefined')
+      ? VehicleSafetyPhysicsLayer.filterAction(this.vehicle, actData.action, env, allEntities, dt)
+      : actData.action;
+
     this.prevSteerAction = this.lastAction[0];
-    this.lastAction = actData.action;
+    this.lastAction = safeAction;
     const targetY = (this.vehicle.route && this.vehicle.route.laneY) ? this.vehicle.route.laneY : (this.destination ? this.destination.y : 560);
     this.prevCrossTrack = (this.vehicle.y - targetY) / 95;
 
-    // 3. Actuate action through existing vehicle physics
+    // 4. Actuate filtered safe action through existing vehicle physics
     if (typeof this.vehicle.applyRLAction === 'function') {
-      this.vehicle.applyRLAction(actData.action, dt);
+      this.vehicle.applyRLAction(safeAction, dt);
     } else if (this.vehicle.inputs) {
-      this.vehicle.inputs.steer = actData.action[0];
-      this.vehicle.inputs.throttle = actData.action[1];
-      this.vehicle.inputs.brake = actData.action[2];
+      this.vehicle.inputs.steer = safeAction[0];
+      this.vehicle.inputs.throttle = safeAction[1];
+      this.vehicle.inputs.brake = safeAction[2];
       this.vehicle.inputs.handbrake = false;
       this.vehicle.update(dt);
     }
 
     this.isCollided = !!this.vehicle.isCollided;
-    return { obs, actionData: actData };
+    return { obs, actionData: actData, safeAction };
   }
 }
 
@@ -9458,6 +9718,7 @@ window.DetectionManager = DetectionManager;
 window.PathPlanner = PathPlanner;
 window.StaticCollisionSystem = StaticCollisionSystem;
 window.VehicleCollisionSystem = VehicleCollisionSystem;
+window.VehicleSafetyPhysicsLayer = VehicleSafetyPhysicsLayer;
 window.DecisionManager = DecisionManager;
 window.AutonomousVehicleController = AutonomousVehicleController;
 window.RoadNetworkSystem = RoadNetworkSystem;
