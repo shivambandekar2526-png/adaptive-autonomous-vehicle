@@ -172,6 +172,45 @@ html, body {
   color: var(--accent-amber);
 }
 
+.pill-value.accent-rose {
+  color: var(--accent-rose);
+}
+
+.pill-value.accent-emerald {
+  color: var(--accent-emerald);
+}
+
+.risk-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background-color: var(--accent-emerald);
+  box-shadow: 0 0 6px var(--accent-emerald);
+  transition: all 0.2s ease;
+}
+
+.risk-dot.safe {
+  background-color: var(--accent-emerald);
+  box-shadow: 0 0 6px var(--accent-emerald);
+}
+
+.risk-dot.caution {
+  background-color: var(--accent-amber);
+  box-shadow: 0 0 8px var(--accent-amber);
+  animation: pulse-fast 0.6s infinite alternate;
+}
+
+.risk-dot.danger {
+  background-color: var(--accent-rose);
+  box-shadow: 0 0 10px var(--accent-rose);
+  animation: pulse-fast 0.35s infinite alternate;
+}
+
+.radar-dot {
+  background-color: var(--accent-cyan);
+  box-shadow: 0 0 6px var(--accent-cyan);
+}
+
 .traffic-dot {
   background-color: var(--accent-amber);
   box-shadow: 0 0 6px var(--accent-amber);
@@ -446,6 +485,10 @@ html, body {
   flex-shrink: 0;
 }
 
+.danger-swatch { background: #ef4444; border: 1px solid #fca5a5; box-shadow: 0 0 6px rgba(239, 68, 68, 0.8); }
+.caution-swatch { background: #f59e0b; border: 1px solid #fcd34d; box-shadow: 0 0 6px rgba(245, 158, 11, 0.8); }
+.safe-swatch { background: #10b981; border: 1px solid #6ee7b7; box-shadow: 0 0 6px rgba(16, 185, 129, 0.8); }
+.radar-swatch { background: rgba(6, 182, 212, 0.35); border: 1px dashed #38bdf8; box-shadow: 0 0 6px rgba(6, 182, 212, 0.6); }
 .ego-swatch { background: #38bdf8; border: 1px solid #ffffff; box-shadow: 0 0 6px rgba(56, 189, 248, 0.8); }
 .destination-swatch { background: #10b981; border: 1px solid #34d399; box-shadow: 0 0 6px rgba(16, 185, 129, 0.8); }
 .traffic-car-swatch { background: #dc2626; border: 1px solid #f87171; box-shadow: 0 0 4px rgba(220, 38, 38, 0.6); }

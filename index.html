@@ -13,39 +13,45 @@
       <div class="header-left">
         <div class="project-identity">
           <h1 class="sim-title">Adaptive Path Planning &amp; Collision Avoidance</h1>
-          <span class="sim-subtitle">Unstructured Indian Road Simulation &bull; Module 3: Dynamic Traffic &amp; Objects</span>
+          <span class="sim-subtitle">Unstructured Indian Road Simulation &bull; Module 4: Detection &amp; Collision Risk</span>
         </div>
       </div>
 
-      <!-- Vehicle Real-time Telemetry Readouts -->
+      <!-- Real-time Perception & Telemetry Readouts -->
       <div class="header-center">
-        <div class="telemetry-pill" title="Vehicle Drive State">
-          <span class="pill-dot" id="ego-state-dot"></span>
-          <span class="pill-label">STATE:</span>
-          <span class="pill-value" id="ego-state-text">STOPPED</span>
+        <!-- Collision Threat Level -->
+        <div class="telemetry-pill" title="Overall Collision Threat Level">
+          <span class="pill-dot risk-dot safe" id="risk-dot"></span>
+          <span class="pill-label">RISK:</span>
+          <span class="pill-value" id="risk-level-text">SAFE</span>
         </div>
 
-        <div class="telemetry-pill" title="Current Speed">
+        <!-- Minimum Time To Collision (TTC) -->
+        <div class="telemetry-pill" title="Minimum Time To Collision (TTC)">
+          <span class="pill-label">MIN TTC:</span>
+          <span class="pill-value accent-cyan" id="min-ttc-display">-- s</span>
+        </div>
+
+        <!-- Perceived Objects in Radar Radius -->
+        <div class="telemetry-pill" title="Objects detected inside Perception Radius">
+          <span class="pill-dot radar-dot" id="radar-dot"></span>
+          <span class="pill-label">DETECTED:</span>
+          <span class="pill-value accent-amber"><span id="detected-count">0</span> <small>objs</small></span>
+        </div>
+
+        <!-- Ego Vehicle Speed -->
+        <div class="telemetry-pill" title="Current Ego Speed">
           <span class="pill-label">SPEED:</span>
           <span class="pill-value accent-cyan"><span id="ego-speed">0.0</span> <small>km/h</small></span>
         </div>
 
+        <!-- Ego Vehicle Heading -->
         <div class="telemetry-pill" title="Current Heading Angle">
           <span class="pill-label">HEADING:</span>
           <span class="pill-value" id="ego-heading">0.0&deg;</span>
         </div>
 
-        <div class="telemetry-pill" title="Steering Wheel Angle">
-          <span class="pill-label">STEER:</span>
-          <span class="pill-value" id="ego-steer">0.0&deg;</span>
-        </div>
-
-        <div class="telemetry-pill" title="Active Dynamic Traffic Objects">
-          <span class="pill-dot traffic-dot" id="traffic-dot"></span>
-          <span class="pill-label">TRAFFIC:</span>
-          <span class="pill-value accent-amber"><span id="traffic-count">0</span> <small>objs</small></span>
-        </div>
-
+        <!-- Cursor World Coordinates -->
         <div class="coords-display" id="coords-display" title="World Coordinates under cursor">
           <span class="coord-tag">CURSOR:</span>
           <span class="coord-val">X:<span id="coord-x">0</span> Y:<span id="coord-y">0</span></span>
@@ -54,6 +60,9 @@
 
       <div class="header-right">
         <div class="control-group">
+          <button id="btn-sensors" class="tool-btn active" title="Toggle Perception Radar Overlay (V)">
+            <span class="btn-icon">&#128065;</span> Radar
+          </button>
           <button id="btn-traffic" class="tool-btn active" title="Toggle Dynamic Traffic Simulation (T)">
             <span class="btn-icon">&#9658;</span> Traffic
           </button>
@@ -78,10 +87,10 @@
     <main class="canvas-viewport" id="viewport-container">
       <canvas id="sim-canvas"></canvas>
 
-      <!-- Driving Controls HUD Card (Floating Top-Left) -->
+      <!-- Driving Controls & Perception HUD Card (Floating Top-Left) -->
       <aside class="controls-card" id="controls-card">
         <div class="card-header">
-          <span class="card-title">Ego Vehicle Controls</span>
+          <span class="card-title">Vehicle &amp; Radar Controls</span>
           <span class="badge-mode">Manual Teleop</span>
         </div>
         <div class="key-guide">
@@ -104,6 +113,9 @@
             <span class="key-cap">P</span> <span>Reset Car Position</span>
           </div>
           <div class="key-row">
+            <span class="key-cap">V</span> <span>Toggle Perception Radar</span>
+          </div>
+          <div class="key-row">
             <span class="key-cap">T</span> <span>Toggle Dynamic Traffic</span>
           </div>
         </div>
@@ -116,6 +128,22 @@
           <button id="legend-close-btn" class="close-btn">&times;</button>
         </div>
         <div class="legend-content">
+          <div class="legend-item">
+            <span class="legend-swatch danger-swatch"></span>
+            <span><strong>DANGER Target</strong> (TTC &le; 2.0s / Imminent)</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-swatch caution-swatch"></span>
+            <span><strong>CAUTION Target</strong> (TTC 2.0&ndash;4.5s / Proximity)</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-swatch safe-swatch"></span>
+            <span><strong>SAFE Target</strong> (Perceived / Low Threat)</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-swatch radar-swatch"></span>
+            <span><strong>Perception Radius</strong> (360&deg; Radar Field)</span>
+          </div>
           <div class="legend-item">
             <span class="legend-swatch ego-swatch"></span>
             <span><strong>Ego Vehicle</strong> (Autonomous Test Car)</span>
@@ -149,10 +177,6 @@
             <span>Main &amp; Side Road (Unstructured)</span>
           </div>
           <div class="legend-item">
-            <span class="legend-swatch curb-swatch"></span>
-            <span>Curb / Pavement (Black &amp; Yellow)</span>
-          </div>
-          <div class="legend-item">
             <span class="legend-swatch pothole-swatch"></span>
             <span>Irregular Potholes (Hazards)</span>
           </div>
@@ -160,27 +184,15 @@
             <span class="legend-swatch debris-swatch"></span>
             <span>Construction Debris &amp; Barricades</span>
           </div>
-          <div class="legend-item">
-            <span class="legend-swatch signal-swatch"></span>
-            <span>Intersection Traffic Signal</span>
-          </div>
-          <div class="legend-item">
-            <span class="legend-swatch vehicle-swatch"></span>
-            <span>Parked Static Objects (Auto / Thela)</span>
-          </div>
-          <div class="legend-item">
-            <span class="legend-swatch building-swatch"></span>
-            <span>Roadside Commercial &amp; Compounds</span>
-          </div>
         </div>
         <div class="legend-footer">
-          <small>&bull; [W/A/S/D] Drive &bull; [T] Traffic &bull; Drag to Pan &bull; [R] Fit</small>
+          <small>&bull; [W/A/S/D] Drive &bull; [V] Radar &bull; [T] Traffic &bull; [R] Fit</small>
         </div>
       </aside>
 
       <!-- Mini Notification / Hint Banner -->
       <div class="hint-banner" id="hint-banner">
-        <span>Module 3 Active: Dynamic Traffic &amp; Objects (Cars, Bikes, Autos, Pedestrians, Animals) Active. [T] Toggle Traffic.</span>
+        <span>Module 4 Active: Perception Radar &amp; Collision Risk active. [V] Toggle Radar | [T] Toggle Traffic</span>
       </div>
     </main>
   </div>

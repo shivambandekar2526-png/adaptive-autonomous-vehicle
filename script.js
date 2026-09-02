@@ -2569,7 +2569,488 @@ class TrafficManager {
 }
 
 /* ============================================================================
-   7. SIMULATION CORE APPLICATION CONTROLLER & GAME LOOP
+   7. MODULE 4: DETECTION & COLLISION RISK ASSESSMENT SYSTEM
+   ============================================================================ */
+
+/**
+ * Detection & Risk Assessment Manager
+ * Performs simulated perception, tracking, closing speed calculation,
+ * Time-To-Collision (TTC) estimation, and danger/caution risk classification.
+ */
+class DetectionManager {
+  constructor(options = {}) {
+    // Perception Range (World units / px, scale: 1 px ~ 0.25 m, 230 px ~ 57.5 m)
+    this.perceptionRadius = options.perceptionRadius || 230;
+    this.forwardSectorAngle = options.forwardSectorAngle || (140 * Math.PI / 180); // 140 deg forward cone
+    this.closeProximityRadius = options.closeProximityRadius || 110;
+
+    // Safety Thresholds
+    this.dangerTTC = 2.0;       // <= 2.0s is DANGER
+    this.cautionTTC = 4.5;      // 2.0s - 4.5s is CAUTION
+    this.criticalDistance = 48; // Critical proximity trigger (px)
+    this.cautionDistance = 95;  // Proximity warning trigger (px)
+
+    // Current Perception State
+    this.detectedObjects = [];
+    this.overallRisk = 'SAFE'; // 'SAFE', 'CAUTION', 'DANGER'
+    this.minTTC = null;
+    this.dangerCount = 0;
+    this.cautionCount = 0;
+    this.safeCount = 0;
+
+    // Visualisation / Sensor Options
+    this.showSensors = true;
+    this.radarAngle = 0;
+  }
+
+  /**
+   * Continuous perception and risk update loop
+   * Evaluates relative positions, relative velocities, closing speeds, and TTC
+   */
+  update(egoVehicle, staticObstacles, dynamicObjects, dt) {
+    if (dt <= 0 || dt > 0.1) dt = 0.016;
+
+    // Rotate radar scan sweep
+    this.radarAngle += 4.5 * dt;
+    if (this.radarAngle > Math.PI * 2) this.radarAngle -= Math.PI * 2;
+
+    if (!egoVehicle) {
+      this.detectedObjects = [];
+      this.overallRisk = 'SAFE';
+      this.minTTC = null;
+      return;
+    }
+
+    // Ego Kinematics in World Coordinates
+    const egoX = egoVehicle.x;
+    const egoY = egoVehicle.y;
+    const egoHeading = egoVehicle.heading;
+    const egoSpeed = egoVehicle.speed; // px/s (signed)
+    const egoVx = egoSpeed * Math.cos(egoHeading);
+    const egoVy = egoSpeed * Math.sin(egoHeading);
+    const egoRadius = 18;
+
+    const detected = [];
+    let minTTC = Infinity;
+    let highestThreat = 'SAFE';
+    let dCount = 0, cCount = 0, sCount = 0;
+
+    // 1. Gather all candidates (Dynamic traffic entities + Static obstacles)
+    const candidates = [];
+
+    // Add dynamic traffic entities
+    if (Array.isArray(dynamicObjects)) {
+      dynamicObjects.forEach(dyn => {
+        candidates.push({
+          id: dyn.id,
+          type: dyn.type,
+          subType: dyn.subType,
+          name: dyn.name,
+          x: dyn.x,
+          y: dyn.y,
+          heading: dyn.heading,
+          speed: dyn.speed,
+          length: dyn.length,
+          width: dyn.width,
+          radius: dyn.radius || Math.max(dyn.length, dyn.width) / 2,
+          isDynamic: true,
+          bounds: dyn.getCollisionCorners ? dyn.getCollisionCorners() : null,
+          rawObject: dyn
+        });
+      });
+    }
+
+    // Add static obstacles (potholes, debris, parked vehicles)
+    if (staticObstacles) {
+      // Potholes
+      if (Array.isArray(staticObstacles.potholes)) {
+        staticObstacles.potholes.forEach(pot => {
+          candidates.push({
+            id: pot.id,
+            type: 'pothole',
+            subType: 'road_hazard',
+            name: pot.name,
+            x: pot.x,
+            y: pot.y,
+            heading: 0,
+            speed: 0,
+            length: pot.radius * 2,
+            width: pot.radius * 2,
+            radius: pot.radius,
+            isDynamic: false,
+            rawObject: pot
+          });
+        });
+      }
+
+      // Construction Debris
+      if (Array.isArray(staticObstacles.debris)) {
+        staticObstacles.debris.forEach(deb => {
+          candidates.push({
+            id: deb.id,
+            type: 'debris',
+            subType: deb.type,
+            name: deb.name || deb.label,
+            x: deb.x,
+            y: deb.y,
+            heading: deb.angle || 0,
+            speed: 0,
+            length: deb.width,
+            width: deb.height,
+            radius: Math.max(deb.width, deb.height) / 2,
+            isDynamic: false,
+            rawObject: deb
+          });
+        });
+      }
+
+      // Parked Objects
+      if (Array.isArray(staticObstacles.parkedObjects)) {
+        staticObstacles.parkedObjects.forEach(parked => {
+          candidates.push({
+            id: parked.id,
+            type: 'parked_object',
+            subType: parked.type,
+            name: parked.name,
+            x: parked.x,
+            y: parked.y,
+            heading: parked.angle || 0,
+            speed: 0,
+            length: parked.width,
+            width: parked.height,
+            radius: Math.max(parked.width, parked.height) / 2,
+            isDynamic: false,
+            rawObject: parked
+          });
+        });
+      }
+    }
+
+    // 2. Evaluate Each Obstacle for Detection & Risk
+    candidates.forEach(cand => {
+      // Relative Position Vector (World Space)
+      const dx = cand.x - egoX;
+      const dy = cand.y - egoY;
+      const distance = Math.hypot(dx, dy);
+
+      // Early perception range check
+      if (distance > this.perceptionRadius) return;
+
+      // Bearing relative to ego heading [-PI, PI]
+      const worldAngleToCand = Math.atan2(dy, dx);
+      let bearing = worldAngleToCand - egoHeading;
+      while (bearing > Math.PI) bearing -= Math.PI * 2;
+      while (bearing < -Math.PI) bearing += Math.PI * 2;
+
+      // Check perception sector (360 close proximity OR within forward sensor cone)
+      const inCloseProximity = distance <= this.closeProximityRadius;
+      const inForwardSector = Math.abs(bearing) <= (this.forwardSectorAngle / 2);
+
+      if (!inCloseProximity && !inForwardSector) return;
+
+      // Candidate Velocity Vector
+      const candVx = cand.speed * Math.cos(cand.heading);
+      const candVy = cand.speed * Math.sin(cand.heading);
+
+      // Relative Velocity: V_rel = V_cand - V_ego
+      const vRelX = candVx - egoVx;
+      const vRelY = candVy - egoVy;
+      const relSpeed = Math.hypot(vRelX, vRelY);
+
+      // Unit vector from Ego to Candidate
+      const uX = dx / (distance || 1);
+      const uY = dy / (distance || 1);
+
+      // Closing Speed: V_closing = - (V_rel . u)
+      // Positive = distance is closing/decreasing; Negative = opening/moving away
+      const closingSpeed = -(vRelX * uX + vRelY * uY);
+
+      // Edge-to-edge approximate clearance distance
+      const clearance = Math.max(0, distance - (egoRadius + cand.radius));
+
+      // Time To Collision (TTC) Estimation
+      let ttc = Infinity;
+      if (closingSpeed > 1.0) {
+        ttc = clearance / closingSpeed;
+      }
+
+      // Trajectory and Collision Risk Assessment
+      let riskLevel = 'SAFE';
+
+      // Forward corridor alignment: is candidate in ego's direct moving path?
+      const inEgoTravelCorridor = Math.abs(bearing) < (35 * Math.PI / 180);
+      const isApproaching = closingSpeed > 2.0;
+
+      // Danger Condition: Imminent collision trajectory or critical proximity
+      if ((ttc <= this.dangerTTC && isApproaching && (inEgoTravelCorridor || inCloseProximity)) ||
+          (distance <= this.criticalDistance && isApproaching)) {
+        riskLevel = 'DANGER';
+        dCount++;
+        if (ttc < minTTC) minTTC = ttc;
+      }
+      // Caution Condition: Potential collision path or proximity alert
+      else if ((ttc <= this.cautionTTC && isApproaching) ||
+               (distance <= this.cautionDistance && (isApproaching || inEgoTravelCorridor)) ||
+               (!cand.isDynamic && inEgoTravelCorridor && distance < 140 && egoSpeed > 15)) {
+        riskLevel = 'CAUTION';
+        cCount++;
+        if (ttc < minTTC) minTTC = ttc;
+      }
+      // Safe Condition: Perceived without immediate threat
+      else {
+        riskLevel = 'SAFE';
+        sCount++;
+      }
+
+      // Track highest overall threat level
+      if (riskLevel === 'DANGER') {
+        highestThreat = 'DANGER';
+      } else if (riskLevel === 'CAUTION' && highestThreat !== 'DANGER') {
+        highestThreat = 'CAUTION';
+      }
+
+      detected.push({
+        id: cand.id,
+        name: cand.name,
+        type: cand.type,
+        subType: cand.subType,
+        x: cand.x,
+        y: cand.y,
+        dx: dx,
+        dy: dy,
+        distance: distance,
+        clearance: clearance,
+        bearingDeg: (bearing * 180 / Math.PI),
+        relativeSpeed: relSpeed,
+        closingSpeed: closingSpeed,
+        ttc: ttc === Infinity ? null : ttc,
+        riskLevel: riskLevel,
+        isDynamic: cand.isDynamic,
+        length: cand.length,
+        width: cand.width,
+        radius: cand.radius,
+        bounds: cand.bounds
+      });
+    });
+
+    // Sort detected objects: DANGER first, then CAUTION, then closest distance
+    detected.sort((a, b) => {
+      const priority = { DANGER: 0, CAUTION: 1, SAFE: 2 };
+      if (priority[a.riskLevel] !== priority[b.riskLevel]) {
+        return priority[a.riskLevel] - priority[b.riskLevel];
+      }
+      return a.distance - b.distance;
+    });
+
+    this.detectedObjects = detected;
+    this.overallRisk = highestThreat;
+    this.minTTC = minTTC === Infinity ? null : minTTC;
+    this.dangerCount = dCount;
+    this.cautionCount = cCount;
+    this.safeCount = sCount;
+  }
+
+  /**
+   * Render Perception Radar Field and Object Highlighting in World Space
+   */
+  render(ctx, egoVehicle) {
+    if (!this.showSensors || !egoVehicle) return;
+
+    ctx.save();
+    const egoX = egoVehicle.x;
+    const egoY = egoVehicle.y;
+    const egoHeading = egoVehicle.heading;
+
+    // 1. Draw Radar Perception Field & Range Rings
+    this.drawPerceptionField(ctx, egoX, egoY, egoHeading);
+
+    // 2. Highlight Detected Objects with Target Brackets & Threat Badges
+    this.drawDetectedObjectHighlights(ctx, egoX, egoY);
+
+    ctx.restore();
+  }
+
+  drawPerceptionField(ctx, x, y, heading) {
+    ctx.save();
+    ctx.translate(x, y);
+
+    const rad = this.perceptionRadius;
+
+    // Concentric Range Rings (20m, 35m, 55m scale)
+    const rings = [70, 140, rad];
+    rings.forEach((r, idx) => {
+      ctx.strokeStyle = idx === rings.length - 1 ? 'rgba(56, 189, 248, 0.35)' : 'rgba(56, 189, 248, 0.15)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 6]);
+      ctx.beginPath();
+      ctx.arc(0, 0, r, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Range labels
+      ctx.fillStyle = 'rgba(148, 163, 184, 0.5)';
+      ctx.font = '500 9px ui-monospace, SFMono-Regular, monospace';
+      ctx.fillText(`${Math.round(r * 0.25)}m`, r - 16, -4);
+    });
+
+    // Outer Perception Field Soft Fill
+    const grad = ctx.createRadialGradient(0, 0, 10, 0, 0, rad);
+    grad.addColorStop(0, 'rgba(6, 182, 212, 0.08)');
+    grad.addColorStop(0.7, 'rgba(6, 182, 212, 0.03)');
+    grad.addColorStop(1, 'rgba(6, 182, 212, 0)');
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(0, 0, rad, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Forward Perception Sector FOV Wedge (140 deg)
+    const halfAngle = this.forwardSectorAngle / 2;
+    ctx.fillStyle = 'rgba(56, 189, 248, 0.06)';
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.arc(0, 0, rad, heading - halfAngle, heading + halfAngle);
+    ctx.closePath();
+    ctx.fill();
+
+    // Sector boundary rays
+    ctx.strokeStyle = 'rgba(56, 189, 248, 0.25)';
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.lineTo(Math.cos(heading - halfAngle) * rad, Math.sin(heading - halfAngle) * rad);
+    ctx.moveTo(0, 0);
+    ctx.lineTo(Math.cos(heading + halfAngle) * rad, Math.sin(heading + halfAngle) * rad);
+    ctx.stroke();
+
+    // Spinning Radar Sweep Line
+    ctx.strokeStyle = 'rgba(6, 182, 212, 0.55)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.lineTo(Math.cos(this.radarAngle) * rad, Math.sin(this.radarAngle) * rad);
+    ctx.stroke();
+
+    ctx.restore();
+  }
+
+  drawDetectedObjectHighlights(ctx, egoX, egoY) {
+    this.detectedObjects.forEach(obj => {
+      ctx.save();
+      ctx.translate(obj.x, obj.y);
+
+      const isDanger = obj.riskLevel === 'DANGER';
+      const isCaution = obj.riskLevel === 'CAUTION';
+
+      // Colors by threat
+      let color = '#06b6d4';     // SAFE (Cyan)
+      let glowColor = 'rgba(6, 182, 212, 0.4)';
+      if (isDanger) {
+        color = '#ef4444';       // DANGER (Neon Red)
+        glowColor = 'rgba(239, 68, 68, 0.8)';
+      } else if (isCaution) {
+        color = '#f59e0b';       // CAUTION (Amber)
+        glowColor = 'rgba(245, 158, 11, 0.7)';
+      }
+
+      // 1. Connection / Tracking Vector to Ego for Caution/Danger
+      if (isDanger || isCaution) {
+        ctx.restore();
+        ctx.save();
+        ctx.strokeStyle = color;
+        ctx.lineWidth = isDanger ? 2 : 1.2;
+        if (!isDanger) ctx.setLineDash([4, 4]);
+        ctx.beginPath();
+        ctx.moveTo(egoX, egoY);
+        ctx.lineTo(obj.x, obj.y);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.restore();
+        ctx.save();
+        ctx.translate(obj.x, obj.y);
+      }
+
+      // 2. Corner Bracket Target Reticle [  ]
+      const boxW = Math.max(obj.length || 30, obj.radius * 2 || 30) + 10;
+      const boxH = Math.max(obj.width || 20, obj.radius * 2 || 20) + 10;
+      const halfW = boxW / 2;
+      const halfH = boxH / 2;
+      const arm = 6;
+
+      ctx.strokeStyle = color;
+      ctx.lineWidth = isDanger ? 2.5 : 1.5;
+      if (isDanger) {
+        ctx.shadowColor = glowColor;
+        ctx.shadowBlur = 8;
+      }
+
+      // Top-Left
+      ctx.beginPath();
+      ctx.moveTo(-halfW, -halfH + arm);
+      ctx.lineTo(-halfW, -halfH);
+      ctx.lineTo(-halfW + arm, -halfH);
+      // Top-Right
+      ctx.moveTo(halfW - arm, -halfH);
+      ctx.lineTo(halfW, -halfH);
+      ctx.lineTo(halfW, -halfH + arm);
+      // Bottom-Right
+      ctx.moveTo(halfW, halfH - arm);
+      ctx.lineTo(halfW, halfH);
+      ctx.lineTo(halfW - arm, halfH);
+      // Bottom-Left
+      ctx.moveTo(-halfW + arm, halfH);
+      ctx.lineTo(-halfW, halfH);
+      ctx.lineTo(-halfW, halfH - arm);
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+
+      // 3. Floating Telemetry Callout Badge
+      this.drawObjectBadge(ctx, 0, -halfH - 8, obj, color);
+
+      ctx.restore();
+    });
+  }
+
+  drawObjectBadge(ctx, x, y, obj, color) {
+    let text = `${obj.type.toUpperCase()} | ${Math.round(obj.distance)}px`;
+    if (obj.riskLevel === 'DANGER') {
+      const ttcText = obj.ttc && obj.ttc < 10 ? `${obj.ttc.toFixed(1)}s` : '--';
+      text = `! DANGER | TTC: ${ttcText}`;
+    } else if (obj.riskLevel === 'CAUTION') {
+      const ttcText = obj.ttc && obj.ttc < 10 ? `${obj.ttc.toFixed(1)}s` : `${Math.round(obj.distance)}px`;
+      text = `CAUTION | ${ttcText}`;
+    }
+
+    ctx.font = 'bold 9px ui-monospace, SFMono-Regular, monospace';
+    const metrics = ctx.measureText(text);
+    const badgeW = metrics.width + 10;
+    const badgeH = 14;
+
+    // Badge Background
+    ctx.fillStyle = obj.riskLevel === 'DANGER' ? '#ef4444' : (obj.riskLevel === 'CAUTION' ? '#f59e0b' : 'rgba(15, 23, 42, 0.85)');
+    ctx.beginPath();
+    ctx.roundRect(x - badgeW / 2, y - badgeH, badgeW, badgeH, 3);
+    ctx.fill();
+
+    // Badge Border
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    // Badge Text
+    ctx.fillStyle = obj.riskLevel === 'SAFE' ? '#e2e8f0' : '#0f172a';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(text, x, y - badgeH / 2);
+  }
+
+  toggleSensors(state) {
+    this.showSensors = state !== undefined ? state : !this.showSensors;
+    return this.showSensors;
+  }
+}
+
+/* ============================================================================
+   8. SIMULATION CORE APPLICATION CONTROLLER & GAME LOOP
    ============================================================================ */
 class SimulationAppController {
   constructor() {
@@ -2588,6 +3069,9 @@ class SimulationAppController {
 
     // Module 3: Dynamic Traffic Manager
     this.trafficManager = new TrafficManager();
+
+    // Module 4: Detection & Collision Risk Assessment System
+    this.detectionManager = new DetectionManager();
 
     // Registered Submodules
     this.modules = {};
@@ -2615,7 +3099,7 @@ class SimulationAppController {
     this.lastTime = performance.now();
     requestAnimationFrame((time) => this.loop(time));
 
-    console.log('[SimulationEngine] Module 1, 2 & 3 Active: Environment, Ego Vehicle, and Dynamic Traffic loaded.');
+    console.log('[SimulationEngine] Module 1, 2, 3 & 4 Active: Environment, Ego Vehicle, Traffic & Detection Risk loaded.');
   }
 
   cacheDom() {
@@ -2626,15 +3110,19 @@ class SimulationAppController {
       coordY: document.getElementById('coord-y'),
       
       // Telemetry Readouts
-      egoStateDot: document.getElementById('ego-state-dot'),
-      egoStateText: document.getElementById('ego-state-text'),
       egoSpeed: document.getElementById('ego-speed'),
       egoHeading: document.getElementById('ego-heading'),
       egoSteer: document.getElementById('ego-steer'),
-      trafficDot: document.getElementById('traffic-dot'),
-      trafficCount: document.getElementById('traffic-count'),
+      
+      // Module 4 Detection & Risk Elements
+      riskDot: document.getElementById('risk-dot'),
+      riskLevelText: document.getElementById('risk-level-text'),
+      minTtcDisplay: document.getElementById('min-ttc-display'),
+      detectedCount: document.getElementById('detected-count'),
+      radarDot: document.getElementById('radar-dot'),
 
       // Controls
+      btnSensors: document.getElementById('btn-sensors'),
       btnTraffic: document.getElementById('btn-traffic'),
       btnResetCar: document.getElementById('btn-reset-car'),
       btnGrid: document.getElementById('btn-grid'),
@@ -2718,14 +3206,22 @@ class SimulationAppController {
       this.camera.zoomAt(factor, screenX, screenY);
     }, { passive: false });
 
+    // Perception / Radar Sensors Button
+    if (this.dom.btnSensors) {
+      this.dom.btnSensors.addEventListener('click', () => {
+        const active = this.detectionManager.toggleSensors();
+        this.dom.btnSensors.classList.toggle('active', active);
+        if (this.dom.radarDot) {
+          this.dom.radarDot.style.opacity = active ? '1' : '0.3';
+        }
+      });
+    }
+
     // Traffic Toggle Button
     if (this.dom.btnTraffic) {
       this.dom.btnTraffic.addEventListener('click', () => {
         const active = this.trafficManager.toggle();
         this.dom.btnTraffic.classList.toggle('active', active);
-        if (this.dom.trafficDot) {
-          this.dom.trafficDot.classList.toggle('paused', !active);
-        }
       });
     }
 
@@ -2785,7 +3281,7 @@ class SimulationAppController {
       });
     }
 
-    // Keyboard Shortcuts (G: Grid, L: Labels, R: Reset View, T: Toggle Traffic)
+    // Keyboard Shortcuts (G: Grid, L: Labels, R: Reset View, T: Toggle Traffic, V: Toggle Radar)
     window.addEventListener('keydown', (e) => {
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
 
@@ -2798,12 +3294,14 @@ class SimulationAppController {
         this.dom.btnResetView.click();
       } else if (key === 't' && this.dom.btnTraffic) {
         this.dom.btnTraffic.click();
+      } else if (key === 'v' && this.dom.btnSensors) {
+        this.dom.btnSensors.click();
       }
     });
   }
 
   /**
-   * Main Simulation Loop (Updates Physics, Traffic, Telemetry, Renders Scene)
+   * Main Simulation Loop (Updates Physics, Traffic, Perception, Telemetry, Renders Scene)
    */
   loop(currentTime) {
     const dt = Math.min((currentTime - this.lastTime) / 1000, 0.1);
@@ -2819,7 +3317,17 @@ class SimulationAppController {
       this.trafficManager.update(dt);
     }
 
-    // 3. Update Submodules (Future Module 4+)
+    // 3. Update Perception & Risk Assessment (Module 4)
+    if (this.detectionManager) {
+      this.detectionManager.update(
+        this.egoVehicle,
+        EnvironmentData,
+        this.trafficManager.getEntities(),
+        dt
+      );
+    }
+
+    // 4. Update Submodules (Future Module 5+)
     Object.keys(this.modules).forEach((name) => {
       const mod = this.modules[name];
       if (typeof mod.update === 'function') {
@@ -2827,10 +3335,10 @@ class SimulationAppController {
       }
     });
 
-    // 4. Update Real-time HUD Telemetry
+    // 5. Update Real-time HUD Telemetry
     this.updateHUD();
 
-    // 5. Render Scene
+    // 6. Render Scene
     this.render();
 
     // Request next animation frame
@@ -2840,7 +3348,7 @@ class SimulationAppController {
   }
 
   /**
-   * Update HUD Telemetry elements with Ego Vehicle and Traffic telemetry data
+   * Update HUD Telemetry elements with Ego Vehicle and Perception risk telemetry
    */
   updateHUD() {
     if (this.egoVehicle) {
@@ -2856,41 +3364,42 @@ class SimulationAppController {
       if (this.dom.egoHeading) {
         this.dom.egoHeading.textContent = `${headingDeg.toFixed(1)}°`;
       }
-
-      // Steer angle in degrees
-      const steerDeg = (this.egoVehicle.steeringAngle * (180 / Math.PI)).toFixed(1);
-      if (this.dom.egoSteer) {
-        this.dom.egoSteer.textContent = `${steerDeg > 0 ? '+' : ''}${steerDeg}°`;
-      }
-
-      // State text & indicator dot
-      if (this.dom.egoStateText && this.dom.egoStateDot) {
-        const state = this.egoVehicle.state;
-        this.dom.egoStateText.textContent = state;
-
-        this.dom.egoStateDot.className = 'pill-dot';
-        switch (state) {
-          case 'ACCELERATING':
-            this.dom.egoStateDot.classList.add('accelerating');
-            break;
-          case 'BRAKING':
-            this.dom.egoStateDot.classList.add('braking');
-            break;
-          case 'REVERSING':
-            this.dom.egoStateDot.classList.add('reversing');
-            break;
-          case 'STOPPED':
-            this.dom.egoStateDot.classList.add('stopped');
-            break;
-          default:
-            break;
-        }
-      }
     }
 
-    // Traffic count readout
-    if (this.dom.trafficCount && this.trafficManager) {
-      this.dom.trafficCount.textContent = this.trafficManager.getEntities().length;
+    // Update Module 4 Collision Risk Telemetry
+    if (this.detectionManager) {
+      const overall = this.detectionManager.overallRisk;
+
+      if (this.dom.riskLevelText) {
+        this.dom.riskLevelText.textContent = overall;
+        this.dom.riskLevelText.className = 'pill-value';
+        if (overall === 'DANGER') {
+          this.dom.riskLevelText.classList.add('accent-rose');
+        } else if (overall === 'CAUTION') {
+          this.dom.riskLevelText.classList.add('accent-amber');
+        } else {
+          this.dom.riskLevelText.classList.add('accent-emerald');
+        }
+      }
+
+      if (this.dom.riskDot) {
+        this.dom.riskDot.className = 'pill-dot risk-dot';
+        this.dom.riskDot.classList.add(overall.toLowerCase());
+      }
+
+      if (this.dom.minTtcDisplay) {
+        if (this.detectionManager.minTTC !== null && this.detectionManager.minTTC < 10) {
+          this.dom.minTtcDisplay.textContent = `${this.detectionManager.minTTC.toFixed(1)} s`;
+          this.dom.minTtcDisplay.className = 'pill-value ' + (overall === 'DANGER' ? 'accent-rose' : 'accent-amber');
+        } else {
+          this.dom.minTtcDisplay.textContent = '-- s';
+          this.dom.minTtcDisplay.className = 'pill-value accent-cyan';
+        }
+      }
+
+      if (this.dom.detectedCount) {
+        this.dom.detectedCount.textContent = this.detectionManager.detectedObjects.length;
+      }
     }
   }
 
@@ -2915,12 +3424,17 @@ class SimulationAppController {
       this.trafficManager.render(this.ctx);
     }
 
+    // Render Perception Radar & Collision Risk Highlights (Module 4)
+    if (this.detectionManager) {
+      this.detectionManager.render(this.ctx, this.egoVehicle);
+    }
+
     // Render Ego Vehicle (Module 2)
     if (this.egoVehicle) {
       this.egoVehicle.render(this.ctx);
     }
 
-    // Render Future Submodules (Module 4+)
+    // Render Future Submodules (Module 5+)
     Object.keys(this.modules).forEach((name) => {
       const mod = this.modules[name];
       if (typeof mod.render === 'function') {
@@ -2941,16 +3455,37 @@ class SimulationAppController {
     return EnvironmentData.destination;
   }
 
-  /**
-   * Accessor for all active dynamic objects (Cars, bikes, autos, pedestrians, animals)
-   */
   getDynamicObjects() {
     return this.trafficManager ? this.trafficManager.getEntities() : [];
   }
 
   /**
-   * Combined Obstacles accessor (Static hazards + Dynamic traffic) for collision modules
+   * Accessor for Perception & Detection Data (Module 4 -> Module 5 Path Planning)
    */
+  getPerceptionData() {
+    return {
+      detectedObjects: this.detectionManager ? this.detectionManager.detectedObjects : [],
+      overallRisk: this.detectionManager ? this.detectionManager.overallRisk : 'SAFE',
+      minTTC: this.detectionManager ? this.detectionManager.minTTC : null,
+      detectedCount: this.detectionManager ? this.detectionManager.detectedObjects.length : 0,
+      dangerCount: this.detectionManager ? this.detectionManager.dangerCount : 0,
+      cautionCount: this.detectionManager ? this.detectionManager.cautionCount : 0,
+      safeCount: this.detectionManager ? this.detectionManager.safeCount : 0,
+      perceptionRadius: this.detectionManager ? this.detectionManager.perceptionRadius : 230
+    };
+  }
+
+  /**
+   * Accessor for Threat Summary & Prioritized Risk Objects
+   */
+  getRiskAssessment() {
+    return {
+      overallRisk: this.detectionManager ? this.detectionManager.overallRisk : 'SAFE',
+      minTTC: this.detectionManager ? this.detectionManager.minTTC : null,
+      threatObjects: this.detectionManager ? this.detectionManager.detectedObjects.filter(o => o.riskLevel !== 'SAFE') : []
+    };
+  }
+
   getObstacles() {
     return {
       potholes: EnvironmentData.potholes,
@@ -2958,7 +3493,8 @@ class SimulationAppController {
       parkedObjects: EnvironmentData.parkedObjects,
       buildings: EnvironmentData.buildings,
       signal: EnvironmentData.trafficSignal,
-      dynamicObjects: this.getDynamicObjects()
+      dynamicObjects: this.getDynamicObjects(),
+      perception: this.getPerceptionData()
     };
   }
 
@@ -2993,11 +3529,13 @@ window.WORLD_CONFIG = WORLD_CONFIG;
 window.EgoVehicle = EgoVehicle;
 window.DynamicObject = DynamicObject;
 window.TrafficManager = TrafficManager;
+window.DetectionManager = DetectionManager;
 
 // Boot on DOM Ready
 document.addEventListener('DOMContentLoaded', () => {
   SimulationEngine.init();
 });
+
 
 
 
