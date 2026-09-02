@@ -13,12 +13,25 @@
       <div class="header-left">
         <div class="project-identity">
           <h1 class="sim-title">Adaptive Path Planning &amp; Collision Avoidance</h1>
-          <span class="sim-subtitle">Unstructured Indian Road Simulation &bull; Module 6A: Context-Aware Decision Making</span>
+          <span class="sim-subtitle">Unstructured Indian Road Simulation &bull; Module 6B: Autonomous Ego Vehicle Control</span>
         </div>
       </div>
 
       <!-- Real-time Perception, Risk, Planner & Context Decision Telemetry Readouts -->
       <div class="header-center">
+        <!-- Module 6B: Driving Mode -->
+        <div class="telemetry-pill mode-pill" id="mode-pill" title="Driving Mode: Manual / Autonomous (M)">
+          <span class="pill-dot mode-dot manual" id="mode-dot"></span>
+          <span class="pill-label">MODE:</span>
+          <span class="pill-value accent-cyan" id="mode-value">MANUAL</span>
+        </div>
+
+        <!-- Module 6B: Control State -->
+        <div class="telemetry-pill control-state-pill" id="control-state-pill" title="Autonomous Actuation State">
+          <span class="pill-label">STATE:</span>
+          <span class="pill-value accent-emerald" id="control-state-value">IDLE</span>
+        </div>
+
         <!-- Module 6A: Context-Aware Decision -->
         <div class="telemetry-pill decision-pill" title="Context-Aware Decision Maker (Module 6A)">
           <span class="pill-dot decision-dot go" id="decision-dot"></span>
@@ -74,6 +87,9 @@
 
       <div class="header-right">
         <div class="control-group">
+          <button id="btn-mode" class="tool-btn btn-mode" title="Toggle Manual / Autonomous Driving Mode (M)">
+            <span class="btn-icon">&#9889;</span> <span id="btn-mode-text">Autonomous</span>
+          </button>
           <button id="btn-paths" class="tool-btn active" title="Toggle Adaptive Path Trajectories (C)">
             <span class="btn-icon">&#10548;</span> Paths
           </button>
@@ -108,9 +124,12 @@
       <aside class="controls-card" id="controls-card">
         <div class="card-header">
           <span class="card-title">Vehicle &amp; Planner Controls</span>
-          <span class="badge-mode">Manual Teleop</span>
+          <span class="badge-mode" id="badge-mode">Manual Teleop</span>
         </div>
         <div class="key-guide">
+          <div class="key-row">
+            <span class="key-cap">M</span> <span>Toggle Auto / Manual</span>
+          </div>
           <div class="key-row">
             <span class="key-cap">W</span> / <span class="key-cap">&uarr;</span> <span>Accelerate</span>
           </div>
@@ -228,7 +247,7 @@
 
       <!-- Mini Notification / Hint Banner -->
       <div class="hint-banner" id="hint-banner">
-        <span>Module 6A Active: Context-Aware Decision Making active. [C] Toggle Paths | [V] Toggle Radar | [T] Toggle Traffic</span>
+        <span>Module 6B Active: Autonomous Ego Vehicle Control active. [M] Auto/Manual Mode | [C] Paths | [V] Radar | [T] Traffic | [P] Reset</span>
       </div>
     </main>
   </div>

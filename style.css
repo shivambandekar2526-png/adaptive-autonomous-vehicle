@@ -192,6 +192,57 @@ html, body {
   color: #ec4899;
 }
 
+/* Module 6B Mode Pill & Dot Styles */
+.mode-pill {
+  border-color: rgba(6, 182, 212, 0.4);
+  background: rgba(15, 23, 42, 0.95);
+}
+
+.mode-pill.autonomous {
+  border-color: rgba(16, 185, 129, 0.6);
+  box-shadow: 0 0 10px rgba(16, 185, 129, 0.2);
+}
+
+.mode-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  transition: all 0.2s ease;
+}
+
+.mode-dot.manual {
+  background-color: var(--accent-cyan);
+  box-shadow: 0 0 6px var(--accent-cyan);
+}
+
+.mode-dot.autonomous {
+  background-color: var(--accent-emerald);
+  box-shadow: 0 0 10px var(--accent-emerald);
+  animation: pulse-fast 0.8s infinite alternate;
+}
+
+.control-state-pill {
+  border-color: rgba(56, 189, 248, 0.3);
+}
+
+.btn-mode {
+  border-color: rgba(6, 182, 212, 0.4) !important;
+  color: var(--accent-cyan) !important;
+}
+
+.btn-mode.autonomous {
+  background: rgba(16, 185, 129, 0.2) !important;
+  border-color: rgba(16, 185, 129, 0.6) !important;
+  color: var(--accent-emerald) !important;
+  box-shadow: 0 0 12px rgba(16, 185, 129, 0.35) !important;
+}
+
+.badge-mode.autonomous {
+  color: var(--accent-emerald);
+  background: rgba(16, 185, 129, 0.2);
+  border-color: rgba(16, 185, 129, 0.5);
+}
+
 /* Module 6A Decision Pill & Dot Styles */
 .decision-pill {
   border-color: rgba(6, 182, 212, 0.3);

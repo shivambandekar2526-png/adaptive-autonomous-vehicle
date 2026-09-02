@@ -1389,6 +1389,7 @@ class EgoVehicle {
     this.inputs = {
       throttle: 0,   // +1 = forward (W/Up), -1 = brake/reverse (S/Down)
       steer: 0,      // -1 = left (A/Left), +1 = right (D/Right)
+      brake: 0,      // 0 to 1 = progressive footbrake deceleration
       handbrake: false // Space = immediate stop
     };
 
@@ -1481,6 +1482,10 @@ class EgoVehicle {
     this.heading = heading;
     this.speed = 0;
     this.steeringAngle = 0;
+    this.inputs.throttle = 0;
+    this.inputs.steer = 0;
+    this.inputs.brake = 0;
+    this.inputs.handbrake = false;
     this.state = 'STOPPED';
     this.isBraking = false;
     this.isReversing = false;
@@ -1529,6 +1534,18 @@ class EgoVehicle {
         this.speed = 0;
       }
       this.state = 'STOPPED';
+
+    } else if (this.inputs.brake > 0) {
+      // Autonomous / Progressive Footbrake
+      this.isBraking = true;
+      if (Math.abs(this.speed) > 1.5) {
+        const brakeDir = -Math.sign(this.speed);
+        this.speed += brakeDir * this.brakingDecel * this.inputs.brake * dt;
+        if (Math.sign(this.speed) !== -brakeDir) this.speed = 0;
+      } else {
+        this.speed = 0;
+      }
+      this.state = (this.speed === 0) ? 'STOPPED' : 'BRAKING';
 
     } else if (this.inputs.throttle > 0) {
       // Forward Acceleration
@@ -4532,7 +4549,273 @@ class DecisionManager {
 }
 
 /* ============================================================================
-   10. SIMULATION CORE APPLICATION CONTROLLER & GAME LOOP
+   10. MODULE 6B: AUTONOMOUS EGO VEHICLE CONTROL SYSTEM
+   ============================================================================ */
+
+/**
+ * Autonomous Vehicle Controller
+ * Closes the control loop between Perception, Collision Risk, Adaptive Path Planning,
+ * Context-Aware Decision Making, and Physical Vehicle Actuation.
+ *
+ * Operational Modes:
+ *  - MANUAL     : Teleoperated with WASD / Arrow keys / Spacebar.
+ *  - AUTONOMOUS : Actuation driven deterministically by DecisionManager & PathPlanner.
+ *
+ * Safety Priority Hierarchy:
+ *  DANGER / STOP -> WAIT / YIELD -> REPLAN -> SLOW -> GO
+ */
+class AutonomousVehicleController {
+  constructor(options = {}) {
+    this.isAutonomous = false;
+    this.controlState = 'MANUAL'; // 'MANUAL', 'CRUISING', 'AVOIDING', 'BRAKING', 'STOPPED', 'WAITING', 'YIELDING', 'REVERSING', 'REPLANNING', 'ARRIVED'
+    this.targetSpeed = 0;
+    this.targetHeading = 0;
+    this.hasArrived = false;
+    this.arrivalDistance = 45; // px
+
+    // Actuation parameters
+    this.config = {
+      cruiseSpeed: 95,          // px/s (~24 km/h)
+      cautionSpeed: 42,         // px/s (~10 km/h)
+      replanSpeed: 25,          // px/s (~6 km/h)
+      reverseSpeed: -26,        // px/s (controlled backward speed)
+      lookaheadWaypointIdx: 3,  // Lookahead point index along 18-point trajectory spline (~30-40px)
+      steerGain: 2.2,           // Proportional lateral tracking gain
+      steerRateLimit: 4.5,      // rad/s (smooth steering rate limit)
+      speedDecelGain: 25,       // Longitudinal braking sensitivity
+      speedAccelGain: 35,       // Longitudinal throttle sensitivity
+      rearSafetyBuffer: 60      // px safety buffer required for reversing
+    };
+  }
+
+  /**
+   * Toggle between Manual and Autonomous driving modes
+   * @param {boolean} [forceState]
+   * @param {EgoVehicle} [egoVehicle]
+   * @returns {boolean} Current autonomous mode state
+   */
+  toggleMode(forceState, egoVehicle) {
+    this.isAutonomous = (forceState !== undefined) ? forceState : !this.isAutonomous;
+    
+    if (!this.isAutonomous) {
+      this.controlState = 'MANUAL';
+      if (egoVehicle) {
+        egoVehicle.inputs.throttle = 0;
+        egoVehicle.inputs.brake = 0;
+        egoVehicle.inputs.steer = 0;
+        egoVehicle.inputs.handbrake = false;
+      }
+    } else {
+      this.controlState = 'CRUISING';
+      this.hasArrived = false;
+    }
+
+    console.log(`[AutonomousController] Mode: ${this.isAutonomous ? 'AUTONOMOUS' : 'MANUAL'}`);
+    return this.isAutonomous;
+  }
+
+  /**
+   * Main autonomous actuation step
+   * @param {EgoVehicle} egoVehicle
+   * @param {Object} destination
+   * @param {Object} decisionData
+   * @param {Object} pathPlannerData
+   * @param {Object} perceptionData
+   * @param {TrafficManager} trafficManager
+   * @param {number} dt
+   */
+  update(egoVehicle, destination, decisionData, pathPlannerData, perceptionData, trafficManager, dt) {
+    if (!egoVehicle) return;
+
+    // 1. If in Manual Mode: Leave ego inputs to manual teleop
+    if (!this.isAutonomous) {
+      this.controlState = 'MANUAL';
+      return;
+    }
+
+    const egoX = egoVehicle.x;
+    const egoY = egoVehicle.y;
+    const egoHeading = egoVehicle.heading;
+    const currentSpeed = egoVehicle.speed || 0;
+
+    // 2. Check Destination Arrival (Destination Goal at x: 1650, y: 560)
+    const destX = destination ? destination.x : 1650;
+    const destY = destination ? destination.y : 560;
+    const distToGoal = Math.hypot(destX - egoX, destY - egoY);
+
+    if (distToGoal <= this.arrivalDistance || this.hasArrived) {
+      this.hasArrived = true;
+      this.controlState = 'ARRIVED';
+      this.targetSpeed = 0;
+      egoVehicle.inputs.throttle = 0;
+      egoVehicle.inputs.brake = 1.0;
+      egoVehicle.inputs.steer = 0;
+      egoVehicle.inputs.handbrake = (Math.abs(currentSpeed) < 1.0);
+      return;
+    }
+
+    // 3. Extract Decision and Trajectory
+    const decision = decisionData ? decisionData.decision : 'GO';
+    const selectedPath = pathPlannerData ? pathPlannerData.selectedPath : null;
+    const plannerState = pathPlannerData ? pathPlannerData.plannerState : 'OPTIMAL';
+
+    // 4. Execute Safety Priority Mapping: Decision -> Target Speed & Control State
+    switch (decision) {
+      case 'STOP':
+        this.controlState = 'STOPPED';
+        this.targetSpeed = 0;
+        egoVehicle.inputs.throttle = 0;
+        egoVehicle.inputs.brake = 1.0;
+        egoVehicle.inputs.steer = 0;
+        return;
+
+      case 'WAIT':
+        this.controlState = 'WAITING';
+        this.targetSpeed = 0;
+        egoVehicle.inputs.throttle = 0;
+        egoVehicle.inputs.brake = 1.0;
+        egoVehicle.inputs.steer = 0;
+        return;
+
+      case 'YIELD':
+        this.controlState = 'YIELDING';
+        this.targetSpeed = 0;
+        egoVehicle.inputs.throttle = 0;
+        egoVehicle.inputs.brake = 0.8;
+        return;
+
+      case 'REVERSE': {
+        // Verify rear safety buffer in real-time before reversing
+        const rearSafe = this.checkRearSafety(egoVehicle, perceptionData, trafficManager);
+        if (rearSafe) {
+          this.controlState = 'REVERSING';
+          this.targetSpeed = this.config.reverseSpeed; // -26 px/s
+          egoVehicle.inputs.throttle = -0.6;
+          egoVehicle.inputs.brake = 0;
+          egoVehicle.inputs.steer = 0;
+          return;
+        } else {
+          // If rear occupied, fallback to WAITING
+          this.controlState = 'WAITING';
+          this.targetSpeed = 0;
+          egoVehicle.inputs.throttle = 0;
+          egoVehicle.inputs.brake = 1.0;
+          egoVehicle.inputs.steer = 0;
+          return;
+        }
+      }
+
+      case 'REPLAN':
+        this.controlState = 'REPLANNING';
+        this.targetSpeed = this.config.replanSpeed; // 25 px/s
+        break;
+
+      case 'SLOW':
+        this.controlState = (plannerState === 'AVOIDANCE') ? 'AVOIDING' : 'BRAKING';
+        this.targetSpeed = this.config.cautionSpeed; // 42 px/s
+        break;
+
+      case 'GO':
+      default:
+        this.controlState = 'CRUISING';
+        this.targetSpeed = this.config.cruiseSpeed; // 95 px/s
+        break;
+    }
+
+    // 5. Lateral Path Tracking (Smooth Steering Control)
+    let desiredSteerAngle = 0;
+
+    if (selectedPath && selectedPath.waypoints && selectedPath.waypoints.length > 0) {
+      // Pick lookahead point along spline trajectory
+      const lookaheadIdx = Math.min(this.config.lookaheadWaypointIdx, selectedPath.waypoints.length - 1);
+      const targetWp = selectedPath.waypoints[lookaheadIdx] || selectedPath.endPoint;
+
+      // Target heading from ego position to target waypoint
+      const targetHeading = Math.atan2(targetWp.y - egoY, targetWp.x - egoX);
+      let headingError = targetHeading - egoHeading;
+      while (headingError > Math.PI) headingError -= Math.PI * 2;
+      while (headingError < -Math.PI) headingError += Math.PI * 2;
+
+      // Calculate desired steer input [-1.0, 1.0]
+      desiredSteerAngle = Math.max(-1.0, Math.min(1.0, headingError * this.config.steerGain));
+
+      // Speed reduction on sharp turns to maintain stability
+      if (Math.abs(desiredSteerAngle) > 0.4) {
+        this.targetSpeed = Math.min(this.targetSpeed, this.config.cautionSpeed);
+      }
+    } else {
+      // Direct waypoint heading to destination if planner has no path
+      const directHeading = Math.atan2(destY - egoY, destX - egoX);
+      let headingError = directHeading - egoHeading;
+      while (headingError > Math.PI) headingError -= Math.PI * 2;
+      while (headingError < -Math.PI) headingError += Math.PI * 2;
+      desiredSteerAngle = Math.max(-1.0, Math.min(1.0, headingError * 1.5));
+    }
+
+    // Smooth steering rate transition
+    egoVehicle.inputs.steer += (desiredSteerAngle - egoVehicle.inputs.steer) * this.config.steerRateLimit * dt;
+    egoVehicle.inputs.steer = Math.max(-1.0, Math.min(1.0, egoVehicle.inputs.steer));
+
+    // 6. Longitudinal Speed Control (Throttle & Progressive Braking)
+    if (currentSpeed < this.targetSpeed) {
+      const speedDiff = this.targetSpeed - currentSpeed;
+      egoVehicle.inputs.throttle = Math.min(1.0, Math.max(0.15, speedDiff / this.config.speedAccelGain));
+      egoVehicle.inputs.brake = 0;
+      egoVehicle.inputs.handbrake = false;
+    } else if (currentSpeed > this.targetSpeed + 3) {
+      const excessSpeed = currentSpeed - this.targetSpeed;
+      egoVehicle.inputs.throttle = 0;
+      egoVehicle.inputs.brake = Math.min(1.0, excessSpeed / this.config.speedDecelGain);
+      egoVehicle.inputs.handbrake = false;
+    } else {
+      // Maintain speed / coast
+      egoVehicle.inputs.throttle = 0.1;
+      egoVehicle.inputs.brake = 0;
+      egoVehicle.inputs.handbrake = false;
+    }
+  }
+
+  /**
+   * Verify real-time rear safety clearance buffer before allowing REVERSE
+   */
+  checkRearSafety(egoVehicle, perceptionData, trafficManager) {
+    const cosH = Math.cos(egoVehicle.heading);
+    const sinH = Math.sin(egoVehicle.heading);
+
+    const dynamicEntities = trafficManager ? trafficManager.getEntities() : [];
+    for (const dyn of dynamicEntities) {
+      const dx = dyn.x - egoVehicle.x;
+      const dy = dyn.y - egoVehicle.y;
+      const forwardDist = dx * cosH + dy * sinH;
+      const lateralDist = Math.abs(dy * cosH - dx * sinH);
+
+      if (forwardDist < -4 && forwardDist > -this.config.rearSafetyBuffer && lateralDist < 26) {
+        return false;
+      }
+    }
+
+    if (window.StaticCollisionSystem) {
+      const rearX = egoVehicle.x - cosH * 35;
+      const rearY = egoVehicle.y - sinH * 35;
+      const solidRear = window.StaticCollisionSystem.checkSolidCollision(rearX, rearY, 16);
+      if (solidRear.collided) return false;
+    }
+
+    return true;
+  }
+
+  getTelemetry() {
+    return {
+      isAutonomous: this.isAutonomous,
+      controlState: this.controlState,
+      targetSpeed: this.targetSpeed,
+      hasArrived: this.hasArrived
+    };
+  }
+}
+
+/* ============================================================================
+   11. SIMULATION CORE APPLICATION CONTROLLER & GAME LOOP
    ============================================================================ */
 class SimulationAppController {
   constructor() {
@@ -4561,6 +4844,9 @@ class SimulationAppController {
     // Module 6A: Context-Aware Decision Manager
     this.decisionManager = new DecisionManager();
 
+    // Module 6B: Autonomous Vehicle Controller
+    this.autonomousController = new AutonomousVehicleController();
+
     // Registered Submodules
     this.modules = {};
 
@@ -4587,7 +4873,7 @@ class SimulationAppController {
     this.lastTime = performance.now();
     requestAnimationFrame((time) => this.loop(time));
 
-    console.log('[SimulationEngine] Module 1, 2, 3, 4 & 5 Active: Environment, Ego Vehicle, Traffic, Risk & Path Planner loaded.');
+    console.log('[SimulationEngine] Modules 1-6B Active: Environment, Ego Vehicle, Traffic Intelligence, Perception Risk, Path Planner, Decision Maker & Autonomous Control loaded.');
   }
 
   cacheDom() {
@@ -4599,6 +4885,17 @@ class SimulationAppController {
       
       // Telemetry Readouts
       egoSpeed: document.getElementById('ego-speed'),
+
+      // Module 6B Mode & Control State Elements
+      btnMode: document.getElementById('btn-mode'),
+      btnModeText: document.getElementById('btn-mode-text'),
+      modePill: document.getElementById('mode-pill'),
+      modeDot: document.getElementById('mode-dot'),
+      modeValue: document.getElementById('mode-value'),
+      controlStatePill: document.getElementById('control-state-pill'),
+      controlStateValue: document.getElementById('control-state-value'),
+      badgeMode: document.getElementById('badge-mode'),
+      hintBanner: document.getElementById('hint-banner'),
 
       // Module 6A Decision Telemetry Elements
       decisionDot: document.getElementById('decision-dot'),
@@ -4703,6 +5000,13 @@ class SimulationAppController {
       this.camera.zoomAt(factor, screenX, screenY);
     }, { passive: false });
 
+    // Mode Toggle Button (Manual / Autonomous)
+    if (this.dom.btnMode) {
+      this.dom.btnMode.addEventListener('click', () => {
+        this.toggleAutonomousMode();
+      });
+    }
+
     // Path Planner Toggle Button
     if (this.dom.btnPaths) {
       this.dom.btnPaths.addEventListener('click', () => {
@@ -4734,6 +5038,9 @@ class SimulationAppController {
     if (this.dom.btnResetCar) {
       this.dom.btnResetCar.addEventListener('click', () => {
         this.egoVehicle.reset();
+        if (this.autonomousController) {
+          this.autonomousController.hasArrived = false;
+        }
       });
     }
 
@@ -4786,12 +5093,20 @@ class SimulationAppController {
       });
     }
 
-    // Keyboard Shortcuts (G: Grid, L: Labels, R: Reset View, T: Toggle Traffic, V: Toggle Radar, C: Toggle Paths)
+    // Keyboard Shortcuts (M: Mode, Space: Stop/Manual, G: Grid, L: Labels, R: Reset View, T: Toggle Traffic, V: Toggle Radar, C: Toggle Paths)
     window.addEventListener('keydown', (e) => {
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
 
       const key = e.key.toLowerCase();
-      if (key === 'g' && this.dom.btnGrid) {
+      if (key === 'm') {
+        this.toggleAutonomousMode();
+      } else if (e.code === 'Space') {
+        // Emergency Stop & Return to Manual Teleoperation
+        if (this.autonomousController && this.autonomousController.isAutonomous) {
+          this.autonomousController.toggleMode(false, this.egoVehicle);
+          this.updateModeUI(false);
+        }
+      } else if (key === 'g' && this.dom.btnGrid) {
         this.dom.btnGrid.click();
       } else if (key === 'l' && this.dom.btnLabels) {
         this.dom.btnLabels.click();
@@ -4808,43 +5123,68 @@ class SimulationAppController {
   }
 
   /**
-   * Main Simulation Loop (Updates Physics, Traffic, Perception, Path Planner, Telemetry, Renders Scene)
+   * Toggle between Manual and Autonomous driving mode
+   * @param {boolean} [forceState]
+   * @returns {boolean}
+   */
+  toggleAutonomousMode(forceState) {
+    if (!this.autonomousController) return false;
+    const isAuto = this.autonomousController.toggleMode(forceState, this.egoVehicle);
+    this.updateModeUI(isAuto);
+    return isAuto;
+  }
+
+  updateModeUI(isAuto) {
+    if (this.dom.btnMode) {
+      this.dom.btnMode.classList.toggle('autonomous', isAuto);
+      if (this.dom.btnModeText) {
+        this.dom.btnModeText.textContent = isAuto ? 'Manual Mode' : 'Autonomous';
+      }
+    }
+    if (this.dom.badgeMode) {
+      this.dom.badgeMode.textContent = isAuto ? 'Autonomous AI' : 'Manual Teleop';
+      this.dom.badgeMode.classList.toggle('autonomous', isAuto);
+    }
+    if (this.dom.modePill) {
+      this.dom.modePill.classList.toggle('autonomous', isAuto);
+    }
+    if (this.dom.modeDot) {
+      this.dom.modeDot.className = 'pill-dot mode-dot ' + (isAuto ? 'autonomous' : 'manual');
+    }
+    if (this.dom.modeValue) {
+      this.dom.modeValue.textContent = isAuto ? 'AUTONOMOUS' : 'MANUAL';
+      this.dom.modeValue.className = 'pill-value ' + (isAuto ? 'accent-emerald' : 'accent-cyan');
+    }
+  }
+
+  /**
+   * Main Simulation Loop (Updates Physics, Traffic, Perception, Path Planner, Decision, Controller, Telemetry, Renders Scene)
    */
   loop(currentTime) {
     const dt = Math.min((currentTime - this.lastTime) / 1000, 0.1);
     this.lastTime = currentTime;
 
-    // 1. Update Ego Vehicle Physics (Module 2)
-    if (this.egoVehicle) {
-      this.egoVehicle.update(dt);
-    }
-
-    // 2. Update Dynamic Traffic & Entities (Module 3 + Local Traffic Intelligence)
-    if (this.trafficManager) {
-      this.trafficManager.update(dt, this.egoVehicle, EnvironmentData);
-    }
-
-    // 3. Update Perception & Risk Assessment (Module 4)
+    // 1. Update Perception & Risk Assessment (Module 4)
     if (this.detectionManager) {
       this.detectionManager.update(
         this.egoVehicle,
         EnvironmentData,
-        this.trafficManager.getEntities(),
+        this.trafficManager ? this.trafficManager.getEntities() : [],
         dt
       );
     }
 
-    // 4. Update Adaptive Path Planner (Module 5)
+    // 2. Update Adaptive Path Planner (Module 5)
     if (this.pathPlanner) {
       this.pathPlanner.update(
         this.egoVehicle,
         EnvironmentData,
-        this.detectionManager ? this.detectionManager.getPerceptionData ? this.detectionManager : this.getPerceptionData() : null,
+        this.getPerceptionData(),
         dt
       );
     }
 
-    // 5. Update Context-Aware Decision Manager (Module 6A)
+    // 3. Update Context-Aware Decision Manager (Module 6A)
     if (this.decisionManager) {
       this.decisionManager.update(
         this.egoVehicle,
@@ -4856,7 +5196,30 @@ class SimulationAppController {
       );
     }
 
-    // 6. Update Submodules (Future Module 6B+)
+    // 4. Update Autonomous Vehicle Controller (Module 6B)
+    if (this.autonomousController) {
+      this.autonomousController.update(
+        this.egoVehicle,
+        EnvironmentData.destination,
+        this.getDecisionData(),
+        this.getPathPlannerData(),
+        this.getPerceptionData(),
+        this.trafficManager,
+        dt
+      );
+    }
+
+    // 5. Update Ego Vehicle Physics (Module 2)
+    if (this.egoVehicle) {
+      this.egoVehicle.update(dt);
+    }
+
+    // 6. Update Dynamic Traffic & Intelligent Non-Ego Vehicles (Module 3 + Local Traffic Planner)
+    if (this.trafficManager) {
+      this.trafficManager.update(dt, this.egoVehicle, EnvironmentData);
+    }
+
+    // 7. Update Submodules (Future Extensions)
     Object.keys(this.modules).forEach((name) => {
       const mod = this.modules[name];
       if (typeof mod.update === 'function') {
@@ -4864,10 +5227,10 @@ class SimulationAppController {
       }
     });
 
-    // 7. Update Real-time HUD Telemetry
+    // 8. Update Real-time HUD Telemetry
     this.updateHUD();
 
-    // 8. Render Scene
+    // 9. Render Scene
     this.render();
 
     // Request next animation frame
@@ -4877,7 +5240,7 @@ class SimulationAppController {
   }
 
   /**
-   * Update HUD Telemetry elements with Ego Vehicle, Perception, Path Planner, and Decision telemetry
+   * Update HUD Telemetry elements with Ego Vehicle, Perception, Path Planner, Decision, and Autonomous Controller telemetry
    */
   updateHUD() {
     if (this.egoVehicle) {
@@ -4885,6 +5248,35 @@ class SimulationAppController {
       const speedKmH = (Math.abs(this.egoVehicle.speed) * 0.25).toFixed(1);
       if (this.dom.egoSpeed) {
         this.dom.egoSpeed.textContent = speedKmH;
+      }
+    }
+
+    // Update Module 6B Autonomous Control State Telemetry
+    if (this.autonomousController) {
+      const isAuto = this.autonomousController.isAutonomous;
+      const state = this.autonomousController.controlState;
+      const arrived = this.autonomousController.hasArrived;
+
+      if (this.dom.controlStateValue) {
+        this.dom.controlStateValue.textContent = arrived ? 'ARRIVED' : state;
+        this.dom.controlStateValue.className = 'pill-value';
+        if (arrived) {
+          this.dom.controlStateValue.classList.add('accent-emerald');
+        } else if (state === 'STOPPED' || state === 'BRAKING') {
+          this.dom.controlStateValue.classList.add('accent-rose');
+        } else if (state === 'AVOIDING' || state === 'REPLANNING') {
+          this.dom.controlStateValue.classList.add('accent-amber');
+        } else if (state === 'WAITING' || state === 'YIELDING') {
+          this.dom.controlStateValue.classList.add('accent-indigo');
+        } else if (state === 'REVERSING') {
+          this.dom.controlStateValue.classList.add('accent-pink');
+        } else {
+          this.dom.controlStateValue.classList.add('accent-cyan');
+        }
+      }
+
+      if (arrived && this.dom.hintBanner) {
+        this.dom.hintBanner.innerHTML = '<span>&#127881; <strong>DESTINATION REACHED!</strong> Vehicle safely stopped at destination goal. [P] Reset Car</span>';
       }
     }
 
@@ -5026,7 +5418,7 @@ class SimulationAppController {
       this.egoVehicle.render(this.ctx);
     }
 
-    // Render Future Submodules (Module 6+)
+    // Render Future Submodules
     Object.keys(this.modules).forEach((name) => {
       const mod = this.modules[name];
       if (typeof mod.render === 'function') {
@@ -5041,6 +5433,14 @@ class SimulationAppController {
 
   getEgoVehicle() {
     return this.egoVehicle;
+  }
+
+  getAutonomousController() {
+    return this.autonomousController;
+  }
+
+  isAutonomous() {
+    return this.autonomousController ? this.autonomousController.isAutonomous : false;
   }
 
   getDestination() {
@@ -5110,6 +5510,10 @@ class SimulationAppController {
     return this.decisionManager ? this.decisionManager.getDecision() : 'GO';
   }
 
+  getControlState() {
+    return this.autonomousController ? this.autonomousController.controlState : 'MANUAL';
+  }
+
   getObstacles() {
     return {
       potholes: EnvironmentData.potholes,
@@ -5120,7 +5524,8 @@ class SimulationAppController {
       dynamicObjects: this.getDynamicObjects(),
       perception: this.getPerceptionData(),
       planner: this.getPathPlannerData(),
-      decision: this.getDecisionData()
+      decision: this.getDecisionData(),
+      controller: this.autonomousController ? this.autonomousController.getTelemetry() : null
     };
   }
 
@@ -5159,6 +5564,7 @@ window.DetectionManager = DetectionManager;
 window.PathPlanner = PathPlanner;
 window.StaticCollisionSystem = StaticCollisionSystem;
 window.DecisionManager = DecisionManager;
+window.AutonomousVehicleController = AutonomousVehicleController;
 
 // Boot on DOM Ready
 document.addEventListener('DOMContentLoaded', () => {
