@@ -4382,7 +4382,7 @@ class DetectionManager {
    * Continuous perception and risk update loop
    * Evaluates relative positions, relative velocities, closing speeds, and TTC
    */
-  update(egoVehicle, staticObstacles, dynamicObjects, dt) {
+  update(egoVehicle, arg2, arg3, dt) {
     if (dt <= 0 || dt > 0.1) dt = 0.016;
 
     // Rotate radar scan sweep
@@ -4394,6 +4394,27 @@ class DetectionManager {
       this.overallRisk = 'SAFE';
       this.minTTC = null;
       return;
+    }
+
+    // Flexible parameter resolution: support both (ego, static, dynamic) and (ego, dynamic, static)
+    let staticObstacles = null;
+    let dynamicObjects = [];
+
+    if (Array.isArray(arg2)) {
+      dynamicObjects = arg2;
+      staticObstacles = arg3;
+    } else if (Array.isArray(arg3)) {
+      staticObstacles = arg2;
+      dynamicObjects = arg3;
+    } else if (arg2 && typeof arg2.getEntities === 'function') {
+      dynamicObjects = arg2.getEntities();
+      staticObstacles = arg3;
+    } else if (arg3 && typeof arg3.getEntities === 'function') {
+      staticObstacles = arg2;
+      dynamicObjects = arg3.getEntities();
+    } else {
+      staticObstacles = arg2;
+      dynamicObjects = [];
     }
 
     // Ego Kinematics in World Coordinates
@@ -4425,9 +4446,9 @@ class DetectionManager {
           y: dyn.y,
           heading: dyn.heading,
           speed: dyn.speed,
-          length: dyn.length,
-          width: dyn.width,
-          radius: dyn.radius || Math.max(dyn.length, dyn.width) / 2,
+          length: dyn.length || 18,
+          width: dyn.width || 18,
+          radius: (dyn.radius !== undefined) ? dyn.radius : (Math.max(dyn.length || 18, dyn.width || 18) / 2),
           isDynamic: true,
           bounds: dyn.getCollisionCorners ? dyn.getCollisionCorners() : null,
           rawObject: dyn
@@ -4527,10 +4548,11 @@ class DetectionManager {
       const onRoad = window.StaticCollisionSystem ? window.StaticCollisionSystem.isDrivableRoad(cand.x, cand.y) : true;
       const onSidewalk = window.StaticCollisionSystem ? window.StaticCollisionSystem.isSidewalk(cand.x, cand.y) : false;
       const headingToRoad = window.StaticCollisionSystem ? window.StaticCollisionSystem.isMovingTowardRoad(cand.x, cand.y, cand.heading, cand.speed) : false;
+      const location = onSidewalk ? 'SIDEWALK' : (onRoad ? 'ROAD' : 'OFF_ROAD');
 
       // Candidate Velocity Vector
-      const candVx = cand.speed * Math.cos(cand.heading);
-      const candVy = cand.speed * Math.sin(cand.heading);
+      const candVx = (cand.speed || 0) * Math.cos(cand.heading || 0);
+      const candVy = (cand.speed || 0) * Math.sin(cand.heading || 0);
 
       // Relative Velocity: V_rel = V_cand - V_ego
       const vRelX = candVx - egoVx;
@@ -4556,21 +4578,126 @@ class DetectionManager {
 
       // Forward corridor alignment: is candidate directly in ego vehicle's travel path?
       const forwardCorridorDist = dx * Math.cos(egoHeading) + dy * Math.sin(egoHeading);
-      const lateralCorridorDist = Math.abs(dy * Math.cos(egoHeading) - dx * Math.sin(egoHeading));
-      const inEgoTravelCorridor = (forwardCorridorDist > 0 && forwardCorridorDist < 160 && lateralCorridorDist < (cand.radius + 18));
+      const lateralCorridorDist = dy * Math.cos(egoHeading) - dx * Math.sin(egoHeading);
+      const absLatDist = Math.abs(lateralCorridorDist);
+      // Use tighter corridor for stationary/parked objects to avoid false positives from roadside items
+      const isParkedOrStaticObj = (!cand.isDynamic || Math.abs(cand.speed || 0) < 2) && (cand.type === 'parked_object' || cand.type === 'debris');
+      const corridorHalfWidth = isParkedOrStaticObj ? Math.min(cand.radius, 14) : (cand.radius + 18);
+      const inEgoTravelCorridor = (forwardCorridorDist > 0 && forwardCorridorDist < 160 && absLatDist < corridorHalfWidth);
       const isApproaching = closingSpeed > 1.5;
       const isBehindAndReceding = (forwardCorridorDist < -8 && closingSpeed <= 1.0);
+
+      // Relative Position (AHEAD / BEHIND / LEFT / RIGHT)
+      let relativePosition = 'AHEAD';
+      if (forwardCorridorDist > 14) {
+        relativePosition = 'AHEAD';
+      } else if (forwardCorridorDist < -14) {
+        relativePosition = 'BEHIND';
+      } else {
+        relativePosition = (lateralCorridorDist < 0) ? 'LEFT' : 'RIGHT';
+      }
+
+      // Relative Movement Classification
+      let relativeMovement = 'STATIONARY';
+      const isDynamic = !!cand.isDynamic && Math.abs(cand.speed || 0) > 2.0;
+
+      if (!isDynamic) {
+        relativeMovement = 'STATIONARY';
+      } else if (cand.type === 'pedestrian' || cand.type === 'animal') {
+        if (candVy < -3) relativeMovement = 'CROSSING_RIGHT_TO_LEFT';
+        else if (candVy > 3) relativeMovement = 'CROSSING_LEFT_TO_RIGHT';
+        else if (closingSpeed > 1.5) relativeMovement = 'APPROACHING';
+        else if (closingSpeed < -1.5) relativeMovement = 'RECEDING';
+        else relativeMovement = 'PARALLEL';
+      } else {
+        let headingDiff = Math.abs((cand.heading || 0) - egoHeading);
+        while (headingDiff > Math.PI) headingDiff -= Math.PI * 2;
+        headingDiff = Math.abs(headingDiff);
+
+        if (headingDiff > 2.4) {
+          relativeMovement = 'ONCOMING';
+        } else if (headingDiff < 0.6) {
+          relativeMovement = (closingSpeed > 2.0) ? 'APPROACHING' : (closingSpeed < -2.0 ? 'RECEDING' : 'PARALLEL');
+        } else {
+          relativeMovement = (candVy < 0) ? 'CROSSING_RIGHT_TO_LEFT' : 'CROSSING_LEFT_TO_RIGHT';
+        }
+      }
+
+      // Trajectory Intersection Check
+      const intersectsTrajectory = inEgoTravelCorridor && onRoad;
+
+      // Predicted Future Intersection (temporal projection 0 - 3.5s)
+      let predictedIntersection = false;
+      let tIntersection = null;
+      if (cand.isDynamic && Math.abs(cand.speed || 0) > 1.0) {
+        for (let t = 0.2; t <= 3.5; t += 0.2) {
+          const futureEgoX = egoX + egoVx * t;
+          const futureEgoY = egoY + egoVy * t;
+          const futureCandX = cand.x + candVx * t;
+          const futureCandY = cand.y + candVy * t;
+          const futureDist = Math.hypot(futureCandX - futureEgoX, futureCandY - futureEgoY);
+          if (futureDist < (egoRadius + cand.radius + 10)) {
+            predictedIntersection = true;
+            tIntersection = t;
+            break;
+          }
+        }
+      } else if (inEgoTravelCorridor) {
+        predictedIntersection = true;
+        tIntersection = (egoSpeed > 5) ? (forwardCorridorDist / egoSpeed) : Infinity;
+      }
+
+      // Available Safe Gap around object
+      const leftGap = Math.max(0, (cand.y - (cand.radius || 12)) - 465);
+      const rightGap = Math.max(0, 655 - (cand.y + (cand.radius || 12)));
+      const safeGap = {
+        left: leftGap,
+        right: rightGap,
+        canPassLeft: leftGap > 36,
+        canPassRight: rightGap > 36,
+        hasSafeAlternative: (leftGap > 36 || rightGap > 36)
+      };
+
+      // Relevance Classification
+      let relevance = 'IRRELEVANT';
+
+      if (isBehindAndReceding || (onSidewalk && !headingToRoad)) {
+        relevance = 'IRRELEVANT';
+      } else if (onSidewalk && headingToRoad) {
+        relevance = 'MONITOR';
+      } else if (cand.type === 'pothole') {
+        relevance = inEgoTravelCorridor ? 'MONITOR' : 'IRRELEVANT';
+      } else if (cand.type === 'parked_object') {
+        // Parked objects are roadside hazards - only relevant if directly blocking the tight corridor
+        relevance = inEgoTravelCorridor ? 'MONITOR' : 'IRRELEVANT';
+      } else if (isDynamic && relativePosition === 'AHEAD' && (relativeMovement === 'PARALLEL' || relativeMovement === 'APPROACHING') && absLatDist < 26) {
+        relevance = 'FOLLOW_LEAD';
+      } else if (relativeMovement === 'ONCOMING' && absLatDist > 24) {
+        relevance = 'MONITOR';
+      } else if (inEgoTravelCorridor || predictedIntersection) {
+        relevance = 'THREAT';
+      } else if (!cand.isDynamic && forwardCorridorDist > 0 && forwardCorridorDist < 90 && absLatDist < 35) {
+        relevance = 'BLOCKAGE';
+      } else {
+        relevance = 'MONITOR';
+      }
 
       // Trajectory-Aware Collision Risk Assessment
       let riskLevel = 'SAFE';
 
-      // Case 0: Object behind ego and receding/opening gap -> Always SAFE
-      if (isBehindAndReceding) {
+      if (relevance === 'IRRELEVANT') {
         riskLevel = 'SAFE';
         sCount++;
-      }
-      // Case 1: Potholes (Road surface hazards)
-      else if (cand.type === 'pothole') {
+      } else if (relevance === 'FOLLOW_LEAD') {
+        if (closingSpeed > 4.0 || forwardCorridorDist < 35) {
+          riskLevel = 'CAUTION';
+          cCount++;
+          if (ttc < minTTC) minTTC = ttc;
+        } else {
+          riskLevel = 'SAFE';
+          sCount++;
+        }
+      } else if (cand.type === 'pothole') {
         if (inEgoTravelCorridor && forwardCorridorDist < 120 && egoSpeed > 10) {
           riskLevel = 'CAUTION';
           cCount++;
@@ -4578,16 +4705,9 @@ class DetectionManager {
           riskLevel = 'SAFE';
           sCount++;
         }
-      }
-      // Case 2: Pedestrians & Animals (Sidewalk vs Crossing vs In-Corridor)
-      else if (cand.type === 'pedestrian' || cand.type === 'animal') {
-        if (onSidewalk && !headingToRoad) {
-          // Standing or walking parallel on sidewalk -> SAFE (does not block path)
-          riskLevel = 'SAFE';
-          sCount++;
-        } else if (onSidewalk && headingToRoad) {
-          // Approaching curb / entering road -> Caution / Danger based on trajectory
-          if (forwardCorridorDist > 0 && forwardCorridorDist < 110 && lateralCorridorDist < 55) {
+      } else if (cand.type === 'pedestrian' || cand.type === 'animal') {
+        if (onSidewalk && headingToRoad) {
+          if (forwardCorridorDist > 0 && forwardCorridorDist < 110 && absLatDist < 55) {
             riskLevel = (ttc <= 1.8 || forwardCorridorDist < 40) ? 'DANGER' : 'CAUTION';
             if (riskLevel === 'DANGER') dCount++; else cCount++;
             if (ttc < minTTC) minTTC = ttc;
@@ -4596,7 +4716,6 @@ class DetectionManager {
             sCount++;
           }
         } else if (onRoad) {
-          // Check if pedestrian/animal has lateral velocity moving towards ego travel corridor
           const lateralSpeedTowardCorridor = (dy > 0 && candVy < -3) || (dy < 0 && candVy > 3);
           const tCross = lateralSpeedTowardCorridor ? Math.abs(dy) / (Math.abs(candVy) || 1) : Infinity;
 
@@ -4616,18 +4735,29 @@ class DetectionManager {
           riskLevel = 'SAFE';
           sCount++;
         }
-      }
-      // Case 3: Solid Obstacles & Dynamic Road Vehicles
-      else {
+      } else {
+        // Solid Obstacles & Dynamic Road Vehicles
+        const isStationary = (!cand.isDynamic || Math.abs(cand.speed || 0) < 5);
+        const directCorridorWidth = isStationary ? 16 : (cand.radius + 6);
+        const isDirectFrontal = (absLatDist < directCorridorWidth);
+
         if (cand.type === 'building' || (onSidewalk && !cand.isDynamic && !inEgoTravelCorridor)) {
           riskLevel = 'SAFE';
           sCount++;
-        } else if (inEgoTravelCorridor) {
-          if ((ttc <= this.dangerTTC && isApproaching) || (forwardCorridorDist <= 40 && (isApproaching || egoSpeed > 15))) {
+        } else if (inEgoTravelCorridor && isDirectFrontal) {
+          if (!isStationary && ttc <= this.dangerTTC && isApproaching) {
             riskLevel = 'DANGER';
             dCount++;
             if (ttc < minTTC) minTTC = ttc;
-          } else if ((ttc <= this.cautionTTC && isApproaching) || (forwardCorridorDist <= 90 && (cand.speed < 15 || !cand.isDynamic))) {
+          } else if (forwardCorridorDist <= 35 && egoSpeed > 15) {
+            riskLevel = 'DANGER';
+            dCount++;
+            if (ttc < minTTC) minTTC = ttc;
+          } else if (forwardCorridorDist <= 75 && isStationary) {
+            riskLevel = 'CAUTION';
+            cCount++;
+            if (ttc < minTTC) minTTC = ttc;
+          } else if (!isStationary && ttc <= this.cautionTTC && isApproaching) {
             riskLevel = 'CAUTION';
             cCount++;
             if (ttc < minTTC) minTTC = ttc;
@@ -4673,7 +4803,15 @@ class DetectionManager {
         bounds: cand.bounds,
         onRoad: onRoad,
         onSidewalk: onSidewalk,
-        headingToRoad: headingToRoad
+        headingToRoad: headingToRoad,
+        location: location,
+        relativePosition: relativePosition,
+        relativeMovement: relativeMovement,
+        intersectsTrajectory: intersectsTrajectory,
+        predictedIntersection: predictedIntersection,
+        tIntersection: tIntersection,
+        safeGap: safeGap,
+        relevance: relevance
       });
     });
 
@@ -5119,8 +5257,8 @@ class PathPlanner {
         const obs = obstacles[j];
         if (obs.type === 'pothole') continue; // Potholes are scored in Step C as road surface hazards
 
-        // If pedestrian or animal is on sidewalk and not moving toward road, skip collision on road path
-        if ((obs.type === 'pedestrian' || obs.type === 'animal') && obs.onSidewalk && !obs.headingToRoad) {
+        // If object is classified as IRRELEVANT (sidewalk bystander, behind receding), skip collision scoring on path
+        if (obs.relevance === 'IRRELEVANT' || ((obs.type === 'pedestrian' || obs.type === 'animal') && obs.onSidewalk && !obs.headingToRoad)) {
           continue;
         }
 
@@ -5272,8 +5410,11 @@ class PathPlanner {
           type: det.type,
           x: det.x,
           y: det.y,
+          heading: det.heading || 0,
+          speed: det.speed || 0,
           radius: det.radius || 15,
           riskLevel: det.riskLevel || 'SAFE',
+          relevance: det.relevance || 'MONITOR',
           onRoad: det.onRoad,
           onSidewalk: det.onSidewalk,
           headingToRoad: det.headingToRoad
@@ -5511,7 +5652,7 @@ class DecisionManager {
     const plannerState = pathPlannerData ? pathPlannerData.plannerState : 'OPTIMAL';
     const candidatePaths = pathPlannerData ? (pathPlannerData.candidatePaths || []) : [];
 
-    const dynamicEntities = trafficManager ? trafficManager.getEntities() : [];
+    const dynamicEntities = trafficManager ? (typeof trafficManager.getEntities === 'function' ? trafficManager.getEntities() : (Array.isArray(trafficManager) ? trafficManager : [])) : [];
 
     // --- 1. Analyze Environmental Context & Traffic States ---
     const context = this.analyzeContext({
@@ -5677,7 +5818,7 @@ class DecisionManager {
     );
 
     for (const obj of detectedObjects) {
-      if (obj.isDynamic && (obj.type === 'car' || obj.type === 'motorcycle' || obj.type === 'auto_rickshaw')) {
+      if (obj.isDynamic && (obj.speed || 0) >= 8 && (obj.type === 'car' || obj.type === 'motorcycle' || obj.type === 'auto_rickshaw' || obj.type === 'truck' || obj.type === 'bus')) {
         let headingDiff = Math.abs((obj.heading || 0) - egoHeading);
         while (headingDiff > Math.PI) headingDiff -= Math.PI * 2;
         headingDiff = Math.abs(headingDiff);
@@ -5712,14 +5853,56 @@ class DecisionManager {
       }
     }
 
-    // F. Check Developing Risk / Hazard Caution
+    // F. Lead Vehicle Detection (for smooth FOLLOWING and SLOW regulation)
+    let leadVehicle = null;
+    let leadFollow = false;
+    let leadSlowing = false;
+
+    for (const obj of detectedObjects) {
+      if (obj.isDynamic && (obj.type === 'car' || obj.type === 'motorcycle' || obj.type === 'auto_rickshaw' || obj.type === 'truck' || obj.type === 'bus')) {
+        const dx = obj.x - egoX;
+        const dy = obj.y - egoY;
+        const forwardDist = dx * cosH + dy * sinH;
+        const lateralDist = Math.abs(dy * cosH - dx * sinH);
+
+        let headingDiff = Math.abs((obj.heading || 0) - egoHeading);
+        while (headingDiff > Math.PI) headingDiff -= Math.PI * 2;
+        headingDiff = Math.abs(headingDiff);
+
+        // Vehicle ahead in same corridor moving generally in same direction
+        if (obj.isDynamic && (obj.speed || 0) >= 8 && forwardDist > 15 && forwardDist < 160 && lateralDist < 26 && headingDiff < 0.6) {
+          leadVehicle = obj;
+          const closingSpeed = obj.closingSpeed || 0;
+          if (closingSpeed > 3.0 || (obj.speed !== undefined && obj.speed < egoSpeed - 5)) {
+            leadSlowing = true;
+          } else if (obj.speed !== undefined && obj.speed >= 10 && forwardDist >= 30) {
+            leadFollow = true;
+          }
+          break;
+        }
+      }
+    }
+
+    // G. Pedestrian Approaching Curb / Monitoring
+    let pedestrianApproachingCurb = false;
+    for (const obj of detectedObjects) {
+      if ((obj.type === 'pedestrian' || obj.type === 'animal') && obj.onSidewalk && obj.headingToRoad) {
+        if (obj.distance < 110) {
+          pedestrianApproachingCurb = true;
+          break;
+        }
+      }
+    }
+
+    // H. Check Developing Risk / Hazard Caution
     let developingRisk = false;
     let cautionReason = '';
 
     if (overallRisk === 'CAUTION' || (minTTC > this.config.imminentTTC && minTTC <= this.config.cautionTTC)) {
       developingRisk = true;
       cautionReason = `Developing collision risk (TTC ${minTTC < 10 ? minTTC.toFixed(1) + 's' : 'caution'})`;
-    } else if (plannerState === 'AVOIDANCE') {
+    } else if (plannerState === 'AVOIDANCE' && overallRisk !== 'SAFE') {
+      // Only slow for avoidance when there are actual detected threats, not just static roadside objects
       developingRisk = true;
       cautionReason = 'Executing path avoidance maneuver';
     } else if (isEgoInPothole) {
@@ -5753,6 +5936,10 @@ class DecisionManager {
       rearBlocker,
       crossTrafficDetected,
       crossTrafficReason,
+      leadVehicle,
+      leadFollow,
+      leadSlowing,
+      pedestrianApproachingCurb,
       developingRisk,
       cautionReason,
       egoSpeed,
@@ -5768,8 +5955,11 @@ class DecisionManager {
    * 3. STUCK RECOVERY -> REVERSE (if clear rear) or WAIT
    * 4. TRAFFIC BLOCKAGE -> REVERSE (if clear rear) or WAIT (waiting for gap)
    * 5. INFEASIBLE TRAJECTORY -> REPLAN (if alternative exists) or WAIT
-   * 6. DEVELOPING RISK / AVOIDANCE -> SLOW
-   * 7. DEFAULT / SIDEWALK DETECTION -> GO
+   * 6. LEAD VEHICLE SLOWING -> SLOW
+   * 7. LEAD VEHICLE CRUISE -> FOLLOW
+   * 8. PEDESTRIAN AT CURB -> SLOW (MONITOR)
+   * 9. DEVELOPING RISK / AVOIDANCE -> SLOW
+   * 10. DEFAULT / SIDEWALK DETECTION -> GO
    */
   evaluatePriority(ctx) {
     // 1. HIGHEST PRIORITY: Imminent Collision Threat -> STOP
@@ -5842,7 +6032,31 @@ class DecisionManager {
       }
     }
 
-    // 6. Developing Risk / Hazard Caution / Avoidance Maneuver -> SLOW
+    // 6. Lead Vehicle Slowing Down -> SLOW
+    if (ctx.leadSlowing) {
+      return {
+        decision: 'SLOW',
+        reason: 'Lead vehicle slowing ahead - maintaining buffer'
+      };
+    }
+
+    // 7. Lead Vehicle Cruising Normally Ahead -> FOLLOW
+    if (ctx.leadFollow) {
+      return {
+        decision: 'FOLLOW',
+        reason: 'Following lead vehicle at safe distance'
+      };
+    }
+
+    // 8. Pedestrian Approaching Curb -> SLOW / MONITOR
+    if (ctx.pedestrianApproachingCurb) {
+      return {
+        decision: 'SLOW',
+        reason: 'Monitoring pedestrian approaching road curb'
+      };
+    }
+
+    // 9. Developing Risk / Hazard Caution / Avoidance Maneuver -> SLOW
     if (ctx.developingRisk) {
       return {
         decision: 'SLOW',
@@ -5850,7 +6064,7 @@ class DecisionManager {
       };
     }
 
-    // 7. DEFAULT: Normal Clear Driving -> GO (Sidewalk pedestrians and non-threatening objects do not stop car)
+    // 10. DEFAULT: Normal Clear Driving -> GO (Sidewalk pedestrians and non-threatening objects do not stop car)
     return {
       decision: 'GO',
       reason: 'Clear path toward destination'
@@ -5865,6 +6079,7 @@ class DecisionManager {
       decision: this.currentDecision,
       reason: this.reason,
       state: this.state,
+      leadVehicle: this.state ? this.state.leadVehicle : null,
       history: this.decisionHistory
     };
   }
@@ -5974,13 +6189,16 @@ class AutonomousVehicleController {
     const egoHeading = egoVehicle.heading;
     const currentSpeed = egoVehicle.speed || 0;
 
-    // Track Stuck Status: If vehicle is commanded to move but displacement < 3.5px for > 2.5s
-    const isCommandingMove = (this.targetSpeed > 15 && this.controlState !== 'WAITING' && this.controlState !== 'STOPPED' && this.controlState !== 'ARRIVED');
-    const movedDist = Math.hypot(egoX - this.lastStuckCheckPos.x, egoY - this.lastStuckCheckPos.y);
+    // Track Stuck / Deadlock Status:
+    // 1. Ego commanded to move (targetSpeed > 15) but stationary (< 3.5px displacement)
+    // 2. Ego trapped in WAITING / STOPPED state for > 2.5s
+    const isTrapped = (this.controlState === 'WAITING' || this.controlState === 'STOPPED') && !this.hasArrived;
+    const isCommandingMove = (this.targetSpeed > 15 && this.controlState !== 'ARRIVED');
+    const isStationary = Math.abs(currentSpeed) < 8.0 && Math.hypot(egoX - this.lastStuckCheckPos.x, egoY - this.lastStuckCheckPos.y) < 3.5;
 
-    if (isCommandingMove && movedDist < 3.5 && Math.abs(currentSpeed) < 8.0) {
+    if ((isCommandingMove || isTrapped) && isStationary) {
       this.stuckTimer += dt;
-    } else {
+    } else if (this.controlState !== 'REVERSING') {
       this.stuckTimer = 0;
       this.lastStuckCheckPos = { x: egoX, y: egoY };
     }
@@ -6045,9 +6263,16 @@ class AutonomousVehicleController {
         if (rearSafe) {
           this.controlState = 'REVERSING';
           this.targetSpeed = this.config.reverseSpeed; // -26 px/s
-          egoVehicle.inputs.throttle = -0.6;
+          egoVehicle.inputs.throttle = -0.65;
           egoVehicle.inputs.brake = 0;
           egoVehicle.inputs.steer = 0;
+          this.reverseTimer = (this.reverseTimer || 0) + dt;
+          if (this.reverseTimer >= 1.5) {
+            this.reverseTimer = 0;
+            this.stuckTimer = 0;
+            this.isStuck = false;
+            this.controlState = 'REPLANNING';
+          }
           return;
         } else {
           // If rear occupied, fallback to WAITING
@@ -6065,9 +6290,30 @@ class AutonomousVehicleController {
         this.targetSpeed = this.config.replanSpeed; // 25 px/s
         break;
 
+      case 'FOLLOW':
+        this.controlState = 'FOLLOWING';
+        if (decisionData && decisionData.leadVehicle) {
+          const lead = decisionData.leadVehicle;
+          const leadSpeed = (lead.speed !== undefined) ? lead.speed : this.config.cautionSpeed;
+          const leadDist = lead.distance || Math.hypot(lead.x - egoX, lead.y - egoY);
+          const desiredHeadway = Math.max(45, 1.8 * Math.abs(currentSpeed)); // 1.8s safe headway
+          const gapError = leadDist - desiredHeadway;
+          // Smoothly regulate speed to match lead vehicle while maintaining desired gap
+          this.targetSpeed = Math.max(0, Math.min(this.config.cruiseSpeed, leadSpeed + 0.65 * gapError));
+        } else {
+          this.targetSpeed = this.config.cautionSpeed;
+        }
+        break;
+
       case 'SLOW':
         this.controlState = (plannerState === 'AVOIDANCE') ? 'AVOIDING' : 'BRAKING';
-        this.targetSpeed = this.config.cautionSpeed; // 42 px/s
+        if (decisionData && decisionData.leadVehicle) {
+          const lead = decisionData.leadVehicle;
+          const leadSpeed = (lead.speed !== undefined) ? lead.speed : 20;
+          this.targetSpeed = Math.max(15, Math.min(this.config.cautionSpeed, leadSpeed - 5));
+        } else {
+          this.targetSpeed = this.config.cautionSpeed; // 42 px/s
+        }
         break;
 
       case 'GO':
@@ -6217,8 +6463,15 @@ class AutonomousVehicleController {
     const cosH = Math.cos(egoVehicle.heading);
     const sinH = Math.sin(egoVehicle.heading);
 
-    const dynamicEntities = trafficManager ? trafficManager.getEntities() : [];
-    for (const dyn of dynamicEntities) {
+    const candidates = [];
+    if (trafficManager && Array.isArray(trafficManager.getEntities())) {
+      candidates.push(...trafficManager.getEntities());
+    }
+    if (perceptionData && Array.isArray(perceptionData.detectedObjects)) {
+      candidates.push(...perceptionData.detectedObjects);
+    }
+
+    for (const dyn of candidates) {
       const dx = dyn.x - egoVehicle.x;
       const dy = dyn.y - egoVehicle.y;
       const forwardDist = dx * cosH + dy * sinH;
