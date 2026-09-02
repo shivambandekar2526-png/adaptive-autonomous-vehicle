@@ -2645,8 +2645,11 @@ class EgoVehicle {
     this.frictionDecel = 50;     // Rolling friction / air drag (px/s²)
     
     this.maxSteeringAngle = 0.58; // Max steer lock (~33 degrees)
+    this.maxSteeringRate = 2.8;   // Configurable steering actuator angular rate limit (rad/s)
     this.steeringSpeed = 3.2;     // Steering rate (rad/s)
     this.steeringReturnSpeed = 4.5; // Self-centering rate (rad/s)
+    this.angularVelocity = 0;     // Heading angular velocity (rad/s)
+    this.lateralVelocity = 0;     // Lateral velocity (px/s)
 
     // User Input States
     this.inputs = {
@@ -2745,6 +2748,8 @@ class EgoVehicle {
     this.heading = heading;
     this.speed = 0;
     this.steeringAngle = 0;
+    this.angularVelocity = 0;
+    this.lateralVelocity = 0;
     this.inputs.throttle = 0;
     this.inputs.steer = 0;
     this.inputs.brake = 0;
@@ -2765,22 +2770,14 @@ class EgoVehicle {
   update(dt) {
     if (dt <= 0 || dt > 0.1) dt = 0.016; // Clamp against delta spike
 
-    // --- 1. Steering Dynamics (Smooth rate & self-centering) ---
-    if (this.inputs.steer !== 0) {
-      this.steeringAngle += this.inputs.steer * this.steeringSpeed * dt;
-      this.steeringAngle = Math.max(-this.maxSteeringAngle, Math.min(this.maxSteeringAngle, this.steeringAngle));
-    } else {
-      // Auto-center steering when key is released
-      if (Math.abs(this.steeringAngle) > 0.005) {
-        const returnDir = -Math.sign(this.steeringAngle);
-        this.steeringAngle += returnDir * this.steeringReturnSpeed * dt;
-        if (Math.sign(this.steeringAngle) !== -returnDir) {
-          this.steeringAngle = 0;
-        }
-      } else {
-        this.steeringAngle = 0;
-      }
-    }
+    // --- 1. Steering Actuator Dynamics (First-Order Rate Limiter) ---
+    // Continuous steering target [-1, 1] mapped to physical steering angle limit
+    const targetSteerAngle = Math.max(-this.maxSteeringAngle, Math.min(this.maxSteeringAngle, this.inputs.steer * this.maxSteeringAngle));
+    const maxDelta = this.maxSteeringRate * dt;
+    const steerDiff = targetSteerAngle - this.steeringAngle;
+    const clampedDelta = Math.max(-maxDelta, Math.min(maxDelta, steerDiff));
+    this.steeringAngle += clampedDelta;
+    this.steeringAngle = Math.max(-this.maxSteeringAngle, Math.min(this.maxSteeringAngle, this.steeringAngle));
 
     // --- 2. Longitudinal Acceleration, Braking & Friction ---
     this.isBraking = false;
@@ -6931,11 +6928,9 @@ class AutonomousVehicleController {
       desiredSteerAngle = Math.max(-1.0, Math.min(1.0, headingError * 1.5));
     }
 
-    // Smooth gradual steering rate transition (anti-oscillation low-pass filter)
+    // Set direct continuous steering command to vehicle steering actuator
     if (this.controlState !== 'WAITING' && this.controlState !== 'STOPPED' && !this.isStuck) {
-      const steerRate = this.config.steerRateLimit || 6.5;
-      egoVehicle.inputs.steer += (desiredSteerAngle - egoVehicle.inputs.steer) * steerRate * dt;
-      egoVehicle.inputs.steer = Math.max(-1.0, Math.min(1.0, egoVehicle.inputs.steer));
+      egoVehicle.inputs.steer = Math.max(-1.0, Math.min(1.0, desiredSteerAngle));
     }
 
     // 7. Longitudinal Speed Control (Throttle & Progressive Braking)
@@ -7202,11 +7197,11 @@ class MLPNet {
 /**
  * Continuous Proximal Policy Optimization (PPO-Clip) Agent for Ego Vehicle
  * Directly outputs continuous steering [-1, 1], throttle [0, 1], and brake [0, 1]
- * from continuous 22-dimensional simulation environment state observations.
+ * from continuous 26-dimensional control-state simulation environment state observations.
  */
 class EgoPPOAgent {
   constructor(options = {}) {
-    this.obsDim = options.obsDim || 22;
+    this.obsDim = options.obsDim || 26;
     this.actionDim = options.actionDim || 3;
     this.hiddenDims = options.hiddenDims || [64, 64];
 
@@ -7217,8 +7212,8 @@ class EgoPPOAgent {
 
     // Continuous Gaussian policy standard deviations [steer, throttle, brake]
     this.logStd = new Float32Array([-0.693, -1.2, -1.2]); // std approx [0.50, 0.30, 0.30]
-    this.minStd = new Float32Array([0.08, 0.05, 0.05]);
-    this.stdDecay = 0.996;
+    this.minStd = new Float32Array([0.06, 0.04, 0.04]);
+    this.stdDecay = 0.997;
 
     // Hyperparameters
     this.gamma = 0.99;
@@ -7243,9 +7238,9 @@ class EgoPPOAgent {
   }
 
   /**
-   * Extract rich, directional 22-D normalized continuous observation vector
+   * Extract rich, 26-D control-state normalized continuous observation vector
    */
-  getObservation(ego, env, routePlanner, dynamicEntities, prevAction = [0, 0, 0]) {
+  getObservation(ego, env, routePlanner, dynamicEntities, prevAction = [0, 0, 0], lastSteerChange = 0, crossTrackRate = 0) {
     if (!ego || !env) return new Array(this.obsDim).fill(0);
 
     const dest = env.destination || { x: 1650, y: 560 };
@@ -7256,6 +7251,15 @@ class EgoPPOAgent {
     let relAngle = destAngle - ego.heading;
     while (relAngle > Math.PI) relAngle -= Math.PI * 2;
     while (relAngle < -Math.PI) relAngle += Math.PI * 2;
+
+    // Desired road travel heading (0 = Eastbound along main road)
+    const desiredHeading = 0.0;
+    let headingErr = ego.heading - desiredHeading;
+    while (headingErr > Math.PI) headingErr -= Math.PI * 2;
+    while (headingErr < -Math.PI) headingErr += Math.PI * 2;
+
+    // Lateral velocity perpendicular to road heading
+    const lateralVel = (ego.speed || 0) * Math.sin(headingErr);
 
     const topEdgeDist = Math.max(0, Math.min(1.0, (ego.y - 465) / 190));
     const bottomEdgeDist = Math.max(0, Math.min(1.0, (655 - ego.y) / 190));
@@ -7340,13 +7344,19 @@ class EgoPPOAgent {
       Math.max(-0.5, Math.min(1.0, (ego.speed || 0) / 100)),
       Math.cos(ego.heading),
       Math.sin(ego.heading),
+      Math.max(-1.0, Math.min(1.0, (ego.angularVelocity || 0) / 2.5)), // 1. Angular velocity / heading change rate
+      Math.max(-1.0, Math.min(1.0, lateralVel / 80)),                  // 2. Lateral velocity
+      Math.max(-1.0, Math.min(1.0, (ego.steeringAngle || 0) / (ego.maxSteeringAngle || 0.58))), // 3. Current steering angle
+      Math.max(-1.0, Math.min(1.0, lastSteerChange / 2.0)),            // 4. Steering change from previous step
+      crossTrack,                                                      // 5. Signed cross-track error
+      Math.max(-1.0, Math.min(1.0, crossTrackRate / 3.0)),             // 6. Rate of change of cross-track error
+      headingErr / Math.PI,                                            // 7. Heading error relative to desired travel direction
       Math.max(-1.0, Math.min(1.0, dx / 1600)),
       Math.max(-1.0, Math.min(1.0, dy / 1600)),
       Math.min(1.0, distToGoal / 1600),
       relAngle / Math.PI,
       topEdgeDist,
       bottomEdgeDist,
-      crossTrack,
       rayDistances[0],
       rayDistances[1],
       rayDistances[2],
@@ -7354,14 +7364,13 @@ class EgoPPOAgent {
       rayDistances[4],
       nearestHazardDist,
       nearestHazardAngle,
-      nearestDynDist,
-      nearestDynAngle,
-      prevAction[0] // Previous steering action for smoothness
+      nearestDynDist
     ];
   }
 
   /**
    * Sample action from continuous Gaussian policy
+   * Uses exploration noise during TRAINING; uses deterministic mean action during EVALUATION.
    */
   selectAction(obs, isTraining = true) {
     const actRes = this.actor.forward(obs);
@@ -7571,11 +7580,21 @@ class RLTrainingManager {
     this.currentEpisode = 0;
     this.currentEpisodeReward = 0;
     this.prevDistanceToGoal = 0;
+    this.prevEgoX = 140;
+    this.prevEgoY = 580;
 
     // Cumulative and rolling statistics
     this.episodeRewards = [];
     this.episodeSuccesses = [];
     this.episodeLengths = [];
+    this.episodeAbsSteer = [];
+    this.episodeSteerChanges = [];
+    this.episodeLateralErrors = [];
+
+    this.currentEpAbsSteerSum = 0;
+    this.currentEpSteerChangeSum = 0;
+    this.currentEpLateralErrorSum = 0;
+
     this.totalCollisions = 0;
     this.totalRoadDepartures = 0;
     this.totalSuccesses = 0;
@@ -7583,6 +7602,7 @@ class RLTrainingManager {
     this.lastTerminationReason = 'NONE';
     this.lastAction = [0, 0, 0];
     this.prevSteerAction = 0;
+    this.prevCrossTrack = 0;
   }
 
   isActive() {
@@ -7631,6 +7651,13 @@ class RLTrainingManager {
     this.currentEpisodeReward = 0;
     this.lastTerminationReason = 'RUNNING';
     this.prevSteerAction = 0;
+    this.prevCrossTrack = 0;
+    this.prevEgoX = 140;
+    this.prevEgoY = 580;
+
+    this.currentEpAbsSteerSum = 0;
+    this.currentEpSteerChangeSum = 0;
+    this.currentEpLateralErrorSum = 0;
 
     const dest = env.destination || { x: 1650, y: 560 };
     this.prevDistanceToGoal = Math.hypot(dest.x - ego.x, dest.y - ego.y);
@@ -7644,8 +7671,8 @@ class RLTrainingManager {
     const routePlanner = this.engine.getRoutePlanner();
     if (!ego || !env) return;
 
-    // 1. Advance dynamic pedestrians and animals
-    if (this.engine.trafficManager) {
+    // 1. Advance dynamic pedestrians and animals (if traffic is enabled)
+    if (this.engine.trafficManager && this.engine.trafficManager.isEnabled) {
       this.engine.trafficManager.update(dt, ego, env);
     }
 
@@ -7654,13 +7681,20 @@ class RLTrainingManager {
       this.engine.detectionManager.update(
         ego,
         env,
-        this.engine.trafficManager ? this.engine.trafficManager.getEntities() : [],
+        this.engine.trafficManager && this.engine.trafficManager.isEnabled ? this.engine.trafficManager.getEntities() : [],
         dt
       );
     }
 
-    const dynEntities = this.engine.trafficManager ? this.engine.trafficManager.getEntities() : [];
-    const obs = this.agent.getObservation(ego, env, routePlanner, dynEntities, this.lastAction);
+    // 3. Control-State Observations
+    const currentCrossTrack = (ego.y - 560) / 95;
+    const crossTrackRate = (currentCrossTrack - this.prevCrossTrack) / Math.max(0.001, dt);
+    const lastSteerChange = this.lastAction[0] - this.prevSteerAction;
+
+    const dynEntities = this.engine.trafficManager && this.engine.trafficManager.isEnabled ? this.engine.trafficManager.getEntities() : [];
+    const obs = this.agent.getObservation(ego, env, routePlanner, dynEntities, this.lastAction, lastSteerChange, crossTrackRate);
+    
+    // Select action: Gaussian sampling in training, deterministic policy inference in evaluation
     const isTraining = this.isTraining();
     const actData = this.agent.selectAction(obs, isTraining);
     this.lastAction = actData.action;
@@ -7675,22 +7709,52 @@ class RLTrainingManager {
     ego.update(dt);
     this.currentStep++;
 
-    // Compute Step Reward
+    // Track step smoothness metrics
+    const steerDelta = Math.abs(actData.action[0] - this.prevSteerAction);
+    const latError = Math.abs(ego.y - 560);
+    this.currentEpAbsSteerSum += Math.abs(actData.action[0]);
+    this.currentEpSteerChangeSum += steerDelta;
+    this.currentEpLateralErrorSum += latError;
+
+    // 4. Compute Step Reward
     const dest = env.destination || { x: 1650, y: 560 };
     const currDist = Math.hypot(dest.x - ego.x, dest.y - ego.y);
-    let reward = (this.prevDistanceToGoal - currDist) * 2.0; // Forward progress reward
+
+    // Valid road route longitudinal progress reward (along road direction 0 rad)
+    const desiredHeading = 0.0;
+    const deltaLongitudinal = (ego.x - this.prevEgoX) * Math.cos(desiredHeading) + (ego.y - this.prevEgoY) * Math.sin(desiredHeading);
+    this.prevEgoX = ego.x;
+    this.prevEgoY = ego.y;
     this.prevDistanceToGoal = currDist;
 
+    let reward = deltaLongitudinal * 2.2; // Longitudinal road progress reward
+
     // Centerline / Road corridor centering bonus
-    reward += 0.30 * (1 - Math.min(1, Math.abs(ego.y - 560) / 45));
+    reward += 0.30 * (1 - Math.min(1, latError / 45));
+
+    // Heading alignment bonus with desired road travel direction
+    reward += 0.20 * Math.max(0, Math.cos(ego.heading - desiredHeading));
+
     // Forward velocity bonus
     reward += 0.25 * Math.max(0, (ego.speed || 0) / 80);
 
     // Smoothness penalty: Penalize rapid steering changes and excessive steering magnitude
-    const steerDelta = actData.action[0] - this.prevSteerAction;
-    reward -= 0.06 * (steerDelta * steerDelta);
-    reward -= 0.02 * (actData.action[0] * actData.action[0]);
+    reward -= 0.08 * (steerDelta * steerDelta);
+    if (actData.action[0] * this.prevSteerAction < 0) {
+      // Rapid sign reversal penalty (left-right snake oscillation)
+      reward -= 0.12 * steerDelta;
+    }
+    reward -= 0.03 * (actData.action[0] * actData.action[0]);
+
+    // Lateral divergence penalty: If lateral error is increasing away from centerline
+    const newCrossTrack = (ego.y - 560) / 95;
+    const newCrossTrackRate = (newCrossTrack - currentCrossTrack) / Math.max(0.001, dt);
+    if (newCrossTrack * newCrossTrackRate > 0) {
+      reward -= 0.15 * Math.abs(newCrossTrack * newCrossTrackRate);
+    }
+
     this.prevSteerAction = actData.action[0];
+    this.prevCrossTrack = newCrossTrack;
 
     // Step cost
     reward -= 0.04;
@@ -7698,11 +7762,6 @@ class RLTrainingManager {
     // Stationary penalty (prevents car from standing still)
     if (Math.abs(ego.speed) < 2.0 && currDist > 60) {
       reward -= 0.30;
-    }
-
-    // Dynamic Pedestrian / Animal / Hazard proximity safety penalty
-    if (obs[19] < 0.30) {
-      reward -= 0.20 * (1.0 - obs[19] / 0.30);
     }
 
     // Check Termination Conditions
@@ -7747,22 +7806,32 @@ class RLTrainingManager {
     if (done) {
       this.lastTerminationReason = reason;
 
+      const avgEpSteer = this.currentStep > 0 ? (this.currentEpAbsSteerSum / this.currentStep) : 0;
+      const avgEpSteerChange = this.currentStep > 0 ? (this.currentEpSteerChangeSum / this.currentStep) : 0;
+      const avgEpLatErr = this.currentStep > 0 ? (this.currentEpLateralErrorSum / this.currentStep) : 0;
+
       // Track rolling history (last 100 episodes)
       this.episodeRewards.push(this.currentEpisodeReward);
       this.episodeSuccesses.push(isSuccess ? 1 : 0);
       this.episodeLengths.push(this.currentStep);
+      this.episodeAbsSteer.push(avgEpSteer);
+      this.episodeSteerChanges.push(avgEpSteerChange);
+      this.episodeLateralErrors.push(avgEpLatErr);
 
       if (this.episodeRewards.length > 100) this.episodeRewards.shift();
       if (this.episodeSuccesses.length > 100) this.episodeSuccesses.shift();
       if (this.episodeLengths.length > 100) this.episodeLengths.shift();
+      if (this.episodeAbsSteer.length > 100) this.episodeAbsSteer.shift();
+      if (this.episodeSteerChanges.length > 100) this.episodeSteerChanges.shift();
+      if (this.episodeLateralErrors.length > 100) this.episodeLateralErrors.shift();
 
       // Display after every episode
-      console.log(`[PPO Episode ${this.currentEpisode}] Reward: ${this.currentEpisodeReward.toFixed(2)} | Success: ${isSuccess} | Steps: ${this.currentStep} | DistToGoal: ${currDist.toFixed(1)}px | Reason: ${reason} | Total Collisions: ${this.totalCollisions} | Total OffRoad: ${this.totalRoadDepartures}`);
+      console.log(`[PPO Episode ${this.currentEpisode}] Reward: ${this.currentEpisodeReward.toFixed(2)} | Success: ${isSuccess} | Steps: ${this.currentStep} | DistToGoal: ${currDist.toFixed(1)}px | Reason: ${reason} | Total Collisions: ${this.totalCollisions} | Total OffRoad: ${this.totalRoadDepartures} | AbsSteer: ${avgEpSteer.toFixed(3)} | SteerChg: ${avgEpSteerChange.toFixed(3)} | LatErr: ${avgEpLatErr.toFixed(1)}px`);
 
       // Periodically display 100-episode statistics (every 10 or 25 episodes)
       if (this.currentEpisode % 10 === 0) {
         const stats = this.get100EpisodeStats();
-        console.log(`=== [PPO Progress Report: Ep ${this.currentEpisode}] AvgReward(100): ${stats.avgReward100} | SuccessRate(100): ${stats.successRate100} | AvgLength(100): ${stats.avgLength100} ===`);
+        console.log(`=== [PPO Progress Report: Ep ${this.currentEpisode}] AvgReward(100): ${stats.avgReward100} | SuccessRate(100): ${stats.successRate100} | AvgLength(100): ${stats.avgLength100} | AvgAbsSteer: ${stats.avgAbsSteer100} | AvgSteerChg: ${stats.avgSteerChange100} | AvgLatErr: ${stats.avgLateralError100}px ===`);
         if (isTraining) {
           this.agent.saveCheckpoint(this.currentEpisode);
         }
@@ -7789,12 +7858,18 @@ class RLTrainingManager {
     const avgReward = (this.episodeRewards.reduce((a, b) => a + b, 0) / len).toFixed(2);
     const successRate = ((this.episodeSuccesses.reduce((a, b) => a + b, 0) / len) * 100).toFixed(1) + '%';
     const avgLength = (this.episodeLengths.reduce((a, b) => a + b, 0) / len).toFixed(1);
+    const avgAbsSteer = (this.episodeAbsSteer.reduce((a, b) => a + b, 0) / len).toFixed(3);
+    const avgSteerChg = (this.episodeSteerChanges.reduce((a, b) => a + b, 0) / len).toFixed(3);
+    const avgLatErr = (this.episodeLateralErrors.reduce((a, b) => a + b, 0) / len).toFixed(1);
 
     return {
       windowSize: len,
       avgReward100: avgReward,
       successRate100: successRate,
-      avgLength100: avgLength
+      avgLength100: avgLength,
+      avgAbsSteer100: avgAbsSteer,
+      avgSteerChange100: avgSteerChg,
+      avgLateralError100: avgLatErr
     };
   }
 
@@ -7810,6 +7885,9 @@ class RLTrainingManager {
       avgReward100: stats100.avgReward100,
       successRate100: stats100.successRate100,
       avgLength100: stats100.avgLength100,
+      avgAbsSteer100: stats100.avgAbsSteer100,
+      avgSteerChange100: stats100.avgSteerChange100,
+      avgLateralError100: stats100.avgLateralError100,
       bestReward: this.agent.bestReward === -Infinity ? '0.0' : this.agent.bestReward.toFixed(1),
       totalCollisions: this.totalCollisions,
       totalOffRoad: this.totalRoadDepartures,
@@ -7833,8 +7911,8 @@ class RLTrainingManager {
     const m = this.getMetrics();
     const cardX = 20;
     const cardY = 120;
-    const cardW = 270;
-    const cardH = 220;
+    const cardW = 280;
+    const cardH = 240;
 
     // Glassmorphic Card Background
     ctx.fillStyle = 'rgba(15, 23, 42, 0.94)';
@@ -7854,20 +7932,21 @@ class RLTrainingManager {
     ctx.fillStyle = '#94a3b8';
     ctx.font = '11px "Segoe UI", sans-serif';
     ctx.fillText(`Episode: ${m.episode}  (Step: ${m.step})`, cardX + 14, cardY + 42);
-    ctx.fillText(`Reward: ${m.currentReward}  |  Avg(100): ${m.avgReward100}`, cardX + 14, cardY + 62);
-    ctx.fillText(`Success (100): ${m.successRate100}  |  AvgLen: ${m.avgLength100}`, cardX + 14, cardY + 82);
-    ctx.fillText(`Collisions: ${m.totalCollisions}  |  Off-Road: ${m.totalOffRoad}`, cardX + 14, cardY + 102);
-    ctx.fillText(`Goal Dist: ${m.distToGoal}  |  Best: ${m.bestReward}`, cardX + 14, cardY + 122);
-    ctx.fillText(`Last End: ${m.lastReason}`, cardX + 14, cardY + 142);
+    ctx.fillText(`Reward: ${m.currentReward}  |  Avg(100): ${m.avgReward100}`, cardX + 14, cardY + 60);
+    ctx.fillText(`Success (100): ${m.successRate100}  |  AvgLen: ${m.avgLength100}`, cardX + 14, cardY + 78);
+    ctx.fillText(`Smoothness: SteerΔ ${m.avgSteerChange100} | LatErr ${m.avgLateralError100}px`, cardX + 14, cardY + 96);
+    ctx.fillText(`Collisions: ${m.totalCollisions}  |  Off-Road: ${m.totalOffRoad}`, cardX + 14, cardY + 114);
+    ctx.fillText(`Goal Dist: ${m.distToGoal}  |  Best: ${m.bestReward}`, cardX + 14, cardY + 132);
+    ctx.fillText(`Last End: ${m.lastReason}`, cardX + 14, cardY + 150);
 
     // Continuous Control Gauges
-    ctx.fillText(`Steering: [ ${m.steer} ]`, cardX + 14, cardY + 166);
-    ctx.fillText(`Throttle: [ ${m.throttle} ]  Brake: [ ${m.brake} ]`, cardX + 14, cardY + 188);
+    ctx.fillText(`Steering: [ ${m.steer} ]`, cardX + 14, cardY + 174);
+    ctx.fillText(`Throttle: [ ${m.throttle} ]  Brake: [ ${m.brake} ]`, cardX + 14, cardY + 194);
 
     // Mini Steering Meter Bar
     const barX = cardX + 150;
-    const barY = cardY + 158;
-    const barW = 95;
+    const barY = cardY + 166;
+    const barW = 105;
     const barH = 10;
     ctx.fillStyle = 'rgba(30, 41, 59, 0.9)';
     ctx.fillRect(barX, barY, barW, barH);
